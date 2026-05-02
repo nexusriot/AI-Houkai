@@ -1,2 +1,6 @@
 .idea/
 .venv/
+.chroma/
+
+examples/.chroma_demo/
+**/__pycache__/
