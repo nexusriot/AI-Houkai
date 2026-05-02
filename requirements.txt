@@ -1,0 +1,16 @@
+# core
+chromadb>=0.5.0
+sentence-transformers>=2.7.0
+
+# MCP server
+mcp>=1.2.0
+
+# Claude agent example
+anthropic>=0.40.0
+
+# OpenAI agent example
+# Ollama agent example (uses the same openai client via Ollama's OAI-compat endpoint)
+openai>=1.50.0
+
+# tests
+pytest>=8.0.0
