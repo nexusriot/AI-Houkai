@@ -6,7 +6,7 @@ information across sessions — with automatic decay of stale memories
 and periodic reflection that condenses experience into knowledge.
 
 <p align="center" width="100%">
-    <img width="70%" src="logo.png">
+    <img width="70%" src="https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/logo.png">
 </p>
 
 ## Features
