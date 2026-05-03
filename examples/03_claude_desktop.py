@@ -36,10 +36,10 @@ import tempfile, shutil
 import importlib, importlib.util, types as _types
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-from memory_system import MemoryStore
+
+from ai_houkai.memory_system import MemoryStore
 
 DEFAULT_MEMORY_PATH = os.path.join(PROJECT_ROOT, ".chroma")
-sys.path.insert(0, PROJECT_ROOT)
 
 
 def _claude_config_path() -> str:

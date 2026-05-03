@@ -1,6 +1,50 @@
-.idea/
-.venv/
-.chroma/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
 
-examples/.chroma_demo/
-**/__pycache__/
+# Build & distribution
+build/
+dist/
+*.whl
+*.tar.gz
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# ChromaDB persistence
+.chroma/
+*.chroma/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.xml
+
+# Type checking
+.mypy_cache/
+.pytype/
+.pyre/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# HuggingFace model cache (large, re-downloadable)
+.cache/

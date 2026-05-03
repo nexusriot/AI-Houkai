@@ -36,14 +36,12 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 try:
     from openai import OpenAI
 except ImportError:
-    sys.exit("pip install openai")
+    sys.exit("pip install 'ai-houkai[openai]'")
 
-from memory_system import MemoryStore
+from ai_houkai.memory_system import MemoryStore
 
 MODEL       = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 MEMORY_PATH = os.environ.get("AI_HOUKAI_PATH",

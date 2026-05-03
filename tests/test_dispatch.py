@@ -15,7 +15,7 @@ import types
 
 import pytest
 
-from memory_system import MemoryStore
+from ai_houkai.memory_system import MemoryStore
 
 _EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "examples")
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from memory_system import Memory, MemoryStore
+from ai_houkai.memory_system import Memory, MemoryStore
 
 
 class TestRemember:

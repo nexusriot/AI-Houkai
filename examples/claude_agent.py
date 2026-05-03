@@ -25,15 +25,11 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 
 import anthropic
 
-# Allow running from repo root: python examples/claude_agent.py
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from memory_system import MemoryStore
+from ai_houkai.memory_system import MemoryStore
 
 MODEL = "claude-sonnet-4-6"
 MEMORY_PATH = os.environ.get("AI_HOUKAI_PATH", tempfile.mkdtemp(prefix="ai_houkai_claude_"))
