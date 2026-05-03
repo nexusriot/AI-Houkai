@@ -12,7 +12,7 @@ No API keys or running services required.
 
 from __future__ import annotations
 
-import sys, os, shutil, tempfile, textwrap, time
+import sys, os, shutil, tempfile, textwrap
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from memory_system import MemoryStore

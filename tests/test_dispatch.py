@@ -7,8 +7,9 @@ run without any API keys or live services.
 
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import json
+import os
 import sys
 import types
 
@@ -16,11 +17,23 @@ import pytest
 
 from memory_system import MemoryStore
 
+_EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "examples")
 
-def _load_dispatch(module_path: str, store: MemoryStore):
-    """Import an agent example module and inject our test store."""
-    if module_path in sys.modules:
-        del sys.modules[module_path]
+AGENTS = [
+    "claude_agent.py",
+    "04_openai.py",
+    "02_ollama_local_network.py",
+]
+
+
+def _load_dispatch(filename: str, store: MemoryStore):
+    """Load an agent example module by file path and inject our test store."""
+    # Derive a safe module name (digits-prefixed filenames are invalid identifiers)
+    module_name = "_agent_" + filename.replace(".py", "").replace("-", "_")
+
+    # Evict any previously loaded version
+    if module_name in sys.modules:
+        del sys.modules[module_name]
 
     # Stub SDK client constructors so no network calls happen at import time.
     fake_client = types.SimpleNamespace(
@@ -34,16 +47,14 @@ def _load_dispatch(module_path: str, store: MemoryStore):
     sys.modules.setdefault("anthropic", types.ModuleType("anthropic"))
     sys.modules["anthropic"].Anthropic = lambda: fake_client  # type: ignore
 
-    mod = importlib.import_module(module_path)
+    path = os.path.join(_EXAMPLES_DIR, filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)  # type: ignore
+
     mod.store = store  # inject isolated test store
     return mod._dispatch_tool
-
-
-AGENTS = [
-    "examples.claude_agent",
-    "examples.openai_agent",
-    "examples.ollama_agent",
-]
 
 
 @pytest.fixture(params=AGENTS)
