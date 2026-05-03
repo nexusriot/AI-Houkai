@@ -15,14 +15,10 @@ from __future__ import annotations
 
 import math
 import shutil
-import sys
 import tempfile
 import time
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from memory_system import DecayEngine, MemoryStore, ReflectionEngine
+from ai_houkai.memory_system import DecayEngine, MemoryStore, ReflectionEngine
 
 W = 65
 

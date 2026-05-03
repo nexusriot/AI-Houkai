@@ -42,8 +42,7 @@ try:
 except ImportError:
     sys.exit("pip install openai")
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from memory_system import MemoryStore
+from ai_houkai.memory_system import MemoryStore
 
 
 OLLAMA_HOST  = os.environ.get("OLLAMA_HOST",  "127.0.0.1")   # ← change me

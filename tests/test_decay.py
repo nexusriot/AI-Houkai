@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from memory_system import DecayEngine, Memory, MemoryStore
+from ai_houkai.memory_system import DecayEngine, Memory, MemoryStore
 
 
 def _days_ago(days: float) -> float:

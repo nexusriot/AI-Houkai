@@ -6,7 +6,7 @@ information across sessions — with automatic decay of stale memories
 and periodic reflection that condenses experience into knowledge.
 
 <p align="center" width="100%">
-    <img width="70%" src="logo.png">
+    <img width="70%" src="https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/logo.png">
 </p>
 
 ## Features
@@ -25,38 +25,97 @@ and periodic reflection that condenses experience into knowledge.
 
 ```
 AI-Houkai/
-├── memory_system/
-│   ├── __init__.py           # public exports
-│   ├── store.py              # MemoryStore + Memory dataclass
-│   ├── decay.py              # DecayEngine — exponential forgetting
-│   └── reflection.py         # ReflectionEngine — episodic → semantic
-├── mcp_server/
-│   └── server.py             # FastMCP server (remember/recall/forget/…)
+├── ai_houkai/
+│   ├── __init__.py               # convenience re-exports
+│   ├── memory_system/
+│   │   ├── __init__.py
+│   │   ├── store.py              # MemoryStore + Memory dataclass
+│   │   ├── decay.py              # DecayEngine — exponential forgetting
+│   │   └── reflection.py        # ReflectionEngine — episodic → semantic
+│   └── mcp_server/
+│       ├── __init__.py
+│       └── server.py             # FastMCP server (5 tools)
 ├── examples/
-│   ├── 01_standalone.py      # pure-Python walkthrough, no LLM
+│   ├── 01_standalone.py          # pure-Python walkthrough, no LLM
 │   ├── 02_ollama_local_network.py  # Ollama on LAN, fully offline
-│   ├── 03_claude_desktop.py  # MCP auto-install for Claude Desktop
-│   ├── 04_openai.py          # OpenAI GPT-4o / gpt-4o-mini
-│   ├── 05_decay_reflection.py # decay + reflection demo
-│   └── claude_agent.py       # Claude Sonnet REPL (Anthropic SDK)
+│   ├── 03_claude_desktop.py      # MCP auto-install for Claude Desktop
+│   ├── 04_openai.py              # OpenAI GPT-4o / gpt-4o-mini
+│   ├── 05_decay_reflection.py    # decay + reflection demo
+│   ├── 06_claude_code.py         # Claude Code MCP integration
+│   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
+│   └── pip_package_example.py   # post-install usage walkthrough
 ├── tests/
-│   ├── conftest.py           # isolated MemoryStore fixture (tmp_path)
-│   ├── test_memory.py        # MemoryStore unit tests
-│   ├── test_decay.py         # DecayEngine unit tests
-│   ├── test_reflection.py    # ReflectionEngine unit tests
-│   └── test_dispatch.py      # cross-provider _dispatch_tool tests
+│   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
+│   ├── test_memory.py            # MemoryStore unit tests
+│   ├── test_decay.py             # DecayEngine unit tests
+│   ├── test_reflection.py        # ReflectionEngine unit tests
+│   └── test_dispatch.py          # cross-provider _dispatch_tool tests
+├── pyproject.toml
 └── requirements.txt
 ```
 
 ## Install
 
+Modern Linux distros protect the system Python (PEP 668).  Pick whichever
+approach fits your workflow — none requires `--break-system-packages`.
+
+### Virtual environment (recommended for development)
+
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install ai-houkai
+```
+
+### pipx (recommended for the MCP server / CLI tool)
+
+`pipx` installs CLI tools into isolated venvs and puts the script on your
+PATH automatically — no activation step needed.
+
+```bash
+sudo apt install pipx            # or: pip install --user pipx
+pipx ensurepath                  # adds ~/.local/bin to PATH (one-time)
+
+pipx install ai-houkai
+ai-houkai-mcp                    # available everywhere
+```
+
+### uv (fastest, modern)
+
+```bash
+curl -Lsf https://astral.sh/uv/install.sh | sh   # one-time install
+
+uv venv && uv pip install ai-houkai               # project venv
+# or run a script without a persistent install:
+uv run --with ai-houkai python examples/pip_package_example.py
+```
+
+### Extras
+
+```bash
+pip install "ai-houkai[claude]"   # + Anthropic SDK
+pip install "ai-houkai[openai]"   # + OpenAI SDK (also covers Ollama)
+pip install "ai-houkai[all]"      # all providers
+pip install "ai-houkai[dev]"      # + pytest
 ```
 
 > The embedding model (`all-MiniLM-L6-v2`) downloads automatically on
 > first use (~90 MB).  Everything runs fully local — no API key required
-> for the memory layer.
+> for the memory layer itself.
+
+## Quick-start
+
+```python
+from ai_houkai.memory_system import MemoryStore
+
+store = MemoryStore()                  # persists to ./.chroma
+
+store.remember("Python's GIL blocks CPU parallelism",
+               type="semantic", importance=0.85, tags=["python"])
+
+for mem, score in store.recall("parallel execution", k=3):
+    print(f"{score:.3f}  {mem.text}")
+```
 
 ## Run the tests
 
@@ -70,8 +129,7 @@ pytest tests/ -v        # 79 tests
 
 ### 01 · Standalone (no LLM)
 
-Full memory lifecycle — seed → recall with filters → access tracking
-→ forget.  Good starting point before adding an LLM.
+Full memory lifecycle — seed → recall with filters → access tracking → forget.
 
 ```bash
 python examples/01_standalone.py
@@ -79,13 +137,11 @@ python examples/01_standalone.py
 
 ### 02 · Ollama (local network)
 
-Conversational REPL using a local model over Ollama's
-OpenAI-compatible endpoint.  No API key, no internet.
+Conversational REPL using a local model over Ollama's OpenAI-compatible
+endpoint.  No API key, no internet.
 
 ```bash
-# Install Ollama: https://ollama.com
 ollama pull llama3.1
-
 OLLAMA_MODEL=llama3.1 python examples/02_ollama_local_network.py
 ```
 
@@ -97,15 +153,12 @@ OLLAMA_MODEL=llama3.1 python examples/02_ollama_local_network.py
 
 ### 03 · Claude Desktop (MCP)
 
-Auto-installs the MCP server into Claude Desktop's config so Claude
-can call memory tools without any prompting.
+Auto-installs the MCP server into Claude Desktop's config.
 
 ```bash
-# Preview the config block
-python examples/03_claude_desktop.py
-
-# Patch Claude Desktop config + restart Claude Desktop
-python examples/03_claude_desktop.py --install
+python examples/03_claude_desktop.py            # preview config
+python examples/03_claude_desktop.py --install  # write config
+python examples/03_claude_desktop.py --demo     # simulated session
 ```
 
 ### 04 · OpenAI
@@ -115,35 +168,88 @@ GPT-4o / gpt-4o-mini with function calling.
 ```bash
 export OPENAI_API_KEY=sk-...
 python examples/04_openai.py
-
-# override model or persist memory
-OPENAI_MODEL=gpt-4o AI_HOUKAI_PATH=/tmp/oai python examples/04_openai.py
+OPENAI_MODEL=gpt-4o AI_HOUKAI_PATH=~/.ai_houkai python examples/04_openai.py
 ```
 
 | Env var | Default |
 |---|---|
 | `OPENAI_MODEL` | `gpt-4o-mini` |
-| `AI_HOUKAI_PATH` | `./.chroma` |
+| `AI_HOUKAI_PATH` | temp dir |
 
 ### 05 · Decay + Reflection
 
-Shows both cognitive maintenance features with backdated timestamps so
-results are visible without waiting days.
+Shows both cognitive maintenance features with backdated timestamps.
 
 ```bash
 python examples/05_decay_reflection.py
 ```
 
-### Claude agent (Anthropic SDK REPL)
+### 06 · Claude Code (MCP)
 
-Conversational REPL where Claude calls `recall`, `remember`, and
-`forget` as native Anthropic tool-use calls.
+Gives the Claude Code CLI a persistent memory so it remembers project
+conventions, past debug sessions, and your preferences across every
+coding session.
+
+```bash
+# Option A — one-liner (recommended)
+claude mcp add ai-houkai -- ai-houkai-mcp
+
+# Option B — auto-patch ~/.claude/settings.json
+python examples/06_claude_code.py --install
+
+# Option C — preview the config block
+python examples/06_claude_code.py
+
+# Smoke-test
+python examples/06_claude_code.py --verify
+
+# Simulated coding session
+python examples/06_claude_code.py --demo
+
+# Print a CLAUDE.md snippet that teaches Claude how to use memory
+python examples/06_claude_code.py --claudemd
+```
+
+The installed MCP block in `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-houkai": {
+      "command": "ai-houkai-mcp",
+      "env": {
+        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_COLLECTION": "claude_code"
+      }
+    }
+  }
+}
+```
+
+#### Recommended CLAUDE.md addition
+
+Add the following to your project's `CLAUDE.md` so Claude Code knows when and
+how to use memory tools (run `python examples/06_claude_code.py --claudemd`
+to generate it):
+
+```markdown
+## Memory (AI-Houkai MCP)
+
+- **remember** — store conventions, decisions, preferences
+- **recall** — search before starting any task
+- **forget** — remove outdated facts
+
+| Situation | Action |
+|---|---|
+| User states a convention | `remember` with `type="procedural"` |
+| User corrects you | `remember` correction, `forget` old fact |
+| Starting a new task | `recall` relevant context first |
+```
+
+### Claude agent (Anthropic SDK REPL)
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python examples/claude_agent.py
-
-# persist memory across sessions
 AI_HOUKAI_PATH=/tmp/my_memory python examples/claude_agent.py
 ```
 
@@ -156,70 +262,80 @@ REPL commands: `memories` to list recent memories · `quit` to exit.
 Exposes the memory store to any MCP client.
 
 ```bash
-python -m mcp_server.server
+ai-houkai-mcp
+# or: python -m ai_houkai.mcp_server.server
 ```
 
-**Claude Code** — add to `~/.claude/settings.json`:
+Exposed tools: `remember` · `recall` · `forget` · `list_recent` · `stats`.
+
+Environment variables:
+
+| Variable | Default |
+|---|---|
+| `AI_HOUKAI_PATH` | `./.chroma` |
+| `AI_HOUKAI_COLLECTION` | `ai_houkai` |
+
+**Claude Code** (global):
+
+```bash
+claude mcp add ai-houkai -- ai-houkai-mcp
+```
+
+**Claude Code** (manual `~/.claude/settings.json`):
 
 ```json
 {
   "mcpServers": {
-    "AI-Houkai": {
-      "command": "python",
-      "args": ["-m", "mcp_server.server"],
-      "cwd": "/path/to/AI-Houkai",
-      "env": { "AI_HOUKAI_PATH": "/path/to/AI-Houkai/.chroma" }
+    "ai-houkai": {
+      "command": "ai-houkai-mcp",
+      "env": { "AI_HOUKAI_PATH": "/your/memory/path" }
     }
   }
 }
 ```
 
-**Claude Desktop** — use `examples/03_claude_desktop.py --install`
-(handles the platform-specific config path automatically).
-
-Exposed tools: `remember` · `recall` · `forget` · `list_recent` · `stats`.
+**Claude Desktop** — use `examples/03_claude_desktop.py --install`.
 
 ---
 
 ## Decay
 
-Memories fade over time based on how long ago they were last accessed
-and how important they are.
+Memories fade over time based on age and importance.
 
 ```
 score = importance × exp(−λ × days_since_last_access)
 ```
 
-Default `λ = 0.1` gives a half-life of ~7 days for a 0.5-importance
-memory.  `procedural` memories are protected and never pruned.
+Default `λ = 0.1` → half-life ≈ 7 days for a 0.5-importance memory.
+`procedural` memories are protected and never pruned.
 
 ```python
-from memory_system import MemoryStore, DecayEngine
+from ai_houkai.memory_system import MemoryStore, DecayEngine
 
 store  = MemoryStore()
 engine = DecayEngine(store, decay_rate=0.1, min_score=0.05)
 
-engine.prune(dry_run=True)   # preview what would be removed
+engine.prune(dry_run=True)   # preview
 engine.prune()               # delete stale memories
 ```
 
 ## Reflection
 
-Clusters of semantically similar episodic memories are condensed into
-a single `semantic` summary memory (the Generative Agents pattern).
+Clusters of semantically similar episodic memories are condensed into a
+single `semantic` summary (the Generative Agents pattern).
 
 ```python
-from memory_system import MemoryStore, ReflectionEngine
+from ai_houkai.memory_system import MemoryStore, ReflectionEngine
 
 store  = MemoryStore()
 engine = ReflectionEngine(store, similarity_threshold=0.75)
 
-engine.clusters()            # inspect detected clusters
-engine.reflect(dry_run=True) # preview summaries without writing
-engine.reflect(consolidate=True)  # create summaries + delete sources
+engine.clusters()                    # inspect clusters
+engine.reflect(dry_run=True)         # preview
+engine.reflect(consolidate=True)     # create summaries + delete sources
 ```
 
-Plug in any summarizer — including an LLM call:
+Plug in any summarizer — including an LLM:
 
 ```python
 def llm_summarizer(memories):
@@ -230,19 +346,4 @@ def llm_summarizer(memories):
     ).choices[0].message.content
 
 engine = ReflectionEngine(store, summarizer=llm_summarizer)
-```
-
----
-
-## Quick-start (5 lines)
-
-```python
-from memory_system import MemoryStore
-
-store = MemoryStore()                               # persists to ./.chroma
-store.remember("Python's GIL limits CPU threads", type="semantic", importance=0.8)
-
-hits = store.recall("parallel execution in Python", k=3)
-for mem, score in hits:
-    print(f"{score:.2f}  {mem.text}")
 ```

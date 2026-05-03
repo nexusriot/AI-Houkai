@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_system import Memory, MemoryStore, ReflectionEngine
+from ai_houkai.memory_system import Memory, MemoryStore, ReflectionEngine
 
 
 def _ep(store: MemoryStore, text: str, tags: list[str] | None = None,

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from memory_system import MemoryStore
+from ai_houkai.memory_system import MemoryStore
 
 
 @pytest.fixture()

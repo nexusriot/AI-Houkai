@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name            = "ai-houkai"
+version         = "0.1.0"
+description     = "Long-term memory system for AI agents — vector search, decay & reflection"
+readme          = "README.md"
+requires-python = ">=3.10"
+license         = "MIT"
+keywords        = ["ai", "agent", "memory", "chromadb", "mcp", "llm", "rag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Core deps — no LLM provider required for the memory layer itself
+dependencies = [
+    "chromadb>=0.5.0",
+    "sentence-transformers>=2.7.0",
+    "mcp>=1.2.0",
+]
+
+
+[project.optional-dependencies]
+# pip install "ai-houkai[claude]"
+claude = ["anthropic>=0.40.0"]
+
+# pip install "ai-houkai[openai]"
+# Also covers Ollama (uses the same openai client via the /v1 compat endpoint)
+openai = ["openai>=1.50.0"]
+
+# pip install "ai-houkai[all]"
+all = ["anthropic>=0.40.0", "openai>=1.50.0"]
+
+# pip install "ai-houkai[dev]"
+dev = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "pytest>=8.0.0",
+]
+
+
+[project.scripts]
+# Start the MCP server: ai-houkai-mcp
+# Env vars: AI_HOUKAI_PATH, AI_HOUKAI_COLLECTION
+ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
+
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["ai_houkai*"]
+
+[tool.setuptools.package-data]
+"*" = ["py.typed"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

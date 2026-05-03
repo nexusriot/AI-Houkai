@@ -23,7 +23,7 @@ starts from scratch.  AI-Houkai gives an agent a **persistent,
 searchable memory** that survives across sessions — without requiring
 cloud services or API keys for the memory layer itself.
 
-Three cognitive operations model how humans manage long-term memory:
+Four cognitive operations model how humans manage long-term memory:
 
 | Operation | Human analogy | AI-Houkai component |
 |---|---|---|
@@ -40,7 +40,7 @@ Three cognitive operations model how humans manage long-term memory:
 ┌──────────────────────────────────────────────────────────────┐
 │                         Agent / LLM                          │
 │   (Claude · OpenAI · Ollama · any tool-use capable model)    │
-└───────────────┬──────────────────────────┬───────────────────┘
+└───────────────┬───────────────────────────┬──────────────────┘
                 │ tool calls                │ tool results
                 ▼                           │
 ┌──────────────────────────┐                │
@@ -71,10 +71,35 @@ Three cognitive operations model how humans manage long-term memory:
 └─────────────────────────────────┘
 ```
 
-The **MCP server** (`mcp_server/server.py`) wraps `MemoryStore` and
-exposes the same operations as MCP tools so any MCP client (Claude
-Desktop, Claude Code, custom agents) can call them without any Python
-glue code.
+The **MCP server** (`ai_houkai/mcp_server/server.py`) wraps `MemoryStore`
+and exposes the same operations as MCP tools so any MCP client (Claude Code,
+Claude Desktop, custom agents) can call them without Python glue code.
+
+### Package structure
+
+```
+ai_houkai/                        pip package name: ai-houkai
+├── __init__.py                   convenience re-exports
+├── memory_system/
+│   ├── __init__.py               exports Memory, MemoryStore, MemoryType,
+│   │                             DecayEngine, ReflectionEngine
+│   ├── store.py                  MemoryStore + Memory dataclass
+│   ├── decay.py                  DecayEngine
+│   └── reflection.py            ReflectionEngine
+└── mcp_server/
+    ├── __init__.py
+    └── server.py                 FastMCP server + run() entry point
+```
+
+Import styles:
+
+```python
+# Subpackage (canonical)
+from ai_houkai.memory_system import MemoryStore, DecayEngine, ReflectionEngine
+
+# Top-level convenience re-export
+from ai_houkai import MemoryStore, DecayEngine, ReflectionEngine
+```
 
 ---
 
@@ -152,19 +177,15 @@ similarity at query time: `similarity = 1.0 − distance`.
 
 `SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")`
 produces 384-dimensional vectors.  The model runs fully offline once
-downloaded.  To swap to a different provider:
-
-```python
-store = MemoryStore(embedding_model="text-embedding-3-small")
-# or pass a custom chromadb.EmbeddingFunction subclass
-```
+downloaded.  To swap to a different provider pass a custom
+`chromadb.EmbeddingFunction` to the collection.
 
 ### HNSW index
 
 ChromaDB uses the HNSW (Hierarchical Navigable Small World) graph for
 approximate nearest-neighbour search.  At the scale of a single agent's
 memory (hundreds to low thousands of entries), exact search would also
-be fine — HNSW just ensures the query stays fast as collections grow.
+be fine — HNSW ensures queries stay fast as collections grow.
 
 ---
 
@@ -199,7 +220,7 @@ be fine — HNSW just ensures the query stays fast as collections grow.
 1. Build `where` dict from `type` and `min_importance` args.
 2. Call `collection.query(n_results=k, where=where)`.
 3. Post-filter by `tag` (ChromaDB only supports `$eq` on scalar fields,
-   not array membership — so tag filtering happens in Python).
+   not array membership — tag filtering happens in Python).
 4. Call `_touch()` on every returned memory.
 5. Convert cosine distance → similarity score and return.
 
@@ -227,7 +248,6 @@ Score examples with λ=0.1:
 | 0.9 | 7 days | 0.45 | kept |
 | 0.9 | 30 days | 0.04 | **pruned** |
 | 0.5 | 1 day | 0.45 | kept |
-| 0.1 | 1 day | 0.09 | borderline |
 | 0.1 | 7 days | 0.05 | **pruned** |
 
 ### Tuning λ
@@ -242,16 +262,15 @@ Score examples with λ=0.1:
 ### API
 
 ```python
+from ai_houkai.memory_system import MemoryStore, DecayEngine
+
 engine = DecayEngine(store, decay_rate=0.1, min_score=0.05,
                      protect_types=("procedural",))
 
-# Inspect
-score = engine.score(mem)                   # single memory
-pairs = engine.score_all()                  # all memories, sorted desc
-
-# Act
-candidates = engine.prune(dry_run=True)     # preview
-removed     = engine.prune()                # delete stale memories
+score     = engine.score(mem)            # single memory
+pairs     = engine.score_all()           # all, sorted desc
+candidates = engine.prune(dry_run=True)  # preview
+removed    = engine.prune()              # delete stale memories
 ```
 
 `now` can be overridden in both `score()` and `prune()` for
@@ -261,9 +280,9 @@ deterministic testing or time-travel simulations.
 
 ## 7. Reflection Engine
 
-Implements the **Generative Agents** reflection pattern: periodically
-cluster semantically similar episodic memories and condense them into a
-single semantic "summary" memory.
+Implements the **Generative Agents** reflection pattern: cluster
+semantically similar episodic memories and condense them into a single
+semantic "summary" memory.
 
 ### Algorithm
 
@@ -277,8 +296,8 @@ single semantic "summary" memory.
           similarity to the seed ≥ similarity_threshold
 4. Discard clusters with fewer than min_cluster_size members.
 5. For each qualifying cluster:
-      text      = summarizer(cluster_members)
-      tags      = ["reflection"] + union of all source tags
+      text       = summarizer(cluster_members)
+      tags       = ["reflection"] + union of all source tags
       importance = mean(source importances)
       store new semantic memory  →  MemoryStore.remember()
 6. If consolidate=True: delete all source episodic memories.
@@ -286,25 +305,21 @@ single semantic "summary" memory.
 
 ### Clustering properties
 
-- **Seed-based**: the most important memory anchors each cluster,
-  which biases summaries toward high-signal events.
-- **Single-linkage**: a memory joins a cluster if it is similar to
-  the *seed*, not to all existing members.  This is fast (O(n) per
-  seed) and avoids the chaining artefacts of full single-linkage.
-- **Non-overlapping**: each memory belongs to at most one cluster
-  (greedy `used[]` mask).
+- **Seed-based**: highest-importance memory anchors each cluster.
+- **Single-linkage**: a memory joins if similar to the *seed*, not all
+  existing members — O(n) per seed, avoids chaining artefacts.
+- **Non-overlapping**: each memory belongs to at most one cluster.
 
 ### Similarity threshold guide
 
 | threshold | Effect |
 |---|---|
-| 0.95 | Only near-duplicates cluster |
+| 0.95 | Only near-duplicates |
 | 0.80 | Same topic, similar phrasing |
 | 0.75 | Same topic, varied phrasing (default) |
 | 0.60 | Broadly related content |
-| 0.40 | Almost everything clusters together |
 
-### Default summarizer
+### Default summarizer (extractive)
 
 ```python
 def _default_summarizer(memories):
@@ -313,41 +328,32 @@ def _default_summarizer(memories):
     return ("[Reflection ×N] " + body)[:512]
 ```
 
-- **Extractive**: no LLM required.
-- **Most-important first**: the highest-signal events appear earliest.
-- **512-char cap**: keeps semantic memories compact.
-
 ### Custom (LLM) summarizer
 
 ```python
-def my_summarizer(memories: list[Memory]) -> str:
+from ai_houkai.memory_system import ReflectionEngine
+
+def my_summarizer(memories):
     prompt = "\n".join(m.text for m in memories)
     return call_llm(f"Summarise these events into one insight:\n{prompt}")
 
 engine = ReflectionEngine(store, summarizer=my_summarizer)
 ```
 
-Any callable `(list[Memory]) → str` is accepted.
-
 ### API
 
 ```python
+from ai_houkai.memory_system import MemoryStore, ReflectionEngine
+
 engine = ReflectionEngine(store,
                           similarity_threshold=0.75,
                           min_cluster_size=2,
-                          summarizer=None)  # None → default extractive
+                          summarizer=None)
 
-# Inspect without writing
-clusters = engine.clusters()               # list[list[Memory]]
-
-# Preview without writing
-previews = engine.reflect(dry_run=True)    # list[Memory] (not persisted)
-
-# Create semantic reflections, keep episodics
-created  = engine.reflect()
-
-# Create semantic reflections, delete episodics
-created  = engine.reflect(consolidate=True)
+clusters = engine.clusters()              # list[list[Memory]], no writes
+previews = engine.reflect(dry_run=True)   # list[Memory], not persisted
+created  = engine.reflect()               # persist semantic memories
+created  = engine.reflect(consolidate=True)  # + delete source episodics
 ```
 
 ### ChromaDB numpy array guard
@@ -365,7 +371,7 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`mcp_server/server.py` uses **FastMCP** to expose five tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose five tools:
 
 | Tool | Parameters | Returns |
 |---|---|---|
@@ -382,6 +388,65 @@ Configuration via environment variables:
 | `AI_HOUKAI_PATH` | `./.chroma` |
 | `AI_HOUKAI_COLLECTION` | `ai_houkai` |
 
+The `run()` function is the **console-script entry point**:
+
+```python
+# ai_houkai/mcp_server/server.py
+def run() -> None:
+    mcp.run()
+
+# pyproject.toml
+[project.scripts]
+ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
+```
+
+### Claude Code integration
+
+Claude Code reads `~/.claude/settings.json` (global) or
+`.claude/settings.json` (project-level) to discover MCP servers.
+
+```
+Claude Code CLI
+    │
+    │  reads at startup / per-invocation
+    ▼
+~/.claude/settings.json
+    │
+    │  spawns subprocess
+    ▼
+ai-houkai-mcp                         (console script)
+    │
+    │  stdio transport (JSON-RPC 2.0)
+    ▼
+ai_houkai.mcp_server.server  ──►  MemoryStore  ──►  ChromaDB on disk
+```
+
+**Quickest setup** — one command:
+
+```bash
+claude mcp add ai-houkai -- ai-houkai-mcp
+```
+
+**Programmatic setup** (auto-patches `settings.json`):
+
+```bash
+python examples/06_claude_code.py --install
+```
+
+#### CLAUDE.md guidance
+
+Adding memory instructions to `CLAUDE.md` teaches Claude Code *when*
+to use the tools autonomously — without the user needing to prompt:
+
+```markdown
+## Memory (AI-Houkai MCP)
+- recall() before starting any task
+- remember() conventions, decisions, corrections
+- forget() outdated facts
+```
+
+Generate a full snippet: `python examples/06_claude_code.py --claudemd`
+
 ### Claude Desktop integration
 
 ```
@@ -395,23 +460,22 @@ Claude Desktop
     │
     │  spawns subprocess
     ▼
-python -m mcp_server.server
+python -m ai_houkai.mcp_server.server
     │
-    │  stdio transport (JSON-RPC)
+    │  stdio transport (JSON-RPC 2.0)
     ▼
 MemoryStore ──► ChromaDB on disk
 ```
 
 `examples/03_claude_desktop.py --install` locates the platform-specific
-config path, patches the `mcpServers` block, and reports what Claude
-will see.
+config path and patches the `mcpServers` block automatically.
 
 ---
 
 ## 9. Agent Integrations
 
-All agent examples share the same `_dispatch_tool(name, arguments)` 
-interface. Only the SDK and message format differs.
+All agent examples share the same `_dispatch_tool(name, arguments)`
+interface.  Only the SDK and message format differ.
 
 ### Unified dispatch signature
 
@@ -425,7 +489,7 @@ def _dispatch_tool(name: str, arguments: str) -> str:
 ```
 
 This JSON-string interface matches the OpenAI/Ollama function-calling
-format natively. The Claude example serialises its dict input before
+format natively.  The Claude example serialises its dict input before
 calling dispatch.
 
 ### Provider comparison
@@ -433,11 +497,11 @@ calling dispatch.
 | | Claude (`claude_agent.py`) | OpenAI (`04_openai.py`) | Ollama (`02_ollama_local_network.py`) |
 |---|---|---|---|
 | SDK | `anthropic` | `openai` | `openai` (compat endpoint) |
-| Tool definition format | `{"name":…,"input_schema":{…}}` | `{"type":"function","function":{…}}` | same as OpenAI |
+| Tool definition | `{"name":…,"input_schema":{…}}` | `{"type":"function","function":{…}}` | same as OpenAI |
 | Tool call access | `block.name`, `block.input` (dict) | `tc.function.name`, `tc.function.arguments` (str) | same as OpenAI |
-| Arguments format | dict → `json.dumps()` before dispatch | JSON string | JSON string |
+| Arguments | dict → `json.dumps()` | JSON string | JSON string |
 | Endpoint | `api.anthropic.com` | `api.openai.com` | `localhost:11434/v1` |
-| Requires API key | yes | yes | no |
+| API key required | yes | yes | no |
 
 ### Message flow (generic)
 
@@ -449,7 +513,6 @@ LLM API  ──►  tool_call: {name, arguments}
      │
      ▼
 _dispatch_tool(name, arguments)
-     │
      ├── "remember" ──► store.remember()  ──► {"id":…, "stored":true}
      ├── "recall"   ──► store.recall()    ──► {"results":[…]}
      └── "forget"   ──► store.forget()    ──► {"deleted":true/false}
@@ -471,14 +534,13 @@ LLM API  ──►  assistant reply to user
 |---|---|---|
 | `test_memory.py` | 18 | `MemoryStore`: remember, forget, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
 | `test_decay.py` | 15 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store) |
-| `test_reflection.py` | 17 | `ReflectionEngine`: clustering (similarity threshold, min size), reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
+| `test_reflection.py` | 17 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
 | `test_dispatch.py` | 30 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 
 ### Test isolation strategy
 
-`EphemeralClient()` shares an in-process SQLite database, so tests
-in the same pytest session see each other's data.  All tests use
-`PersistentClient` with a `tmp_path`-backed directory:
+`EphemeralClient()` shares an in-process SQLite database.  All tests
+use `PersistentClient` with a `tmp_path`-backed directory:
 
 ```python
 # tests/conftest.py
@@ -487,13 +549,12 @@ def store(tmp_path) -> MemoryStore:
     return MemoryStore(path=str(tmp_path / "chroma"), collection="test_memory")
 ```
 
-pytest's `tmp_path` fixture creates a unique directory per test
-invocation and cleans it up afterwards.
+pytest's `tmp_path` fixture creates a unique directory per test and
+cleans it up afterwards.
 
 ### Loading digit-prefixed modules
 
-`importlib.import_module("04_openai")` raises `ModuleNotFoundError`
-because `04_openai` is not a valid Python identifier.
+`importlib.import_module("04_openai")` raises `ModuleNotFoundError`.
 `test_dispatch.py` uses `spec_from_file_location` instead:
 
 ```python
@@ -507,7 +568,7 @@ spec.loader.exec_module(mod)
 ### SDK stubbing
 
 Agent examples import `openai` and `anthropic` at module level.
-Tests inject stub modules before loading so no network calls happen:
+Tests inject stubs before loading so no network calls happen:
 
 ```python
 fake_client = types.SimpleNamespace(
@@ -525,58 +586,46 @@ sys.modules["anthropic"].Anthropic = lambda: fake_client
 
 ### Hybrid retrieval score
 
-Current retrieval ranks purely by cosine similarity.  A richer score:
-
-```
+```python
 score = α·cosine_sim + β·(1 − age_days/max_age) + γ·importance
 ```
 
-could be implemented as a post-ranking step after `recall()` returns,
-or by adding a custom ChromaDB embedding function that bakes recency
-into the vector.
+Implement as a post-ranking step after `recall()` returns.
 
 ### Scheduled cognitive maintenance
 
-Decay and reflection are currently called explicitly.  A production
-agent could run them on a schedule:
-
 ```python
 import threading, time
+from ai_houkai.memory_system import DecayEngine, ReflectionEngine
 
-def _background_maintenance(store, interval=3600):
-    decay = DecayEngine(store)
+def _maintenance(store, interval=3600):
+    decay   = DecayEngine(store)
     reflect = ReflectionEngine(store)
     while True:
         time.sleep(interval)
         decay.prune()
         reflect.reflect(consolidate=True)
 
-threading.Thread(target=_background_maintenance,
-                 args=(store,), daemon=True).start()
+threading.Thread(target=_maintenance, args=(store,), daemon=True).start()
 ```
 
 ### Multi-user / multi-agent
 
-Each `MemoryStore` targets a single ChromaDB collection.  To isolate
-users or agents, pass distinct collection names:
+Each `MemoryStore` targets a single collection.  Isolate agents by
+passing distinct collection names:
 
 ```python
-alice_store = MemoryStore(path=".chroma", collection="agent_alice")
-bob_store   = MemoryStore(path=".chroma", collection="agent_bob")
+from ai_houkai.memory_system import MemoryStore
+
+alice = MemoryStore(path=".chroma", collection="agent_alice")
+bob   = MemoryStore(path=".chroma", collection="agent_bob")
 ```
 
-All agents can share the same ChromaDB directory; the HNSW index is
-per-collection.
-
 ### Pluggable embeddings
-
-Swap the local sentence-transformers model for any
-`chromadb.EmbeddingFunction`:
 
 ```python
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 
-store = MemoryStore()
 store.collection = store.client.get_or_create_collection(
     name="ai_houkai",
     embedding_function=OpenAIEmbeddingFunction(
@@ -589,27 +638,25 @@ store.collection = store.client.get_or_create_collection(
 
 ### LLM reflection summarizer
 
-Replace the extractive default with a generative summary:
-
 ```python
-def gpt_summarizer(memories: list[Memory]) -> str:
+from ai_houkai.memory_system import ReflectionEngine
+
+def gpt_summarizer(memories):
     prompt = "\n".join(f"- {m.text}" for m in memories)
-    resp = openai_client.chat.completions.create(
+    return openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user",
                    "content": f"Distil these events into one insight:\n{prompt}"}],
-    )
-    return resp.choices[0].message.content
+    ).choices[0].message.content
 
 engine = ReflectionEngine(store, summarizer=gpt_summarizer)
 ```
 
 ### Importance auto-assignment
 
-Currently importance is caller-supplied.  An agent could estimate it
-from context:
+Assign importance based on context rather than caller-supplied values:
 
-- High importance for explicit user instructions or corrections.
-- Medium importance for task completions.
-- Low importance for observations or passing mentions.
-- LLM-based: ask the model to rate `0..1` before storing.
+- **High** (0.9+): explicit user instructions, corrections, preferences
+- **Medium** (0.6–0.8): task completions, project decisions
+- **Low** (0.2–0.4): passing observations, intermediate steps
+- **LLM-based**: ask the model to rate 0–1 before storing
