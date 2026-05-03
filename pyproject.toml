@@ -2,7 +2,6 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-# ── project metadata ──────────────────────────────────────────────────────────
 
 [project]
 name            = "ai-houkai"
@@ -30,7 +29,6 @@ dependencies = [
     "mcp>=1.2.0",
 ]
 
-# ── optional extras ───────────────────────────────────────────────────────────
 
 [project.optional-dependencies]
 # pip install "ai-houkai[claude]"
@@ -50,14 +48,12 @@ dev = [
     "pytest>=8.0.0",
 ]
 
-# ── console scripts ───────────────────────────────────────────────────────────
 
 [project.scripts]
 # Start the MCP server: ai-houkai-mcp
 # Env vars: AI_HOUKAI_PATH, AI_HOUKAI_COLLECTION
 ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
 
-# ── package discovery ─────────────────────────────────────────────────────────
 
 [tool.setuptools.packages.find]
 where   = ["."]
@@ -66,7 +62,6 @@ include = ["ai_houkai*"]
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
 
-# ── pytest ────────────────────────────────────────────────────────────────────
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

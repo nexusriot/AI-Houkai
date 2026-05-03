@@ -15,8 +15,8 @@ No API keys required — the memory layer runs fully local.
 
 from __future__ import annotations
 
-import time
 import shutil
+import time
 import tempfile
 
 from ai_houkai.memory_system import (
@@ -82,7 +82,6 @@ for mem, score in hits:
 
 
 sep("5 · DecayEngine")
-
 
 # Backdate the episodic memories to look 45 days old
 for m in memories:

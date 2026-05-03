@@ -6,7 +6,7 @@ using the Model Context Protocol (MCP).
 
 How it works
 ────────────
-  Claude Desktop  ──MCP──  mcp_server/server.py  ──  ChromaDB
+  Claude Desktop  ──MCP──  ai_houkai/mcp_server/server.py  ──  ChromaDB
         │                         │
    (GUI chat)         exposes remember/recall/forget/stats
 
@@ -68,7 +68,7 @@ def build_mcp_block(memory_path: str) -> dict:
     """Return the JSON block for claude_desktop_config.json."""
     return {
         "command": _python_executable(),
-        "args": ["-m", "mcp_server.server"],
+        "args": ["-m", "ai_houkai.mcp_server.server"],
         "cwd": PROJECT_ROOT,
         "env": {
             "AI_HOUKAI_PATH": memory_path,
@@ -127,8 +127,8 @@ def verify() -> None:
 
         os.environ.setdefault("AI_HOUKAI_PATH", DEFAULT_MEMORY_PATH)
         spec = importlib.util.spec_from_file_location(
-            "mcp_server.server",
-            os.path.join(PROJECT_ROOT, "mcp_server", "server.py"),
+            "ai_houkai.mcp_server.server",
+            os.path.join(PROJECT_ROOT, "ai_houkai", "mcp_server", "server.py"),
         )
         mod = importlib.util.module_from_spec(spec)  # type: ignore
         spec.loader.exec_module(mod)  # type: ignore
