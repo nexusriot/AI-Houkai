@@ -50,13 +50,11 @@ import textwrap
 
 from ai_houkai.memory_system import MemoryStore
 
-# ── paths ─────────────────────────────────────────────────────────────────────
 
 SETTINGS_PATH   = os.path.expanduser("~/.claude/settings.json")
 DEFAULT_MEM_PATH = os.path.expanduser("~/.ai_houkai")
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _mcp_command() -> str:
     """Return the absolute path to the ai-houkai-mcp console script."""
@@ -76,8 +74,6 @@ def _build_mcp_block(memory_path: str) -> dict:
         },
     }
 
-
-# ── sub-commands ───────────────────────────────────────────────────────────────
 
 def cmd_print(memory_path: str) -> None:
     """Print the JSON block to paste into settings.json."""
@@ -257,8 +253,6 @@ def cmd_demo(memory_path: str) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ── CLAUDE.md note ─────────────────────────────────────────────────────────────
-
 CLAUDEMD_SNIPPET = textwrap.dedent("""
     ## Memory (AI-Houkai MCP)
 
@@ -285,8 +279,6 @@ CLAUDEMD_SNIPPET = textwrap.dedent("""
     - `feedback` — user preferences ("Prefers concise answers")
 """).strip()
 
-
-# ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     ap = argparse.ArgumentParser(
