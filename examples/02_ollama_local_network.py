@@ -34,7 +34,6 @@ import json
 import os
 import sys
 import tempfile
-import time
 
 import urllib.request, urllib.error
 
@@ -43,12 +42,11 @@ try:
 except ImportError:
     sys.exit("pip install openai")
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from memory_system import MemoryStore
 
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-OLLAMA_HOST  = os.environ.get("OLLAMA_HOST",  "192.168.88.61")   # ← change me
+OLLAMA_HOST  = os.environ.get("OLLAMA_HOST",  "127.0.0.1")   # ← change me
 OLLAMA_PORT  = int(os.environ.get("OLLAMA_PORT", "11434"))
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "nexusriot/gemma-4-abliterated:e2b")
 MEMORY_PATH  = os.environ.get("AI_HOUKAI_PATH",
