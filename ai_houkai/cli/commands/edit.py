@@ -1,8 +1,8 @@
 """Edit, tag, and bump commands."""
 
 from __future__ import annotations
-
-import time
+import subprocess
+import tempfile
 from typing import List, Optional
 
 import typer
@@ -41,8 +41,6 @@ def edit(
         f"{mem.text}\n"
     )
 
-    import subprocess
-    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False, prefix="houkai_") as tf:
         tf.write(yaml_block)
         tmp_path = tf.name

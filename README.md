@@ -301,7 +301,7 @@ editor              = "nvim"
 
 ## Roadmap
 
-Designs for upcoming features live in [PROPOSALS.md](PROPOSALS.md).
+Designs for upcoming features live in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
 
 ## Run the tests
 

@@ -35,10 +35,9 @@ from __future__ import annotations
 
 import math
 import uuid
-from typing import Callable, TYPE_CHECKING
+from typing import Callable
 
-if TYPE_CHECKING:
-    from .store import Memory, MemoryStore
+from .store import Memory as Memory, MemoryStore
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -128,8 +127,7 @@ class ReflectionEngine:
             )
 
             if dry_run:
-                from .store import Memory as _Memory
-                candidate = _Memory(
+                candidate = Memory(
                     id=str(uuid.uuid4()),
                     text=text,
                     type="semantic",
@@ -166,8 +164,6 @@ class ReflectionEngine:
     def _fetch_episodic(
         self,
     ) -> "tuple[list[Memory], list[list[float]]]":
-        from .store import Memory as _Memory
-
         res = self.store.collection.get(
             where={"type": "episodic"},
             include=["embeddings", "documents", "metadatas"],
@@ -179,7 +175,7 @@ class ReflectionEngine:
         embs  = [] if raw is None else raw  # numpy arrays are truthy-ambiguous
 
         mems = [
-            _Memory.from_record(i, d, m)
+            Memory.from_record(i, d, m)
             for i, d, m in zip(ids, docs, metas)
         ]
         return mems, [list(e) for e in embs]

@@ -7,7 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 import typer
-
+from rich.console import Console
+from rich.table import Table
 
 def stats(
     ctx: typer.Context,
@@ -49,8 +50,7 @@ def stats(
         return
 
     try:
-        from rich.console import Console
-        from rich.table import Table
+
         console = Console()
 
         console.print(f"[bold]Store[/]       {store_path}")

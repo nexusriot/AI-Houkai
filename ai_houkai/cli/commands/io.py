@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -46,8 +47,6 @@ def import_cmd(
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Import memories from a JSONL file."""
-    import hashlib
-
     store = ctx.obj["store"]
     records = []
     with open(path) as f:

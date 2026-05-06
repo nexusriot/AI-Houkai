@@ -6,6 +6,8 @@ import json
 from typing import List, Optional
 
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from ai_houkai.cli import output as out
 
@@ -74,8 +76,6 @@ def neighbors(
         return
 
     try:
-        from rich.console import Console
-        from rich.table import Table
         console = Console()
         table = Table(show_header=True, header_style="bold cyan")
         table.add_column("REL", width=14)

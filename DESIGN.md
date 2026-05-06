@@ -849,7 +849,7 @@ Default `mode="semantic"` is unchanged — zero risk for existing callers.
 
 ## 15. Extension Points
 
-> The designs in [PROPOSALS.md](PROPOSALS.md) are now implemented (§12–14).
+> The designs in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/) are now implemented (§12–14).
 > The sketches below remain valid for further customisation.
 > The sketches below remain valid as quick recipes.
 

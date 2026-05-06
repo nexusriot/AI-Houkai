@@ -6,7 +6,9 @@ from typing import List
 
 import typer
 
+from ai_houkai.memory_system.decay import DecayEngine
 from ai_houkai.cli import output as out
+
 
 
 def prune(
@@ -18,8 +20,6 @@ def prune(
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Prune low-score memories via exponential decay. Dry-run by default."""
-    from ai_houkai.memory_system.decay import DecayEngine
-
     store = ctx.obj["store"]
     engine = DecayEngine(
         store,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import typer
 
 from ai_houkai.cli import output as out
-
+from ai_houkai.memory_system.reflection import ReflectionEngine
 
 def reflect(
     ctx: typer.Context,
@@ -16,7 +16,7 @@ def reflect(
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Cluster episodic memories and synthesise semantic summaries. Dry-run by default."""
-    from ai_houkai.memory_system.reflection import ReflectionEngine
+
 
     store = ctx.obj["store"]
     engine = ReflectionEngine(

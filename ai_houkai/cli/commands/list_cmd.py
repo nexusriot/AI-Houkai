@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import time
 from typing import Optional
 
@@ -11,7 +12,6 @@ _DURATION_MAP = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 def _parse_since(since: str) -> float:
-    import datetime
     if not since:
         return 0.0
     for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):

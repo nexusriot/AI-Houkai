@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
 from typing import Any
 
 from ai_houkai.memory_system.store import Memory
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 _USE_RICH = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -92,15 +95,6 @@ def print_memories_table(
         return
 
     if output_fmt == "tsv":
-        _print_tsv(normalized, show_score=show_score)
-        return
-
-    # rich
-    try:
-        from rich.console import Console
-        from rich.table import Table
-        from rich.text import Text
-    except ImportError:
         _print_tsv(normalized, show_score=show_score)
         return
 
