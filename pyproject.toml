@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.1.6"
+version         = "0.2.1"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -38,14 +38,19 @@ claude = ["anthropic>=0.40.0"]
 # Also covers Ollama (uses the same openai client via the /v1 compat endpoint)
 openai = ["openai>=1.50.0"]
 
+# pip install "ai-houkai[cli]"
+cli = ["typer>=0.12", "rich>=13.7"]
+
 # pip install "ai-houkai[all]"
-all = ["anthropic>=0.40.0", "openai>=1.50.0"]
+all = ["anthropic>=0.40.0", "openai>=1.50.0", "typer>=0.12", "rich>=13.7"]
 
 # pip install "ai-houkai[dev]"
 dev = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
     "pytest>=8.0.0",
+    "typer>=0.12",
+    "rich>=13.7",
 ]
 
 
@@ -56,6 +61,9 @@ ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
 
 # Register the MCP server with Claude Code (~/.claude/settings.json)
 ai-houkai-install-claude-code = "ai_houkai.installers.claude_code:_main"
+
+# Terminal CLI — requires pip install "ai-houkai[cli]"
+houkai = "ai_houkai.cli.main:_main"
 
 
 [tool.setuptools.packages.find]

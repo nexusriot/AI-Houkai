@@ -17,6 +17,7 @@
 13. [Conflict / Contradiction Detection](#13-conflict--contradiction-detection)
 14. [Hybrid Retrieval](#14-hybrid-retrieval)
 15. [Extension Points](#15-extension-points)
+16. [CLI — houkai](#16-cli--houkai)
 
 ---
 
@@ -47,16 +48,18 @@ Four cognitive operations model how humans manage long-term memory:
 └───────────────┬───────────────────────────┬──────────────────┘
                 │ tool calls                │ tool results
                 ▼                           │
-┌──────────────────────────┐                │
-│      _dispatch_tool()    │◄───────────────┘
-│  (examples/claude_agent, │
-│   04_openai, 02_ollama)  │
-└───────────┬──────────────┘
-            │  or via MCP
-            ▼
+┌──────────────────────────┐                │   ┌─────────────────────┐
+│      _dispatch_tool()    │◄───────────────┘   │   houkai CLI        │
+│  (examples/claude_agent, │                    │  (ai_houkai.cli)    │
+│   04_openai, 02_ollama)  │                    └──────────┬──────────┘
+└───────────┬──────────────┘                               │
+            │  or via MCP                                  │ direct Python
+            ▼                                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      MemoryStore                             │
 │   remember()  recall()  forget()  list_recent()  count()     │
+│   link()  unlink()  neighbors()  subgraph()                  │
+│   supersede()  restore()  find_conflicts()                   │
 └───────────────────────────┬──────────────────────────────────┘
                             │
             ┌───────────────┼────────────────┐
@@ -95,6 +98,25 @@ ai_houkai/                        pip package name: ai-houkai
 ├── mcp_server/
 │   ├── __init__.py
 │   └── server.py                 FastMCP server — 10 tools
+├── cli/
+│   ├── __init__.py
+│   ├── __main__.py               python -m ai_houkai.cli
+│   ├── main.py                   Typer app, shared --store/--collection flags
+│   ├── config.py                 env → config file → defaults resolution
+│   ├── output.py                 rich / TSV / JSON, id prefix, fmt_age
+│   └── commands/
+│       ├── remember.py           houkai remember
+│       ├── recall.py             houkai recall
+│       ├── list_cmd.py           houkai list
+│       ├── show.py               houkai show
+│       ├── forget.py             houkai forget
+│       ├── edit.py               houkai edit / tag / bump
+│       ├── link.py               houkai link / unlink / neighbors / graph
+│       ├── conflicts.py          houkai conflicts / supersede / restore
+│       ├── decay.py              houkai prune  (wraps DecayEngine)
+│       ├── reflect.py            houkai reflect (wraps ReflectionEngine)
+│       ├── io.py                 houkai export / import / backup
+│       └── stats.py              houkai stats
 └── installers/
     ├── __init__.py               re-exports ClaudeCodeInstaller
     └── claude_code.py            patches ~/.claude/settings.json
@@ -669,7 +691,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 79 tests across 4 files
+### 168 tests across 5 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -677,6 +699,7 @@ LLM API  ──►  assistant reply to user
 | `test_decay.py` | 15 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store) |
 | `test_reflection.py` | 17 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
 | `test_dispatch.py` | 30 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
+| `test_cli.py` | 11 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin |
 
 ### Test isolation strategy
 
@@ -907,3 +930,130 @@ Assign importance based on context rather than caller-supplied values:
 - **Medium** (0.6–0.8): task completions, project decisions
 - **Low** (0.2–0.4): passing observations, intermediate steps
 - **LLM-based**: ask the model to rate 0–1 before storing
+
+---
+
+## 16. CLI — houkai
+
+The `houkai` command gives a human operator direct terminal access to
+the same `MemoryStore` that agents and MCP clients use.  It is an
+optional dependency (`pip install "ai-houkai[cli]"`) so the core memory
+library stays dep-light.
+
+### Dependency strategy
+
+```toml
+# pyproject.toml
+[project.optional-dependencies]
+cli = ["typer>=0.12", "rich>=13.7"]
+
+[project.scripts]
+houkai = "ai_houkai.cli.main:_main"
+```
+
+`typer` and `rich` are not imported at the module level of any
+`memory_system` or `mcp_server` code — the CLI subtree is the only
+consumer.  A `try/except ImportError` guard at the entrypoint prints a
+friendly install hint if the extras are absent.
+
+### Architecture
+
+```
+houkai (bin)
+  └── ai_houkai/cli/main.py          Typer app; registers 22 commands;
+                                     shared --store / --collection flags
+        ├── config.py                Config resolution chain:
+        │                             1. --store / --collection CLI flags
+        │                             2. AI_HOUKAI_PATH / AI_HOUKAI_COLLECTION env
+        │                             3. ~/.config/ai_houkai/config.toml
+        │                             4. ~/.ai_houkai/.chroma  /  ai_houkai
+        ├── output.py                Output layer:
+        │                             - rich Table (TTY)
+        │                             - TSV (non-TTY / pipe)
+        │                             - JSON (--format json)
+        │                             - id prefix resolution (8-char → UUID)
+        │                             - fmt_age(), fmt_importance() helpers
+        └── commands/
+              *.py                   One module per logical group;
+                                     each file exports plain functions
+                                     registered in main.py via
+                                     app.command("name")(fn)
+```
+
+All command functions take `ctx: typer.Context` as their first
+parameter.  The shared callback stores `{"store": MemoryStore, "config":
+Config}` in `ctx.obj` before any subcommand runs.
+
+### Command inventory
+
+| Command | Module | Wraps |
+|---|---|---|
+| `remember` | `remember.py` | `store.remember()` |
+| `recall` | `recall.py` | `store.recall()` |
+| `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
+| `show` | `show.py` | `store._get_by_id()` |
+| `forget` | `forget.py` | `store.forget()` |
+| `edit` | `edit.py` | forget + remember (re-embeds if text changed) |
+| `tag` | `edit.py` | `collection.update()` metadata-only |
+| `bump` | `edit.py` | `collection.update()` metadata-only |
+| `link` | `link.py` | `store.link()` |
+| `unlink` | `link.py` | `store.unlink()` |
+| `neighbors` | `link.py` | `store.neighbors()` |
+| `graph` | `link.py` | `store.subgraph()` |
+| `conflicts` | `conflicts.py` | `store.find_conflicts()` |
+| `supersede` | `conflicts.py` | `store.supersede()` |
+| `restore` | `conflicts.py` | `store.restore()` |
+| `prune` | `decay.py` | `DecayEngine.prune()` |
+| `reflect` | `reflect.py` | `ReflectionEngine.reflect()` |
+| `export` | `io.py` | `store.list_recent()` → JSONL |
+| `import` | `io.py` | JSONL → `store.remember()` |
+| `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
+| `stats` | `stats.py` | `store.list_recent()` + Counter |
+
+### Output system
+
+`output.py` selects the renderer at call time (not import time) by
+checking `sys.stdout.isatty()` and `NO_COLOR`:
+
+```
+stdout isatty + no NO_COLOR  →  rich Table  (colour, box-drawing)
+stdout not a TTY              →  TSV         (tab-separated, machine-readable)
+--format json                 →  JSON array  (explicit override)
+```
+
+Every table row uses an 8-char id prefix.  Full UUIDs are accepted on
+input; `resolve_id_prefix()` performs a linear scan of all memories and
+raises `ValueError` on ambiguous or missing prefixes.
+
+### Safety rules
+
+- **Destructive commands** (`forget`, `prune --apply`, `reflect --apply
+  --consolidate hard`, `import`) confirm interactively unless `--yes`.
+- `prune` and `reflect` default to **dry-run** — matching the underlying
+  engine conventions — and require an explicit `--apply` flag to write.
+- `tag` and `bump` update only ChromaDB metadata; the embedding vector
+  is unchanged, keeping the semantic index consistent.
+- `edit` re-embeds the text (delete + re-add) only when the text field
+  changes; metadata-only edits go through `collection.update()`.
+
+### Config file
+
+`~/.config/ai_houkai/config.toml` (read with `tomllib`, stdlib ≥ 3.11):
+
+```toml
+store_path         = "~/.ai_houkai/.chroma"
+collection         = "ai_houkai"
+default_type       = "semantic"
+default_importance = 0.5
+editor             = "nvim"    # fallback: $EDITOR env, then "nano"
+```
+
+### Testing strategy
+
+`tests/test_cli.py` uses Typer's `CliRunner` — no subprocess, no disk
+I/O outside `tmp_path`.  Each test creates a fresh isolated store via
+`--store tmp_path/chroma --collection cli_test`.
+
+HF Hub model load warnings are emitted to stdout through the runner;
+UUID extraction uses a regex (`_first_uuid()`) rather than assuming the
+output is only the UUID, making tests robust to logging noise.
