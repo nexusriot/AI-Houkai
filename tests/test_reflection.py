@@ -121,20 +121,37 @@ class TestReflect:
         for m in candidates:
             assert "dry-run" in (m.source or "")
 
-    def test_consolidate_removes_source_episodic(self, store: MemoryStore):
+    def test_consolidate_soft_deletes_sources(self, store: MemoryStore):
+        """consolidate=True soft-deletes sources (supersedes them, keeps in DB)."""
         self._seed_deployment_cluster(store)
-        episodic_before = store.count()
         engine = ReflectionEngine(store, similarity_threshold=0.70,
                                   min_cluster_size=2)
         created = engine.reflect(consolidate=True)
         assert len(created) >= 1
-        # All episodics in the cluster should be gone; only reflections remain
-        remaining = store.list_recent(limit=100)
-        episodic_remaining = [m for m in remaining if m.type == "episodic"]
-        semantic_remaining  = [m for m in remaining if m.type == "semantic"]
-        assert len(semantic_remaining) >= 1
-        # Total should be less than before (some episodics removed)
-        assert store.count() < episodic_before + len(created)
+
+        # default list_recent hides superseded — only semantics visible
+        visible = store.list_recent(limit=100)
+        semantic_visible = [m for m in visible if m.type == "semantic"]
+        episodic_visible = [m for m in visible if m.type == "episodic"]
+        assert len(semantic_visible) >= 1
+        assert len(episodic_visible) == 0
+
+        # with include_superseded=True, the episodics are still there
+        all_mems = store.list_recent(limit=100, include_superseded=True)
+        episodic_all = [m for m in all_mems if m.type == "episodic"]
+        assert len(episodic_all) >= 1
+        assert all(m.superseded_by != "" for m in episodic_all)
+
+    def test_consolidate_hard_removes_sources(self, store: MemoryStore):
+        """consolidate='hard' hard-deletes sources (old behaviour)."""
+        self._seed_deployment_cluster(store)
+        count_before = store.count()
+        engine = ReflectionEngine(store, similarity_threshold=0.70,
+                                  min_cluster_size=2)
+        created = engine.reflect(consolidate="hard")
+        assert len(created) >= 1
+        # Hard delete: total count is less than before + reflections created
+        assert store.count() < count_before + len(created)
 
     def test_tags_merged_from_sources(self, store: MemoryStore):
         _ep(store, "Deployed API v2.1 to prod.", tags=["deploy", "api"])

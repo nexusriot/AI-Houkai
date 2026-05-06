@@ -32,9 +32,12 @@ AI-Houkai/
 │   │   ├── store.py              # MemoryStore + Memory dataclass
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   └── reflection.py        # ReflectionEngine — episodic → semantic
-│   └── mcp_server/
+│   ├── mcp_server/
+│   │   ├── __init__.py
+│   │   └── server.py             # FastMCP server (5 tools)
+│   └── installers/
 │       ├── __init__.py
-│       └── server.py             # FastMCP server (5 tools)
+│       └── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
 ├── examples/
 │   ├── 01_standalone.py          # pure-Python walkthrough, no LLM
 │   ├── 02_ollama_local_network.py  # Ollama on LAN, fully offline
@@ -117,6 +120,11 @@ for mem, score in store.recall("parallel execution", k=3):
     print(f"{score:.3f}  {mem.text}")
 ```
 
+## Roadmap
+
+Designs for upcoming features (hybrid retrieval, conflict detection,
+memory linking) live in [PROPOSALS.md](PROPOSALS.md).
+
 ## Run the tests
 
 ```bash
@@ -194,10 +202,15 @@ coding session.
 # Option A — one-liner (recommended)
 claude mcp add ai-houkai -- ai-houkai-mcp
 
-# Option B — auto-patch ~/.claude/settings.json
+# Option B — installer console script (after `pip install ai-houkai`)
+ai-houkai-install-claude-code --install
+ai-houkai-install-claude-code --verify
+ai-houkai-install-claude-code --claudemd
+
+# Option C — auto-patch ~/.claude/settings.json via the example script
 python examples/06_claude_code.py --install
 
-# Option C — preview the config block
+# Option D — preview the config block
 python examples/06_claude_code.py
 
 # Smoke-test
@@ -226,11 +239,20 @@ The installed MCP block in `~/.claude/settings.json`:
 }
 ```
 
+The install logic lives in the reusable `ai_houkai.installers.claude_code`
+module — drop it into your own scripts:
+
+```python
+from ai_houkai.installers import ClaudeCodeInstaller
+
+ClaudeCodeInstaller(memory_path="~/.ai_houkai").install()
+```
+
 #### Recommended CLAUDE.md addition
 
 Add the following to your project's `CLAUDE.md` so Claude Code knows when and
-how to use memory tools (run `python examples/06_claude_code.py --claudemd`
-to generate it):
+how to use memory tools (run `ai-houkai-install-claude-code --claudemd`
+or `python examples/06_claude_code.py --claudemd` to generate it):
 
 ```markdown
 ## Memory (AI-Houkai MCP)

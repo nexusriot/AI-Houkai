@@ -7,16 +7,18 @@ Algorithm
    absorb neighbours above `similarity_threshold`, repeat until exhausted.
 4. For each cluster with ≥ min_cluster_size members, call `summarizer()` and
    store a new semantic memory tagged with "reflection".
-5. If `consolidate=True`, delete the source episodic memories afterwards.
+5. consolidate behaviour (default False):
+     False        — leave source episodics untouched
+     True         — soft-delete: mark sources as superseded_by the summary
+                    and add a "derived_from" link from summary → source
+     "hard"       — hard-delete: remove source episodics (old behaviour)
 
 Summarizer
 By default an extractive summarizer is used (no LLM required): it orders
 memories by importance, joins their texts, and trims to 512 chars.
 
-You can inject any callable that takes ``list[Memory] → str``:
-
     def my_llm_summarizer(memories: list[Memory]) -> str:
-        prompt = "\n".join(m.text for m in memories)
+        prompt = "\\n".join(m.text for m in memories)
         return call_llm(f"Summarise: {prompt}")
 
     engine = ReflectionEngine(store, summarizer=my_llm_summarizer)
@@ -27,15 +29,16 @@ Usage
     store  = MemoryStore(...)
     engine = ReflectionEngine(store)
 
-    plan    = engine.reflect(dry_run=True)    # preview without writing
-    created = engine.reflect(consolidate=True) # reflect + remove sources
+    plan    = engine.reflect(dry_run=True)        # preview without writing
+    created = engine.reflect(consolidate=True)    # reflect + soft-delete sources
+    created = engine.reflect(consolidate="hard")  # reflect + hard-delete sources
 """
 
 from __future__ import annotations
 
 import math
 import uuid
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Literal, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .store import Memory, MemoryStore
@@ -66,39 +69,28 @@ class ReflectionEngine:
         min_cluster_size: int = 2,
         summarizer: Callable[["list[Memory]"], str] | None = None,
     ) -> None:
-        """
-        Parameters
-        store
-            The MemoryStore to operate on.
-        similarity_threshold
-            Cosine similarity ≥ this value groups two memories together.
-            0.75 works well for thematically similar short sentences.
-        min_cluster_size
-            Clusters smaller than this are ignored.
-        summarizer
-            Callable(list[Memory]) → str used to produce the reflection text.
-            Defaults to the built-in extractive summarizer.
-        """
         self.store = store
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
         self.summarizer = summarizer or _default_summarizer
 
-
     def reflect(
         self,
         dry_run: bool = False,
-        consolidate: bool = False,
+        consolidate: bool | Literal["hard"] = False,
     ) -> "list[Memory]":
-        """
-        Cluster episodic memories and create semantic reflections.
+        """Cluster episodic memories and create semantic reflections.
 
         Parameters
         dry_run
             If True, return candidate Memory objects without writing anything.
         consolidate
-            If True (and not dry_run), delete source episodic memories after
-            creating the reflection.  Use carefully — data is lost.
+            False  — leave sources untouched (default).
+            True   — soft-delete: supersede sources and link summary → source
+                     with rel="derived_from". Sources remain in the store but
+                     are hidden from default recall/list_recent queries.
+            "hard" — hard-delete: permanently remove source episodics (old
+                     behaviour, data is lost).
 
         Returns
         Newly created (or candidate) semantic Memory objects, one per cluster.
@@ -114,7 +106,6 @@ class ReflectionEngine:
             group = [mems[i] for i in idx_list]
             text  = self.summarizer(group)
 
-            # Merge tags: "reflection" first, then unique tags from sources
             all_tags: list[str] = ["reflection"]
             seen: set[str] = {"reflection"}
             for m in group:
@@ -147,9 +138,19 @@ class ReflectionEngine:
                     source="reflection",
                 )
                 created.append(new_mem)
-                if consolidate:
+
+                if consolidate == "hard":
                     for m in group:
                         self.store.forget(m.id)
+                elif consolidate:
+                    for m in group:
+                        # Soft-delete: supersede + derived_from link
+                        self.store.supersede(old_id=m.id, new_id=new_mem.id)
+                        self.store.link(
+                            src_id=new_mem.id,
+                            dst_id=m.id,
+                            rel="derived_from",
+                        )
 
         return created
 

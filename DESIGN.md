@@ -10,9 +10,13 @@
 6. [Decay Engine](#6-decay-engine)
 7. [Reflection Engine](#7-reflection-engine)
 8. [MCP Server](#8-mcp-server)
-9. [Agent Integrations](#9-agent-integrations)
-10. [Test Architecture](#10-test-architecture)
-11. [Extension Points](#11-extension-points)
+9. [Installers](#9-installers)
+10. [Agent Integrations](#10-agent-integrations)
+11. [Test Architecture](#11-test-architecture)
+12. [Memory Linking](#12-memory-linking)
+13. [Conflict / Contradiction Detection](#13-conflict--contradiction-detection)
+14. [Hybrid Retrieval](#14-hybrid-retrieval)
+15. [Extension Points](#15-extension-points)
 
 ---
 
@@ -82,13 +86,18 @@ ai_houkai/                        pip package name: ai-houkai
 ├── __init__.py                   convenience re-exports
 ├── memory_system/
 │   ├── __init__.py               exports Memory, MemoryStore, MemoryType,
+│   │                             Link, Graph, HybridWeights, ExpandSpec,
+│   │                             Conflict, ConflictError, ConflictFn,
 │   │                             DecayEngine, ReflectionEngine
-│   ├── store.py                  MemoryStore + Memory dataclass
+│   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
 │   ├── decay.py                  DecayEngine
 │   └── reflection.py            ReflectionEngine
-└── mcp_server/
-    ├── __init__.py
-    └── server.py                 FastMCP server + run() entry point
+├── mcp_server/
+│   ├── __init__.py
+│   └── server.py                 FastMCP server — 10 tools
+└── installers/
+    ├── __init__.py               re-exports ClaudeCodeInstaller
+    └── claude_code.py            patches ~/.claude/settings.json
 ```
 
 Import styles:
@@ -119,7 +128,35 @@ class Memory:
     last_accessed: float        # updated on every recall hit
     access_count:  int          # total recall hits
     source:        str | None   # optional provenance label
+    # linking
+    links:         list[Link]   # directed edges to other memories
+    # conflict management
+    superseded_by: str          # id of superseding memory, or ""
+    superseded_at: float        # epoch when superseded
+    polarity:      int          # -1 / 0 / +1
 ```
+
+### Link dataclass
+
+```python
+@dataclass
+class Link:
+    to:  str   # destination memory id
+    rel: str   # relation vocabulary below
+```
+
+Standard `rel` vocabulary:
+
+| `rel` | Meaning | Created by |
+|---|---|---|
+| `supersedes`    | replaces another memory             | `supersede()` |
+| `refines`       | adds detail to another memory       | manual / agent |
+| `derived_from`  | reflection summary ← source episodic | `ReflectionEngine` |
+| `example_of`    | concrete instance of a rule         | manual / agent |
+| `contradicts`   | intentional disagreement            | `find_conflicts()` + user |
+| `related`       | catch-all weak association          | manual / agent |
+
+`rel` is an open string — callers may add their own.
 
 ### Memory types
 
@@ -139,14 +176,21 @@ Types affect two behaviours:
 ### Metadata serialisation
 
 ChromaDB metadata values must be scalar.  Tags are stored as a
-comma-joined string and re-split on read:
+comma-joined string; `links` are JSON-encoded:
 
 ```python
 # write
-{"tags": "deploy,api,prod"}
+{
+    "tags":          "deploy,api,prod",
+    "links":         '[{"to":"a8...","rel":"refines"}]',
+    "superseded_by": "",
+    "superseded_at": 0.0,
+    "polarity":      0,
+}
 
-# read
-tags = [t for t in meta["tags"].split(",") if t]
+# read — all new fields default safely for old records
+tags  = [t for t in meta.get("tags", "").split(",") if t]
+links = json.loads(meta.get("links") or "[]")
 ```
 
 ---
@@ -371,15 +415,32 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose five tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose ten tools:
 
-| Tool | Parameters | Returns |
+**Core tools**
+
+| Tool | Key parameters | Returns |
 |---|---|---|
-| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?` | `{id, stored}` |
-| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?` | `list[{id,text,type,tags,importance,score,created_at}]` |
+| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored}` or `{stored:false, conflicts:[…]}` |
+| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
 | `forget` | `memory_id` | `{deleted}` |
-| `list_recent` | `limit?` | `list[{id,text,type,tags,created_at}]` |
+| `list_recent` | `limit?`, `include_superseded?` | `list[{…,superseded_by}]` |
 | `stats` | — | `{count, path, collection}` |
+
+**Linking tools**
+
+| Tool | Key parameters | Returns |
+|---|---|---|
+| `link`      | `src_id`, `dst_id`, `rel?` | `{ok, src_id, dst_id, rel}` |
+| `unlink`    | `src_id`, `dst_id`, `rel?` | `{removed}` |
+| `neighbors` | `memory_id`, `rel?`, `direction?`, `depth?` | `list[{id,text,type,tags,importance,rel}]` |
+
+**Conflict tools**
+
+| Tool | Key parameters | Returns |
+|---|---|---|
+| `find_conflicts` | `memory_id?`, `threshold?` | `list[{kind,reason,similarity,a,b}]` |
+| `supersede`      | `old_id`, `new_id`         | `{ok, old_id, new_id}` |
 
 Configuration via environment variables:
 
@@ -427,11 +488,38 @@ ai_houkai.mcp_server.server  ──►  MemoryStore  ──►  ChromaDB on disk
 claude mcp add ai-houkai -- ai-houkai-mcp
 ```
 
-**Programmatic setup** (auto-patches `settings.json`):
+**Programmatic setup** — three equivalent paths, all backed by the same
+installer module (`ai_houkai.installers.claude_code`):
 
 ```bash
+# console script (installed by pip)
+ai-houkai-install-claude-code --install
+
+# python -m
+python -m ai_houkai.installers.claude_code --install
+
+# example wrapper (also offers --demo)
 python examples/06_claude_code.py --install
 ```
+
+**Library usage** — embed installation in your own bootstrap scripts:
+
+```python
+from ai_houkai.installers import ClaudeCodeInstaller
+
+inst = ClaudeCodeInstaller(
+    memory_path   = "~/.ai_houkai",
+    collection    = "my_project",          # per-project namespace
+    settings_path = ".claude/settings.json"  # project-scoped install
+)
+inst.install()
+inst.verify()
+print(inst.claudemd_snippet())
+```
+
+The installer is a small dataclass (no global state, idempotent writes,
+JSON-merge into existing `mcpServers`) so it composes well with project
+scaffolding tooling.
 
 #### CLAUDE.md guidance
 
@@ -472,7 +560,60 @@ config path and patches the `mcpServers` block automatically.
 
 ---
 
-## 9. Agent Integrations
+## 9. Installers
+
+The `ai_houkai.installers` subpackage isolates the boilerplate needed to
+register the MCP server with various MCP clients.  It used to live inside
+`examples/06_claude_code.py`; promoting it to a real module means:
+
+- Third-party tools can import `ClaudeCodeInstaller` as a library.
+- The console script `ai-houkai-install-claude-code` is available
+  immediately after `pip install ai-houkai` — no example file required.
+- Tests can target the installer directly without `spec_from_file_location`
+  hacks for digit-prefixed examples.
+
+### `ClaudeCodeInstaller`
+
+```python
+@dataclass
+class ClaudeCodeInstaller:
+    memory_path:   str = "~/.ai_houkai"
+    collection:    str = "claude_code"
+    settings_path: str = "~/.claude/settings.json"
+    server_name:   str = "ai-houkai"
+    extra_env:     dict = {}
+
+    def build_mcp_block(self)      -> dict
+    def build_settings_block(self) -> dict
+    def install(self)              -> str        # returns settings_path
+    def print_config(self)         -> None
+    def verify(self)               -> bool
+    @staticmethod
+    def claudemd_snippet()         -> str
+```
+
+### Behaviour
+
+- **Idempotent**: re-running `install()` overwrites the `ai-houkai` entry
+  in `mcpServers` but preserves all other servers and top-level keys.
+- **Unparseable settings**: by default replaces a corrupted JSON file
+  rather than aborting (toggle with `overwrite_unparseable=False`).
+- **Per-project install**: pass `settings_path=".claude/settings.json"`
+  to scope the registration to a single repo.
+- **Future installers** (e.g. `claude_desktop.py`) follow the same shape
+  so that callers can dispatch generically.
+
+### Console script wiring (`pyproject.toml`)
+
+```toml
+[project.scripts]
+ai-houkai-mcp                 = "ai_houkai.mcp_server.server:run"
+ai-houkai-install-claude-code = "ai_houkai.installers.claude_code:_main"
+```
+
+---
+
+## 10. Agent Integrations
 
 All agent examples share the same `_dispatch_tool(name, arguments)`
 interface.  Only the SDK and message format differ.
@@ -526,7 +667,7 @@ LLM API  ──►  assistant reply to user
 
 ---
 
-## 10. Test Architecture
+## 11. Test Architecture
 
 ### 79 tests across 4 files
 
@@ -582,7 +723,113 @@ sys.modules["anthropic"].Anthropic = lambda: fake_client
 
 ---
 
-## 11. Extension Points
+## 12. Memory Linking
+
+Typed directed edges between memories — `Link(to, rel)` stored as a
+JSON string in ChromaDB metadata.
+
+### API
+
+```python
+store.link(src_id, dst_id, rel="related")    # idempotent
+store.unlink(src_id, dst_id, rel=None)       # rel=None → remove all
+store.neighbors(memory_id, rel=None,
+                direction="both", depth=1)   # BFS, returns [(Memory, rel)]
+store.subgraph(memory_ids, depth=1)          # Graph(nodes, edges)
+```
+
+### Supersede (soft-delete)
+
+```python
+store.supersede(old_id, new_id)   # marks old as superseded + adds "supersedes" link
+store.restore(memory_id)          # undo a supersede
+```
+
+`superseded_by != ""` hides a memory from default `recall()` / `list_recent()`.
+Pass `include_superseded=True` to see them.
+
+---
+
+## 13. Conflict / Contradiction Detection
+
+### Detection algorithm
+
+```
+candidates(a) = recall(a.text, n=12)
+for b in candidates:
+    if b.type != a.type          → skip
+    if sim(a,b) < threshold      → skip   (default 0.80)
+    if tags don't overlap        → skip   (both must share ≥1 tag, or both empty)
+    if negation_diff(a, b)       → kind="contradiction", reason="negation_diff"
+    elif contradiction_fn(a, b)  → kind="contradiction", reason="custom_fn"
+    else                         → kind="duplicate",     reason="similarity"
+```
+
+`negation_diff`: strips apostrophes, tokenises, counts negation words
+(`not`, `never`, `no`, `dont`, …), returns True if parity differs.
+
+### on_conflict policies
+
+| Policy | Effect on `remember()` |
+|---|---|
+| `ignore` (default) | no check |
+| `warn` | `warnings.warn()` listing conflicts |
+| `supersede` | auto-supersede conflicting memories |
+| `raise` | raises `ConflictError(conflicts)` |
+
+```python
+store = MemoryStore(conflict_policy="warn", conflict_threshold=0.85)
+store.find_conflicts()                       # global pairwise scan (O(n²))
+store.find_conflicts(memory_id=x)            # check one memory
+```
+
+---
+
+## 14. Hybrid Retrieval
+
+### Score formula
+
+```
+final = α·cosine + β·BM25_local + γ·recency + δ·importance
+```
+
+| Weight | Default |
+|---|---|
+| α cosine    | 0.55 |
+| β lexical   | 0.20 |
+| γ recency   | 0.15 |
+| δ importance| 0.10 |
+
+`recency = exp(−λ · age_days)` — same λ as `DecayEngine` (default 0.1).
+
+**BM25 is computed locally** over the cosine over-fetch pool only — no
+second index, O(1) additional storage.
+
+### API
+
+```python
+store.recall(query, k, mode="hybrid")                    # default weights
+store.recall(query, k, mode="hybrid",
+             weights=HybridWeights(cosine=0.8, lexical=0.1,
+                                   recency=0.05, importance=0.05))
+store.recall(query, k, overfetch=6)                      # larger cosine pool
+
+# Graph-walk expansion after scoring
+store.recall(query, k,
+             expand=ExpandSpec(rels=("refines","example_of"),
+                               depth=1, cap=5, score=0.70))
+```
+
+Default `mode="semantic"` is unchanged — zero risk for existing callers.
+
+---
+
+## 15. Extension Points
+
+> The designs in [PROPOSALS.md](PROPOSALS.md) are now implemented (§12–14).
+> The sketches below remain valid for further customisation.
+> The sketches below remain valid as quick recipes.
+
 
 ### Hybrid retrieval score
 
