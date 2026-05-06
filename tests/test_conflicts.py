@@ -8,8 +8,6 @@ from ai_houkai.memory_system import Conflict, ConflictError, MemoryStore
 from ai_houkai.memory_system.store import _negation_diff
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
 class TestNegationDiff:
     def test_plain_vs_plain_no_diff(self):
         assert _negation_diff("use pytest", "run with pytest") is False
@@ -31,8 +29,6 @@ class TestNegationDiff:
     def test_no_negation_both(self):
         assert _negation_diff("deploy to prod", "release to prod") is False
 
-
-# ── find_conflicts ─────────────────────────────────────────────────────────────
 
 class TestFindConflicts:
     def test_empty_store_returns_empty(self, store: MemoryStore):
@@ -113,8 +109,6 @@ class TestFindConflicts:
                    for c in conflicts)
 
 
-# ── remember() with on_conflict ────────────────────────────────────────────────
-
 class TestRememberConflict:
     def test_on_conflict_ignore_is_silent(self, store: MemoryStore):
         store.remember("Use ruff", type="procedural", tags=["lint"])
@@ -143,8 +137,6 @@ class TestRememberConflict:
         if old and old.superseded_by:
             assert old.superseded_by == m2.id
 
-
-# ── supersede / restore ────────────────────────────────────────────────────────
 
 class TestSupersede:
     def test_supersede_marks_old(self, store: MemoryStore):

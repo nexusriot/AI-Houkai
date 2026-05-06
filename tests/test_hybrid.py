@@ -8,8 +8,6 @@ from ai_houkai.memory_system import ExpandSpec, HybridWeights, MemoryStore
 from ai_houkai.memory_system.store import _bm25_score_pool, _tokenize
 
 
-# ── BM25 helpers ──────────────────────────────────────────────────────────────
-
 class TestTokenize:
     def test_lowercase_split(self):
         assert _tokenize("Hello World") == ["hello", "world"]
@@ -61,8 +59,6 @@ class TestBM25ScorePool:
         assert all(0.0 <= s <= 1.0 for s in scores)
 
 
-# ── HybridWeights ─────────────────────────────────────────────────────────────
-
 class TestHybridWeights:
     def test_defaults_sum_to_one(self):
         w = HybridWeights()
@@ -77,8 +73,6 @@ class TestHybridWeights:
         w = HybridWeights(cosine=1.0, lexical=0.0, recency=0.0, importance=0.0)
         assert w.cosine == 1.0
 
-
-# ── Hybrid recall ─────────────────────────────────────────────────────────────
 
 class TestHybridRecall:
     def _seed(self, store: MemoryStore) -> None:
@@ -157,8 +151,6 @@ class TestHybridRecall:
         hits = store.recall("deploy", k=2, mode="hybrid", overfetch=8)
         assert isinstance(hits, list)
 
-
-# ── Expand links ──────────────────────────────────────────────────────────────
 
 class TestExpandLinks:
     def test_expand_follows_outgoing_rel(self, store: MemoryStore):
