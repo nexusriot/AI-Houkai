@@ -6,7 +6,7 @@ import pytest
 
 from ai_houkai.memory_system import ExpandSpec, HybridWeights, MemoryStore
 from ai_houkai.memory_system.store import _bm25_score_pool, _tokenize
-
+from ai_houkai.memory_system import Memory
 
 class TestTokenize:
     def test_lowercase_split(self):
@@ -95,7 +95,6 @@ class TestHybridRecall:
 
     def test_hybrid_returns_memories(self, store: MemoryStore):
         self._seed(store)
-        from ai_houkai.memory_system import Memory
         hits = store.recall("pytest", k=2, mode="hybrid")
         assert len(hits) > 0
         assert all(isinstance(m, Memory) for m, _ in hits)

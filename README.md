@@ -18,7 +18,11 @@ and periodic reflection that condenses experience into knowledge.
 | **Rich metadata** | `importance`, `tags`, `source`, access tracking |
 | **Decay** | Exponential forgetting — prune old, unimportant memories |
 | **Reflection** | Cluster episodic memories → condense into semantic summaries |
-| **MCP server** | Five tools for any MCP client (Claude Code, Claude Desktop) |
+| **Memory linking** | Typed directed edges — `refines`, `supersedes`, `derived_from`, … |
+| **Conflict detection** | Duplicate / contradiction scan with configurable policies |
+| **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
+| **MCP server** | 10 tools for any MCP client (Claude Code, Claude Desktop) |
+| **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
 ## Layout
@@ -34,7 +38,26 @@ AI-Houkai/
 │   │   └── reflection.py        # ReflectionEngine — episodic → semantic
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (5 tools)
+│   │   └── server.py             # FastMCP server (10 tools)
+│   ├── cli/
+│   │   ├── __init__.py
+│   │   ├── __main__.py           # python -m ai_houkai.cli
+│   │   ├── main.py               # Typer app + _main() entrypoint
+│   │   ├── config.py             # store path / collection resolution
+│   │   ├── output.py             # rich tables, TSV, JSON, id prefix helpers
+│   │   └── commands/
+│   │       ├── remember.py       # houkai remember
+│   │       ├── recall.py         # houkai recall
+│   │       ├── list_cmd.py       # houkai list
+│   │       ├── show.py           # houkai show
+│   │       ├── forget.py         # houkai forget
+│   │       ├── edit.py           # houkai edit / tag / bump
+│   │       ├── link.py           # houkai link / unlink / neighbors / graph
+│   │       ├── conflicts.py      # houkai conflicts / supersede / restore
+│   │       ├── decay.py          # houkai prune
+│   │       ├── reflect.py        # houkai reflect
+│   │       ├── io.py             # houkai export / import / backup
+│   │       └── stats.py          # houkai stats
 │   └── installers/
 │       ├── __init__.py
 │       └── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
@@ -98,8 +121,9 @@ uv run --with ai-houkai python examples/pip_package_example.py
 ```bash
 pip install "ai-houkai[claude]"   # + Anthropic SDK
 pip install "ai-houkai[openai]"   # + OpenAI SDK (also covers Ollama)
-pip install "ai-houkai[all]"      # all providers
-pip install "ai-houkai[dev]"      # + pytest
+pip install "ai-houkai[cli]"      # + houkai terminal CLI (typer + rich)
+pip install "ai-houkai[all]"      # all providers + CLI
+pip install "ai-houkai[dev]"      # + pytest + CLI
 ```
 
 > The embedding model (`all-MiniLM-L6-v2`) downloads automatically on
@@ -120,15 +144,169 @@ for mem, score in store.recall("parallel execution", k=3):
     print(f"{score:.3f}  {mem.text}")
 ```
 
+---
+
+## CLI — `houkai`
+
+A full-featured terminal interface for managing memories directly.
+Requires the `cli` extra:
+
+```bash
+pip install "ai-houkai[cli]"
+houkai --help
+```
+
+All commands accept `--store PATH` / `--collection NAME` (or env vars
+`AI_HOUKAI_PATH` / `AI_HOUKAI_COLLECTION`) to target any store.
+IDs can be abbreviated to any unique 8-character prefix.
+
+### Core commands
+
+```bash
+# Store a memory
+houkai remember "Python's GIL blocks CPU parallelism" \
+  --type semantic --tag python --importance 0.85
+
+# Read from stdin (pipe-friendly)
+echo "Deploy with: make release" | houkai remember --stdin --type procedural
+
+# Semantic search
+houkai recall "parallel execution" -k 5
+houkai recall "deploy" --mode hybrid --format json
+
+# List recent memories
+houkai list
+houkai list --type episodic --tag python --since 7d --sort importance
+
+# Inspect one memory (full metadata + link chain)
+houkai show 72be7903
+
+# Delete memories (confirms unless --yes)
+houkai forget 72be7903
+houkai forget id1 id2 id3 --yes
+```
+
+### Curation
+
+```bash
+# Edit text or metadata in $EDITOR (re-embeds only if text changes)
+houkai edit 72be7903
+
+# Add / remove tags without re-embedding
+houkai tag 72be7903 --add hardware --add risc-v --remove old
+
+# Adjust importance
+houkai bump 72be7903 +0.2      # relative delta
+houkai bump 72be7903 =0.9      # absolute value
+```
+
+### Memory graph
+
+```bash
+# Link two memories
+houkai link src-id dst-id --rel refines
+
+# Remove a link
+houkai unlink src-id dst-id --rel refines
+
+# Show neighbors (BFS, configurable depth and direction)
+houkai neighbors 72be7903 --direction out --depth 2
+
+# Render a subgraph
+houkai graph 72be7903 --depth 2 --format ascii
+houkai graph 72be7903 --format dot | dot -Tsvg -o graph.svg
+houkai graph 72be7903 --format json
+```
+
+### Conflicts & supersedes
+
+```bash
+# Full pairwise conflict scan (duplicates + contradictions)
+houkai conflicts
+
+# Check one memory
+houkai conflicts --id 72be7903 --threshold 0.85
+
+# Interactive resolution
+houkai conflicts --resolve interactive
+
+# Mark old memory as superseded by new
+houkai supersede old-id new-id
+
+# Undo a supersede
+houkai restore old-id
+```
+
+### Maintenance
+
+```bash
+# Preview what the decay engine would prune (dry-run by default)
+houkai prune
+houkai prune --decay-rate 0.05 --min-score 0.1
+
+# Actually delete (requires --apply)
+houkai prune --apply --yes
+
+# Preview reflection clusters
+houkai reflect
+houkai reflect --threshold 0.8 --min-cluster-size 3
+
+# Write reflection summaries (requires --apply)
+houkai reflect --apply --consolidate soft   # supersede source episodics
+houkai reflect --apply --consolidate hard   # hard-delete source episodics
+```
+
+### Import / export / backup
+
+```bash
+# Export to JSONL (stdout or file)
+houkai export
+houkai export dump.jsonl --type episodic --tag project
+
+# Import from JSONL (deduplicates by text hash by default)
+houkai import dump.jsonl
+houkai import dump.jsonl --dedupe-by id --yes
+
+# Snapshot the Chroma store
+houkai backup   # → ~/.ai_houkai/backups/<ISO timestamp>/
+```
+
+### Stats
+
+```bash
+houkai stats                 # rich table
+houkai stats --format json   # machine-readable
+```
+
+### Output formats
+
+Every listing command accepts `--format auto|rich|tsv|json`.
+- **auto** — rich table on a TTY, TSV otherwise (pipe-safe).
+- **json** — structured JSON array; pair with `jq` for scripting.
+- `NO_COLOR=1` disables colour in rich output.
+
+### Config file
+
+`~/.config/ai_houkai/config.toml` (all optional):
+
+```toml
+store_path          = "~/.ai_houkai/.chroma"
+collection          = "ai_houkai"
+default_type        = "semantic"
+default_importance  = 0.5
+editor              = "nvim"
+```
+
+---
+
 ## Roadmap
 
-Designs for upcoming features (hybrid retrieval, conflict detection,
-memory linking) live in [PROPOSALS.md](PROPOSALS.md).
+Designs for upcoming features live in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
 
 ## Run the tests
 
 ```bash
-pytest tests/ -v        # 79 tests
+pytest tests/ -v        # 168 tests
 ```
 
 ---

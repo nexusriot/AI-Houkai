@@ -12,8 +12,11 @@ New in this version:
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -26,6 +29,32 @@ from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
+
+
+@functools.lru_cache(maxsize=None)
+def _get_embed_fn(model_name: str):
+    """Return a cached embedding function for *model_name*.
+
+    Loaded once per process per model name — subsequent calls return the
+    same instance, avoiding redundant disk reads and RAM allocation.
+
+    Side-effects applied before the first load:
+      • HF_HUB_DISABLE_PROGRESS_BARS=1  — suppress "Loading weights" bars
+      • huggingface_hub loggers → ERROR  — suppress unauthenticated-request
+        warnings (the model lives in the local cache; no auth is needed)
+    """
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    for _logger_name in (
+        "huggingface_hub",
+        "huggingface_hub.utils",
+        "huggingface_hub.utils._http",
+        "huggingface_hub.utils._headers",
+    ):
+        logging.getLogger(_logger_name).setLevel(logging.ERROR)
+
+    return embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=model_name
+    )
 ConflictFn = Callable[["Memory", "Memory"], bool]
 
 @dataclass
@@ -230,9 +259,7 @@ class MemoryStore:
         self.client = chromadb.PersistentClient(
             path=path, settings=Settings(anonymized_telemetry=False)
         )
-        embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model
-        )
+        embed_fn = _get_embed_fn(embedding_model)
         self.collection = self.client.get_or_create_collection(
             name=collection,
             embedding_function=embed_fn,
