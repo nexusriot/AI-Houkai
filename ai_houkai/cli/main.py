@@ -53,6 +53,7 @@ def _register() -> None:
     from ai_houkai.cli.commands.reflect import reflect
     from ai_houkai.cli.commands.io import export_cmd, import_cmd, backup
     from ai_houkai.cli.commands.stats import stats
+    from ai_houkai.cli.commands.maintenance import maintenance_app
 
     app.command("remember")(remember)
     app.command("recall")(recall)
@@ -75,6 +76,7 @@ def _register() -> None:
     app.command("import")(import_cmd)
     app.command("backup")(backup)
     app.command("stats")(stats)
+    app.add_typer(maintenance_app, name="maintenance")
 
 
 _register()
