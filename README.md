@@ -21,7 +21,8 @@ and periodic reflection that condenses experience into knowledge.
 | **Memory linking** | Typed directed edges — `refines`, `supersedes`, `derived_from`, … |
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
-| **MCP server** | 10 tools for any MCP client (Claude Code, Claude Desktop) |
+| **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
+| **MCP server** | 11 tools for any MCP client (Claude Code, Claude Desktop) |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -36,6 +37,12 @@ AI-Houkai/
 │   │   ├── store.py              # MemoryStore + Memory dataclass
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   └── reflection.py        # ReflectionEngine — episodic → semantic
+│   ├── maintenance/
+│   │   ├── __init__.py
+│   │   ├── durations.py          # parse/format human duration strings
+│   │   ├── state.py              # MaintenanceState — JSON run history
+│   │   ├── scheduler.py          # MaintenanceScheduler — tick + run_forever
+│   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
 │   │   └── server.py             # FastMCP server (10 tools)
@@ -56,6 +63,7 @@ AI-Houkai/
 │   │       ├── conflicts.py      # houkai conflicts / supersede / restore
 │   │       ├── decay.py          # houkai prune
 │   │       ├── reflect.py        # houkai reflect
+│   │       └── maintenance.py    # houkai maintenance tick/run/start/stop/status
 │   │       ├── io.py             # houkai export / import / backup
 │   │       └── stats.py          # houkai stats
 │   └── installers/
@@ -306,7 +314,7 @@ Designs for upcoming features live in [PROPOSALS.md](https://raw.githubuserconte
 ## Run the tests
 
 ```bash
-pytest tests/ -v        # 168 tests
+pytest tests/ -v
 ```
 
 ---
@@ -546,4 +554,135 @@ def llm_summarizer(memories):
     ).choices[0].message.content
 
 engine = ReflectionEngine(store, summarizer=llm_summarizer)
+```
+
+## Scheduled Maintenance
+
+Decay and reflection are powerful but only useful if they run regularly.
+The maintenance daemon orchestrates both automatically so you never have to
+think about it.
+
+### Three usage modes
+
+**Mode A — one-shot tick (recommended for cron)**
+
+```bash
+houkai maintenance tick
+```
+
+Run one tick synchronously: prune stale memories and (optionally) reflect.
+Jobs only execute when their configured interval has elapsed since the last
+run — safe to call as often as you like.
+
+Crontab example (daily at 03:00):
+
+```cron
+0 3 * * * houkai --store ~/.ai_houkai/.chroma maintenance tick
+```
+
+**Mode B — foreground loop**
+
+```bash
+houkai maintenance run
+```
+
+Runs the scheduler in the foreground.  Use this to observe what the daemon
+would do before committing to `start`.  Press Ctrl-C (or send SIGTERM) to
+stop cleanly.
+
+**Mode C — background daemon**
+
+```bash
+houkai maintenance start    # detach into the background
+houkai maintenance status   # show pid, last runs, next schedules
+houkai maintenance stop     # send SIGTERM
+```
+
+Logs go to `~/.ai_houkai/maintenance.log` (configurable).
+
+### Configuration
+
+Add a `[maintenance]` section to `~/.config/ai_houkai/config.toml`:
+
+```toml
+[maintenance]
+enabled       = true
+decay_every   = "24h"     # or "off" to disable decay
+reflect_every = "7d"      # or "off" to disable reflection
+tick_interval = "5m"      # how often the loop wakes to check schedules
+
+[maintenance.decay]
+decay_rate    = 0.1
+min_score     = 0.05
+protect_types = ["procedural"]   # never pruned
+
+[maintenance.reflect]
+min_cluster_size = 3
+apply            = false   # set true to write reflection summaries
+```
+
+Supported duration units: `s` · `m` · `h` · `d` · `w`.
+Default `decay_every = "24h"`, `reflect_every = "7d"`, `tick_interval = "5m"`.
+
+> **reflect.apply = false** (default): reflection runs in observe-only mode —
+> it logs how many summaries *would* be created but writes nothing.  Flip to
+> `true` once you're happy with the clusters.
+
+### Programmatic usage
+
+```python
+import threading
+from ai_houkai.memory_system import MemoryStore
+from ai_houkai.maintenance import MaintenanceScheduler
+
+store = MemoryStore()
+sched = MaintenanceScheduler(
+    store,
+    decay_every=86_400,     # 24 h
+    reflect_every=604_800,  # 7 d
+    tick_interval=300,      # wake every 5 min
+    reflect_apply=False,    # dry-run reflect
+)
+
+# One-shot (e.g. from cron or an agent):
+result = sched.tick()
+print(result.summary())   # "decay pruned 3 | reflect nothing to reflect"
+
+# Blocking loop:
+stop = threading.Event()
+sched.run_forever(stop)   # blocks; call stop.set() to exit
+```
+
+### MCP tool
+
+The `maintenance_tick` tool lets any MCP client trigger a tick without
+running the CLI:
+
+```
+maintenance_tick(reflect_apply=false)
+→ {"summary": "decay pruned 2", "decayed": 2, "reflected": 0, ...}
+```
+
+### systemd unit (optional)
+
+If you prefer systemd over the built-in daemon:
+
+```ini
+# ~/.config/systemd/user/ai-houkai-maintenance.service
+[Unit]
+Description=AI-Houkai maintenance scheduler
+
+[Service]
+ExecStart=houkai --store %h/.ai_houkai/.chroma maintenance run
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now ai-houkai-maintenance
+journalctl --user -u ai-houkai-maintenance -f
 ```

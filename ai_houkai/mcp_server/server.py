@@ -24,6 +24,8 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from ai_houkai.maintenance.scheduler import MaintenanceScheduler
+from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.store import ConflictError
 
@@ -234,6 +236,48 @@ def supersede(old_id: str, new_id: str) -> dict[str, Any]:
         return {"ok": True, "old_id": old_id, "new_id": new_id}
     except (KeyError, ValueError) as e:
         return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def maintenance_tick(
+    reflect_apply: bool = False,
+) -> dict[str, Any]:
+    """Run one maintenance tick: prune stale memories via decay and optionally
+    consolidate episodic clusters via reflection.
+
+    Uses the schedule configured in ~/.config/ai_houkai/config.toml
+    [maintenance] section (or built-in defaults).  Jobs only run when their
+    interval has elapsed since the last run — safe to call frequently.
+
+    reflect_apply
+        If True, reflection summaries are written to the store.
+        If False (default), reflection runs in dry-run mode (no writes).
+
+    Returns a summary dict with counts and any errors.
+    """
+    mcfg = load_maintenance()
+    sched = MaintenanceScheduler(
+        store=store,
+        decay_every=mcfg.decay_every,
+        reflect_every=mcfg.reflect_every,
+        tick_interval=mcfg.tick_interval,
+        state_path=mcfg.state_path,
+        decay_rate=mcfg.decay_rate,
+        min_score=mcfg.min_score,
+        protect_types=mcfg.protect_types,
+        min_cluster_size=mcfg.min_cluster_size,
+        reflect_apply=reflect_apply,
+    )
+    result = sched.tick()
+    return {
+        "summary": result.summary(),
+        "ran_decay": result.ran_decay,
+        "ran_reflect": result.ran_reflect,
+        "decayed": result.decayed,
+        "reflected": result.reflected,
+        "decay_error": result.decay_error,
+        "reflect_error": result.reflect_error,
+    }
 
 
 def run() -> None:
