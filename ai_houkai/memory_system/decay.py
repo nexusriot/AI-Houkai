@@ -13,7 +13,7 @@ Score formula
 Default parameters give a half-life of ~7 days for a 0.5-importance memory.
 
 Usage
-    from memory_system import MemoryStore, DecayEngine
+    from ai_houkai.memory_system import MemoryStore, DecayEngine
 
     store  = MemoryStore(...)
     engine = DecayEngine(store)
@@ -74,9 +74,11 @@ class DecayEngine:
     ) -> list[tuple["Memory", float]]:
         """Return (memory, score) for every memory, sorted score descending."""
         t = now if now is not None else time.time()
+        # include_superseded=True so soft-deleted memories also age out —
+        # otherwise they linger in the store forever.
         pairs = [
             (m, self.score(m, t))
-            for m in self.store.list_recent(limit=100_000)
+            for m in self.store.list_recent(limit=100_000, include_superseded=True)
         ]
         pairs.sort(key=lambda p: p[1], reverse=True)
         return pairs

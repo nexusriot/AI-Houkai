@@ -143,8 +143,13 @@ class MaintenanceScheduler:
                     )
                     created = engine.reflect(dry_run=not self.reflect_apply)
                     result.reflected = len(created)
-                    state.last_reflect_at = t
-                    state.total_reflected += result.reflected
+                    # Only advance the schedule when reflection actually
+                    # persisted summaries. A dry-run writes nothing, so
+                    # stamping last_reflect_at here would push the next real
+                    # run out by reflect_every and starve reflection forever.
+                    if self.reflect_apply:
+                        state.last_reflect_at = t
+                        state.total_reflected += result.reflected
                     logger.info(
                         "Reflect (%s): %d summaries",
                         "apply" if self.reflect_apply else "dry-run",

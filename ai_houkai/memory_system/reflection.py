@@ -24,7 +24,7 @@ memories by importance, joins their texts, and trims to 512 chars.
     engine = ReflectionEngine(store, summarizer=my_llm_summarizer)
 
 Usage
-    from memory_system import MemoryStore, ReflectionEngine
+    from ai_houkai.memory_system import MemoryStore, ReflectionEngine
 
     store  = MemoryStore(...)
     engine = ReflectionEngine(store)
