@@ -314,6 +314,9 @@ class MemoryStore:
                     for c in conflicts:
                         self.supersede(old_id=c.b.id, new_id=mem.id)
                 elif policy == "raise":
+                    # Roll back the just-added doc — the caller is told the
+                    # memory was not stored, so it must not linger in Chroma.
+                    self.forget(mem.id)
                     raise ConflictError(conflicts)
 
         return mem
