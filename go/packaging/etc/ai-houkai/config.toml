@@ -1,0 +1,60 @@
+# AI-Houkai system-wide defaults.
+#
+# Resolution order (later overrides earlier):
+#   1. built-in defaults
+#   2. this file (/etc/ai-houkai/config.toml)
+#   3. per-user file (~/.config/ai_houkai/config.toml)
+#   4. $AI_HOUKAI_CONFIG (if set)
+#   5. AI_HOUKAI_* environment variables
+#   6. command-line flags (--store, --collection)
+#
+# This file is marked as a conffile in the Debian package: dpkg will not
+# silently overwrite local edits on upgrade.
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+# store_path is intentionally left commented out so each user's data lives
+# under their own home directory ($HOME/.ai_houkai/.chroma). Uncomment to
+# force a single shared location for all users on this host.
+#
+# store_path = "/var/lib/ai-houkai/.chroma"
+
+collection         = "ai_houkai"
+
+# ---------------------------------------------------------------------------
+# Defaults applied when callers omit the field
+# ---------------------------------------------------------------------------
+
+default_type       = "episodic"
+default_importance = 0.5
+
+# ---------------------------------------------------------------------------
+# Embedding backend
+# ---------------------------------------------------------------------------
+
+# Provider: "ollama" (local, default) or "openai" (cloud, requires API key).
+embed_provider = "ollama"
+
+# Vector dimensionality — must match the embedding model.
+#   all-minilm     → 384
+#   nomic-embed-text → 768
+#   text-embedding-3-small → 1536
+embed_dim      = 384
+
+# --- Ollama (used when embed_provider = "ollama") --------------------------
+ollama_url   = "http://localhost:11434"
+ollama_model = "all-minilm"
+
+# --- OpenAI (used when embed_provider = "openai") --------------------------
+# Prefer OPENAI_API_KEY env var; uncomment to hard-code (not recommended).
+# openai_api_key = ""
+openai_model     = "text-embedding-3-small"
+
+# ---------------------------------------------------------------------------
+# CLI behaviour
+# ---------------------------------------------------------------------------
+
+# Editor used by `houkai edit`. Empty = honour $EDITOR, then fall back to nano.
+editor = ""
