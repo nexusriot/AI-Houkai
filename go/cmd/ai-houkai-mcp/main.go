@@ -21,7 +21,7 @@ func main() {
 
 	var embedder embed.Embedder
 	switch cfg.EmbedProvider {
-	case "openai":
+	case embed.ProviderOpenAI:
 		key := cfg.OpenAIKey
 		if key == "" {
 			key = os.Getenv("OPENAI_API_KEY")
@@ -30,6 +30,15 @@ func main() {
 			log.Fatal("OPENAI_API_KEY required for openai embed provider")
 		}
 		embedder = embed.NewOpenAI(key, cfg.OpenAIModel)
+	case embed.ProviderDigitalOcean:
+		key := cfg.DOKey
+		if key == "" {
+			key = os.Getenv("DIGITALOCEAN_TOKEN")
+		}
+		if key == "" {
+			log.Fatal("DIGITALOCEAN_TOKEN required for digitalocean embed provider")
+		}
+		embedder = embed.NewDigitalOcean(key, cfg.DOModel)
 	default:
 		embedder = embed.NewOllama(cfg.OllamaURL, cfg.OllamaModel)
 	}

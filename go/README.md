@@ -181,12 +181,43 @@ Resolution order (later wins):
 ```toml
 collection         = "ai_houkai"
 default_importance = 0.5
-embed_provider     = "ollama"        # or "openai"
-embed_dim          = 384             # 384/768/1536 — must match the model
+embed_provider     = "ollama"        # "ollama" | "openai" | "digitalocean"
+embed_dim          = 384             # 384/768/1024/1536 — must match the model
 ollama_url         = "http://localhost:11434"
 ollama_model       = "all-minilm"
 openai_model       = "text-embedding-3-small"
+do_model           = "qwen3-embedding-0.6b"
 ```
+
+### Embedding providers
+
+| Provider       | Default model              | Dim   | Auth env var          | Local? |
+| -------------- | -------------------------- | ----- | --------------------- | ------ |
+| `ollama`       | `all-minilm`               | 384   | —                     | yes    |
+| `openai`       | `text-embedding-3-small`   | 1536  | `OPENAI_API_KEY`      | no     |
+| `digitalocean` | `qwen3-embedding-0.6b`     | 1024  | `DIGITALOCEAN_TOKEN`  | no     |
+
+DigitalOcean's [Serverless Inference](https://docs.digitalocean.com/reference/api/reference/embeddings/index.html.md)
+is wire-compatible with OpenAI's `/v1/embeddings` — it's a thin wrapper over
+the same client code, just pointed at `https://inference.do-ai.run`. To use
+it:
+
+```bash
+export DIGITALOCEAN_TOKEN="dop_v1_..."
+# either:
+houkai --format json config | grep -i embed         # check
+AI_HOUKAI_EMBED_PROVIDER=digitalocean houkai recall "test"
+# or set it persistently:
+cat >> ~/.config/ai_houkai/config.toml <<EOF
+embed_provider = "digitalocean"
+embed_dim      = 1024
+do_model       = "qwen3-embedding-0.6b"
+EOF
+```
+
+**Important:** `embed_dim` must match the chosen model — switching providers
+on an existing store will produce nonsense scores until you re-embed
+(`export` → wipe → `import`).
 
 Run `houkai config` to see what was actually resolved.
 

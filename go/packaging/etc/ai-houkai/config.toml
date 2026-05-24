@@ -34,13 +34,15 @@ default_importance = 0.5
 # Embedding backend
 # ---------------------------------------------------------------------------
 
-# Provider: "ollama" (local, default) or "openai" (cloud, requires API key).
+# Provider: "ollama" (local, default), "openai" (cloud), or "digitalocean"
+# (cloud, DO Gradient Serverless Inference — wire-compatible with OpenAI).
 embed_provider = "ollama"
 
 # Vector dimensionality — must match the embedding model.
-#   all-minilm     → 384
-#   nomic-embed-text → 768
-#   text-embedding-3-small → 1536
+#   all-minilm              → 384
+#   nomic-embed-text        → 768
+#   text-embedding-3-small  → 1536
+#   qwen3-embedding-0.6b    → 1024
 embed_dim      = 384
 
 # --- Ollama (used when embed_provider = "ollama") --------------------------
@@ -51,6 +53,11 @@ ollama_model = "all-minilm"
 # Prefer OPENAI_API_KEY env var; uncomment to hard-code (not recommended).
 # openai_api_key = ""
 openai_model     = "text-embedding-3-small"
+
+# --- DigitalOcean (used when embed_provider = "digitalocean") --------------
+# Prefer DIGITALOCEAN_TOKEN env var; uncomment to hard-code (not recommended).
+# do_api_key = ""
+do_model = "qwen3-embedding-0.6b"
 
 # ---------------------------------------------------------------------------
 # CLI behaviour

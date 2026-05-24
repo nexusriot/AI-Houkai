@@ -54,6 +54,11 @@ func NewRootCmd() *cobra.Command {
 					return fmt.Errorf("OPENAI_API_KEY is required for openai embed provider")
 				}
 				embedder = embed.NewOpenAI(cfg.OpenAIKey, cfg.OpenAIModel)
+			case embed.ProviderDigitalOcean:
+				if cfg.DOKey == "" {
+					return fmt.Errorf("DIGITALOCEAN_TOKEN (or do_api_key in config) is required for digitalocean embed provider")
+				}
+				embedder = embed.NewDigitalOcean(cfg.DOKey, cfg.DOModel)
 			default: // ollama
 				embedder = embed.NewOllama(cfg.OllamaURL, cfg.OllamaModel)
 			}

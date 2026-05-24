@@ -10,11 +10,12 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/decay"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
+	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
 // New wires up the MCP server with all 11 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
-	s := server.NewMCPServer("ai-houkai", "0.3.4",
+	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
 	)
 

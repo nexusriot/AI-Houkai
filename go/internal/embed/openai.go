@@ -18,10 +18,18 @@ type OpenAIEmbedder struct {
 }
 
 func NewOpenAI(apiKey, model string) *OpenAIEmbedder {
+	return NewOpenAICompatible(apiKey, model, "https://api.openai.com")
+}
+
+// NewOpenAICompatible builds an embedder against any service that speaks the
+// OpenAI /v1/embeddings protocol (e.g. DigitalOcean Serverless Inference,
+// llama.cpp's openai-compat server, vLLM, Together, etc.). The baseURL should
+// be the host root without the /v1 suffix — e.g. "https://inference.do-ai.run".
+func NewOpenAICompatible(apiKey, model, baseURL string) *OpenAIEmbedder {
 	return &OpenAIEmbedder{
 		APIKey:  apiKey,
 		Model:   model,
-		BaseURL: "https://api.openai.com",
+		BaseURL: baseURL,
 		client:  &http.Client{},
 	}
 }

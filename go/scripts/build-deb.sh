@@ -190,8 +190,10 @@ if [ "$1" = "configure" ]; then
             echo "  Note: 'ollama pull all-minilm' failed — run it manually before use."
     else
         echo "ai-houkai: Ollama not found."
-        echo "  Install Ollama (https://ollama.com) and run: ollama pull all-minilm"
-        echo "  Or switch to OpenAI by editing /etc/ai-houkai/config.toml."
+        echo "  Install Ollama (https://ollama.com) and run: ollama pull all-minilm,"
+        echo "  or switch to a cloud provider by editing /etc/ai-houkai/config.toml:"
+        echo "    embed_provider = \"openai\"        # OPENAI_API_KEY"
+        echo "    embed_provider = \"digitalocean\"  # DIGITALOCEAN_TOKEN"
     fi
 fi
 EOF

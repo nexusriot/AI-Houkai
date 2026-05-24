@@ -19,6 +19,8 @@ type Config struct {
 	OllamaModel       string  `toml:"ollama_model"`
 	OpenAIKey         string  `toml:"openai_api_key"`
 	OpenAIModel       string  `toml:"openai_model"`
+	DOKey             string  `toml:"do_api_key"`
+	DOModel           string  `toml:"do_model"`
 	EmbedDim          int     `toml:"embed_dim"`
 }
 
@@ -34,6 +36,7 @@ func defaultConfig() Config {
 		OllamaURL:         "http://localhost:11434",
 		OllamaModel:       "all-minilm",
 		OpenAIModel:       "text-embedding-3-small",
+		DOModel:           "qwen3-embedding-0.6b",
 		EmbedDim:          384,
 	}
 }
@@ -91,6 +94,12 @@ func ResolveConfig(storePath, collection string) Config {
 	}
 	if v := os.Getenv("OPENAI_API_KEY"); v != "" && cfg.OpenAIKey == "" {
 		cfg.OpenAIKey = v
+	}
+	if v := os.Getenv("DIGITALOCEAN_TOKEN"); v != "" && cfg.DOKey == "" {
+		cfg.DOKey = v
+	}
+	if v := os.Getenv("AI_HOUKAI_DO_MODEL"); v != "" {
+		cfg.DOModel = v
 	}
 
 	// CLI flag overrides (empty string = not set).

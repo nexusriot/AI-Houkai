@@ -84,11 +84,21 @@ and changing one constructor call in `cmd/*/main.go`.
 
 ### `internal/embed` — embedders
 
-`Embedder` is two methods (`Dim` + `Embed`). `OllamaEmbedder` POSTs to
-`/api/embed`; `OpenAIEmbedder` POSTs to `/v1/embeddings`. Both lazily cache
-the dimension from the first response. A "warmup" call is made by
-`ai-houkai-mcp` at startup so `Dim()` is correct before the first real
-request.
+`Embedder` is two methods (`Dim` + `Embed`). Three implementations ship:
+
+- `OllamaEmbedder` — POSTs to a local Ollama at `/api/embed`.
+- `OpenAIEmbedder` — POSTs to `/v1/embeddings`. The base URL is a field, so
+  the same struct is reused for any OpenAI-compatible host.
+- `NewDigitalOcean` — thin constructor that returns an `OpenAIEmbedder`
+  pointed at `https://inference.do-ai.run`. DO's Serverless Inference is
+  wire-compatible with OpenAI's embeddings endpoint (same JSON request and
+  response shapes, same `Bearer` auth), so no separate type is needed. Any
+  future OpenAI-compatible provider (Together, vLLM, llamafile,
+  `llama-server`) can be added the same way with one line.
+
+All three lazily cache the dimension from the first response. A "warmup"
+call is made by `ai-houkai-mcp` at startup so `Dim()` is correct before the
+first real request.
 
 The `embed_dim` config value is the **vector backend's** dimension and must
 match the embedder; if it doesn't, the zero-vector trick in `All()` is the
