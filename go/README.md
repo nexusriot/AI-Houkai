@@ -167,6 +167,237 @@ All commands accept `--store`, `--collection`, and `--format auto|json|tsv`.
 
 ---
 
+## CLI cookbook
+
+### Capturing memories
+
+```bash
+# simplest — defaults to type=episodic, importance=0.5
+houkai remember "Vlad prefers tabs over spaces in Go"
+
+# tagged + higher importance
+houkai remember "deploy script lives at ops/deploy.sh" \
+    -t devops -t infra -i 0.8 --type procedural
+
+# from stdin (so you can pipe long content)
+git log -1 --format=%B | houkai remember -t commit --source git
+
+# with provenance
+houkai remember "user said the spinner blocks the UI" \
+    --source slack --type feedback -i 0.9
+```
+
+### Searching
+
+```bash
+# semantic recall — top 5 by default
+houkai recall "how to deploy"
+
+# narrow to a tag, raise the limit
+houkai recall "rate limit" -k 20 --tag api
+
+# hybrid mode (cosine + BM25 + recency + importance)
+houkai recall "auth bug" --mode hybrid
+
+# JSON output for piping into jq
+houkai --format json recall "deploy" -k 3 | jq '.[].text'
+
+# only high-importance memories
+houkai recall "decisions" --min-importance 0.7
+```
+
+### Browsing and inspecting
+
+```bash
+# 20 most recent
+houkai list
+
+# filter by type + tag, include soft-deleted
+houkai list --type semantic --tag api --include-superseded --limit 50
+
+# full record (8-char prefix is enough if unambiguous)
+houkai show a1b2c3d4
+
+# pretty-print via fzf for interactive picking
+houkai --format tsv list --limit 200 | fzf | cut -f1 | xargs houkai show
+```
+
+### Editing in place
+
+```bash
+# launches $EDITOR with the memory text; saves + re-embeds on exit
+houkai edit a1b2c3d4
+
+# add/remove tags without re-embedding
+houkai tag a1b2c3d4 --add backend,critical --remove draft
+
+# nudge importance
+houkai bump a1b2c3d4 0.9
+```
+
+### The knowledge graph
+
+```bash
+# link two memories with a typed relation
+houkai link a1b2c3d4 e5f6g7h8 --rel refines
+
+# walk 2 hops outwards
+houkai neighbors a1b2c3d4 --depth 2 --direction out
+
+# only follow one relation type
+houkai neighbors a1b2c3d4 --rel derived_from
+
+# dump the subgraph as JSON for visualisation
+houkai graph a1b2c3d4 e5f6g7h8 --depth 2 > graph.json
+
+# remove a specific link (or all links if --rel omitted)
+houkai unlink a1b2c3d4 e5f6g7h8 --rel related
+```
+
+Relation vocabulary: `supersedes`, `refines`, `derived_from`, `example_of`,
+`contradicts`, `related`.
+
+### Conflicts and supersession
+
+```bash
+# scan the whole store for contradictions/duplicates
+houkai conflicts --threshold 0.85
+
+# check a specific memory
+houkai conflicts a1b2c3d4
+
+# replace one memory with another (soft-delete; reversible)
+houkai supersede a1b2c3d4 e5f6g7h8
+
+# bring a superseded memory back
+houkai restore a1b2c3d4
+```
+
+### Maintenance — pruning and reflection
+
+```bash
+# dry-run: show what decay would remove
+houkai prune
+
+# actually delete
+houkai prune --apply
+
+# tune the decay
+houkai prune --decay-rate 0.05 --min-score 0.02 --apply
+
+# cluster episodic memories into semantic summaries (dry-run)
+houkai reflect
+
+# create the summaries for real
+houkai reflect --apply
+
+# create summaries AND delete the source episodics
+houkai reflect --apply --consolidate
+
+# tighter clustering
+houkai reflect --threshold 0.85 --min-cluster 3 --apply
+```
+
+### Backup, export, import
+
+```bash
+# binary snapshot of the chromem-go directory
+houkai backup
+# → ~/.ai_houkai/backups/20260524T120415/
+
+# portable JSONL export (works across stores + Python ↔ Go)
+houkai export -o memories.jsonl
+
+# pipe straight to import on another host
+houkai export | ssh other-host "houkai import"
+
+# import into a fresh store
+houkai import < memories.jsonl
+```
+
+### Stats and config introspection
+
+```bash
+# counts, by-type breakdown, top tags, avg importance
+houkai stats
+
+# see what config the binary actually resolved (and from where)
+houkai config
+```
+
+### Multiple stores / projects
+
+```bash
+# pin a specific store + collection (overrides config + env)
+houkai --store /srv/team-memory --collection backend list
+
+# project-local memory via env vars
+AI_HOUKAI_PATH="$PWD/.ai_houkai" AI_HOUKAI_COLLECTION=this-project \
+    houkai remember "TODO: drop legacy v1 endpoint"
+```
+
+A handy shell function for per-project memory:
+
+```bash
+# ~/.bashrc
+houkai-here() {
+    AI_HOUKAI_PATH="$PWD/.ai_houkai" \
+    AI_HOUKAI_COLLECTION="$(basename "$PWD")" \
+    houkai "$@"
+}
+# usage:  houkai-here recall "the api thing"
+```
+
+### Switching embedding providers ad hoc
+
+```bash
+# one-off recall against OpenAI without touching config files
+AI_HOUKAI_EMBED_PROVIDER=openai OPENAI_API_KEY=sk-... houkai recall "x"
+
+# same for DigitalOcean
+AI_HOUKAI_EMBED_PROVIDER=digitalocean DIGITALOCEAN_TOKEN=dop_v1_... \
+    houkai recall "x"
+```
+
+(Caveat: a store built with one provider's embeddings shouldn't be queried
+with another's — the cosine scores will be meaningless. Use this only for
+fresh stores or after a re-embed via `export` → wipe → `import`.)
+
+### Piping and scripting
+
+```bash
+# top 3 memories about "auth" as a bash array
+mapfile -t hits < <(houkai --format tsv recall auth -k 3 | cut -f1)
+for id in "${hits[@]}"; do houkai bump "$id" 0.9; done
+
+# every memory tagged 'todo', oldest first
+houkai --format json list --tag todo --limit 1000 \
+  | jq -r 'sort_by(.created_at) | .[] | "\(.id)\t\(.text)"'
+
+# bulk-tag everything from a particular source
+houkai --format json list --limit 1000 \
+  | jq -r '.[] | select(.source=="slack") | .id' \
+  | xargs -I{} houkai tag {} --add from-slack
+```
+
+### Claude Code integration
+
+```bash
+# user-scope (default)
+houkai install
+
+# project-scope, with a project-local store
+houkai install --project --memory-path "$PWD/.ai_houkai"
+
+# point at a non-PATH binary
+houkai install --binary /opt/ai-houkai/ai-houkai-mcp
+
+# write to a custom settings file (useful for testing)
+houkai install --settings /tmp/settings.json
+```
+
+---
+
 ## Configuration
 
 Resolution order (later wins):
