@@ -157,11 +157,11 @@ def test_export_import_roundtrip(tmp_path):
 
     exp_r = _invoke(["export", export_file], store_path)
     assert exp_r.exit_code == 0
-    assert "Exported 2" in exp_r.output
+    assert "Exported 2 memories" in exp_r.output
 
     imp_r = _invoke(["import", export_file, "--yes"], store2_path)
     assert imp_r.exit_code == 0
-    assert "Imported 2" in imp_r.output
+    assert "imported=2" in imp_r.output
 
     list_r = _invoke(["list", "--format", "json"], store2_path)
     data = json.loads(list_r.output)

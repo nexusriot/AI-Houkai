@@ -22,7 +22,9 @@ and periodic reflection that condenses experience into knowledge.
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
-| **MCP server** | 11 tools for any MCP client (Claude Code, Claude Desktop) |
+| **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
+| **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
+| **MCP server** | 14 tools for any MCP client (Claude Code, Claude Desktop) |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -34,7 +36,8 @@ AI-Houkai/
 │   ├── __init__.py               # convenience re-exports
 │   ├── memory_system/
 │   │   ├── __init__.py
-│   │   ├── store.py              # MemoryStore + Memory dataclass
+│   │   ├── store.py              # MemoryStore + Memory dataclass (+ export/import/undo)
+│   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   └── reflection.py        # ReflectionEngine — episodic → semantic
 │   ├── maintenance/
@@ -45,7 +48,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (10 tools)
+│   │   └── server.py             # FastMCP server (14 tools)
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── __main__.py           # python -m ai_houkai.cli
@@ -63,8 +66,9 @@ AI-Houkai/
 │   │       ├── conflicts.py      # houkai conflicts / supersede / restore
 │   │       ├── decay.py          # houkai prune
 │   │       ├── reflect.py        # houkai reflect
-│   │       └── maintenance.py    # houkai maintenance tick/run/start/stop/status
-│   │       ├── io.py             # houkai export / import / backup
+│   │       ├── maintenance.py    # houkai maintenance tick/run/start/stop/status
+│   │       ├── journal.py        # houkai journal tail/show/undo
+│   │       ├── io.py             # houkai export / import / info / backup
 │   │       └── stats.py          # houkai stats
 │   └── installers/
 │       ├── __init__.py
@@ -266,17 +270,57 @@ houkai reflect --apply --consolidate hard   # hard-delete source episodics
 
 ### Import / export / backup
 
+Export uses the portable **`.ahkai`** format — gzipped JSONL with a
+header line on line 1 (format/version/source/options) followed by one
+memory per line. Embeddings are included by default so an import can
+reuse them without re-running the model.
+
 ```bash
-# Export to JSONL (stdout or file)
-houkai export
-houkai export dump.jsonl --type episodic --tag project
+# Export everything (memories + vectors) to a portable archive
+houkai export dump.ahkai
 
-# Import from JSONL (deduplicates by text hash by default)
-houkai import dump.jsonl
-houkai import dump.jsonl --dedupe-by id --yes
+# Filter & shrink — omit embeddings for a smaller file
+houkai export dump.ahkai --type episodic --tag project --no-vectors
 
-# Snapshot the Chroma store
+# Peek at an archive header without touching the store
+houkai info dump.ahkai
+
+# Import — default policy skips id collisions
+houkai import dump.ahkai --yes
+
+# Other conflict policies: overwrite | rename | error
+houkai import dump.ahkai --on-conflict overwrite --yes
+
+# Re-embed text on the way in (required if the export's model differs)
+houkai import dump.ahkai --regenerate-vectors --yes
+
+# Preview without writing anything
+houkai import dump.ahkai --dry-run
+
+# Snapshot the Chroma store directory itself
 houkai backup   # → ~/.ai_houkai/backups/<ISO timestamp>/
+```
+
+### Audit journal
+
+Every mutation (`remember`, `forget`, `supersede`, `restore`, `link`,
+`unlink`, `import`, `export`, `reflect`, `decay`, `undo`) is appended
+to an append-only JSONL journal next to the store (`journal.log`,
+rotated and gzipped at 64 MB, 90-day retention by default). Entries
+carry the actor (`cli` / `mcp` / `reflection` / `decay` / `import` /
+`lib`) plus `before`/`after` snapshots where applicable.
+
+```bash
+# Tail recent entries (newest first)
+houkai journal tail
+houkai journal tail -n 50 --op supersede --actor reflection
+houkai journal tail --all          # include rotated archives
+
+# Pretty-print one entry by timestamp
+houkai journal show 1748284800.123
+
+# Reverse a single operation (remember/forget/supersede/restore/link/unlink)
+houkai journal undo 1748284800.123 --yes
 ```
 
 ### Stats

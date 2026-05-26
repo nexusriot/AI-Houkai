@@ -3,8 +3,11 @@ from .store import (
     ConflictError,
     ConflictFn,
     ExpandSpec,
+    ExportSummary,
     Graph,
     HybridWeights,
+    ImportConflictError,
+    ImportSummary,
     Link,
     Memory,
     MemoryStore,
@@ -12,6 +15,7 @@ from .store import (
 )
 from .decay import DecayEngine
 from .reflection import ReflectionEngine
+from .journal import Journal, JournalEntry
 
 __all__ = [
     "Conflict",
@@ -19,8 +23,13 @@ __all__ = [
     "ConflictFn",
     "DecayEngine",
     "ExpandSpec",
+    "ExportSummary",
     "Graph",
     "HybridWeights",
+    "ImportConflictError",
+    "ImportSummary",
+    "Journal",
+    "JournalEntry",
     "Link",
     "Memory",
     "MemoryStore",
