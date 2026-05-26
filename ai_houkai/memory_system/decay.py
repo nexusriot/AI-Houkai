@@ -27,9 +27,9 @@ from __future__ import annotations
 import math
 import time
 from typing import TYPE_CHECKING
+from contextlib import nullcontext
 
-if TYPE_CHECKING:
-    from .store import Memory, MemoryStore
+from .store import Memory, MemoryStore
 
 
 class DecayEngine:
@@ -103,12 +103,14 @@ class DecayEngine:
         t = now if now is not None else time.time()
         pruned: list["Memory"] = []
 
-        for mem, score in self.score_all(t):
-            if mem.type in self.protect_types:
-                continue
-            if score < self.min_score:
-                if not dry_run:
-                    self.store.forget(mem.id)
-                pruned.append(mem)
+        ctx = self.store.as_actor("decay") if not dry_run else nullcontext()
+        with ctx:
+            for mem, score in self.score_all(t):
+                if mem.type in self.protect_types:
+                    continue
+                if score < self.min_score:
+                    if not dry_run:
+                        self.store.forget(mem.id)
+                    pruned.append(mem)
 
         return pruned

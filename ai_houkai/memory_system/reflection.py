@@ -38,10 +38,11 @@ from __future__ import annotations
 
 import math
 import uuid
-from typing import Callable, Literal, TYPE_CHECKING
+from typing import Callable, Literal
 
-if TYPE_CHECKING:
-    from .store import Memory, MemoryStore
+from contextlib import nullcontext
+
+from .store import Memory, MemoryStore
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -102,55 +103,56 @@ class ReflectionEngine:
         clusters = self._cluster(mems, embeddings)
         created: "list[Memory]" = []
 
-        for idx_list in clusters:
-            group = [mems[i] for i in idx_list]
-            text  = self.summarizer(group)
+        ctx = self.store.as_actor("reflection") if not dry_run else nullcontext()
+        with ctx:
+            for idx_list in clusters:
+                group = [mems[i] for i in idx_list]
+                text  = self.summarizer(group)
 
-            all_tags: list[str] = ["reflection"]
-            seen: set[str] = {"reflection"}
-            for m in group:
-                for tag in m.tags:
-                    if tag not in seen:
-                        all_tags.append(tag)
-                        seen.add(tag)
+                all_tags: list[str] = ["reflection"]
+                seen: set[str] = {"reflection"}
+                for m in group:
+                    for tag in m.tags:
+                        if tag not in seen:
+                            all_tags.append(tag)
+                            seen.add(tag)
 
-            importance = round(
-                sum(m.importance for m in group) / len(group), 3
-            )
-
-            if dry_run:
-                from .store import Memory as _Memory
-                candidate = _Memory(
-                    id=str(uuid.uuid4()),
-                    text=text,
-                    type="semantic",
-                    tags=all_tags,
-                    importance=importance,
-                    source="reflection/dry-run",
+                importance = round(
+                    sum(m.importance for m in group) / len(group), 3
                 )
-                created.append(candidate)
-            else:
-                new_mem = self.store.remember(
-                    text=text,
-                    type="semantic",
-                    tags=all_tags,
-                    importance=importance,
-                    source="reflection",
-                )
-                created.append(new_mem)
 
-                if consolidate == "hard":
-                    for m in group:
-                        self.store.forget(m.id)
-                elif consolidate:
-                    for m in group:
-                        # Soft-delete: supersede + derived_from link
-                        self.store.supersede(old_id=m.id, new_id=new_mem.id)
-                        self.store.link(
-                            src_id=new_mem.id,
-                            dst_id=m.id,
-                            rel="derived_from",
-                        )
+                if dry_run:
+                    candidate = Memory(
+                        id=str(uuid.uuid4()),
+                        text=text,
+                        type="semantic",
+                        tags=all_tags,
+                        importance=importance,
+                        source="reflection/dry-run",
+                    )
+                    created.append(candidate)
+                else:
+                    new_mem = self.store.remember(
+                        text=text,
+                        type="semantic",
+                        tags=all_tags,
+                        importance=importance,
+                        source="reflection",
+                    )
+                    created.append(new_mem)
+
+                    if consolidate == "hard":
+                        for m in group:
+                            self.store.forget(m.id)
+                    elif consolidate:
+                        for m in group:
+                            # Soft-delete: supersede + derived_from link
+                            self.store.supersede(old_id=m.id, new_id=new_mem.id)
+                            self.store.link(
+                                src_id=new_mem.id,
+                                dst_id=m.id,
+                                rel="derived_from",
+                            )
 
         return created
 
@@ -167,7 +169,6 @@ class ReflectionEngine:
     def _fetch_episodic(
         self,
     ) -> "tuple[list[Memory], list[list[float]]]":
-        from .store import Memory as _Memory
 
         res = self.store.collection.get(
             where={"type": "episodic"},
@@ -180,7 +181,7 @@ class ReflectionEngine:
         embs  = [] if raw is None else raw  # numpy arrays are truthy-ambiguous
 
         mems = [
-            _Memory.from_record(i, d, m)
+            Memory.from_record(i, d, m)
             for i, d, m in zip(ids, docs, metas)
         ]
         return mems, [list(e) for e in embs]

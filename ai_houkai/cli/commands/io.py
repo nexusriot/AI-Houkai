@@ -1,9 +1,13 @@
-"""Export, import, and backup commands."""
+"""Export, import, and backup commands.
+
+Uses the portable ``.ahkai`` format — gzipped JSONL with a header line
+on line 1. See PROPOSALS.md §2 for the schema.
+"""
 
 from __future__ import annotations
 
+import gzip
 import json
-import hashlib
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -16,92 +20,97 @@ from ai_houkai.cli import output as out
 
 def export_cmd(
     ctx: typer.Context,
-    path: Optional[str] = typer.Argument(None, help="Output file (default: stdout)"),
+    path: str = typer.Argument(..., help="Output .ahkai file"),
     type: Optional[str] = typer.Option(None, "-t", "--type"),
     tag: Optional[str] = typer.Option(None, "-g", "--tag"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
+    no_vectors: bool = typer.Option(False, "--no-vectors",
+                                    help="Omit embeddings — smaller file"),
 ) -> None:
-    """Export memories to JSONL (stdout or file)."""
+    """Export memories to a portable .ahkai file (gzipped JSONL)."""
     store = ctx.obj["store"]
-    memories = store.list_recent(limit=999_999, include_superseded=include_superseded)
-
-    if type:
-        memories = [m for m in memories if m.type == type]
-    if tag:
-        memories = [m for m in memories if tag in m.tags]
-
-    lines = [json.dumps(out._mem_to_dict(m)) for m in memories]
-    output = "\n".join(lines)
-
-    if path:
-        Path(path).write_text(output + "\n")
-        typer.echo(f"Exported {len(memories)} memories to {path}")
-    else:
-        typer.echo(output)
+    summary = store.export(
+        path,
+        include_vectors=not no_vectors,
+        include_superseded=include_superseded,
+        types=[type] if type else None,
+        tags=[tag] if tag else None,
+    )
+    typer.echo(
+        f"Exported {summary.count} memories → {summary.path} "
+        f"({summary.bytes:,} bytes, {summary.elapsed:.2f}s)"
+    )
 
 
 def import_cmd(
     ctx: typer.Context,
-    path: str = typer.Argument(..., help="JSONL file to import"),
-    dedupe: str = typer.Option("text", "--dedupe-by", help="text|id|none"),
+    path: str = typer.Argument(..., help=".ahkai file to import"),
+    on_conflict: str = typer.Option(
+        "skip", "--on-conflict",
+        help="skip | overwrite | rename | error",
+    ),
+    regenerate_vectors: bool = typer.Option(
+        False, "--regenerate-vectors",
+        help="Re-embed text on import (required if model differs)",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
-    """Import memories from a JSONL file."""
+    """Import memories from an .ahkai file."""
     store = ctx.obj["store"]
-    records = []
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                typer.echo(f"Warning: line {lineno} invalid JSON — skipping ({e})", err=True)
-
-    if not records:
-        typer.echo("No records to import.")
-        return
-
-    if dedupe != "none":
-        existing = store.list_recent(limit=999_999, include_superseded=True)
-        if dedupe == "text":
-            existing_hashes = {hashlib.md5(m.text.encode()).hexdigest() for m in existing}
-            records = [
-                r for r in records
-                if hashlib.md5(r.get("text", "").encode()).hexdigest() not in existing_hashes
-            ]
-        elif dedupe == "id":
-            existing_ids = {m.id for m in existing}
-            records = [r for r in records if r.get("id") not in existing_ids]
-
-    if not records:
-        typer.echo("All records already present — nothing to import.")
-        return
-
-    if not out.confirm(f"Import {len(records)} memories?", yes=yes):
+    if not dry_run and not out.confirm(f"Import from {path}?", yes=yes):
         typer.echo("Aborted.")
         return
+    try:
+        summary = store.import_(
+            path,
+            on_conflict=on_conflict,        # type: ignore[arg-type]
+            regenerate_vectors=regenerate_vectors,
+            dry_run=dry_run,
+        )
+    except (ImportError, FileNotFoundError) as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
 
-    imported = 0
-    for r in records:
-        try:
-            mem = store.remember(
-                text=r["text"],
-                type=r.get("type", "semantic"),
-                tags=r.get("tags", []),
-                importance=r.get("importance", 0.5),
-                source=r.get("source"),
-                polarity=r.get("polarity", 0),
-            )
-            if "created_at" in r:
-                mem.created_at = r["created_at"]
-                store.collection.update(ids=[mem.id], metadatas=[mem.to_metadata()])
-            imported += 1
-        except Exception as e:
-            typer.echo(f"Warning: failed to import record — {e}", err=True)
+    prefix = "[dry-run] " if dry_run else ""
+    typer.echo(
+        f"{prefix}imported={summary.imported} skipped={summary.skipped} "
+        f"overwritten={summary.overwritten} renamed={summary.renamed} "
+        f"errors={len(summary.errors)}"
+    )
+    if summary.vectors_regenerated:
+        typer.echo("(embeddings were re-generated for the local model)")
+    for mid, msg in summary.errors[:5]:
+        typer.echo(f"  ! {mid}: {msg}", err=True)
 
-    typer.echo(f"Imported {imported}/{len(records)} memories.")
+
+def info_cmd(
+    path: str = typer.Argument(..., help=".ahkai file to inspect"),
+) -> None:
+    """Print the header of an .ahkai file without touching the store."""
+    fp = Path(path)
+    if not fp.exists():
+        typer.echo(f"Error: no such file: {fp}", err=True)
+        raise typer.Exit(1)
+    try:
+        with gzip.open(fp, "rt", encoding="utf-8") as f:
+            header_line = f.readline()
+            first_data = f.readline()
+            # consume remaining to get total — cheap on small/medium files
+            count = 1 if first_data.strip() else 0
+            for line in f:
+                if line.strip():
+                    count += 1
+    except OSError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+    try:
+        header = json.loads(header_line)
+    except json.JSONDecodeError:
+        typer.echo("Error: not an ai-houkai export (bad header).", err=True)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(header, indent=2))
+    typer.echo(f"\nmemories on disk: {count}")
 
 
 def backup(

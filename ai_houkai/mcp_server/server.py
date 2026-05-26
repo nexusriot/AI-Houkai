@@ -4,7 +4,7 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed:
+Tools exposed (14):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
     recall(query, k?, type?, tag?, min_importance?, mode?, overfetch?)
     forget(memory_id)
@@ -15,11 +15,16 @@ Tools exposed:
     neighbors(memory_id, rel?, direction?, depth?)
     find_conflicts(memory_id?, threshold?)
     supersede(old_id, new_id)
+    maintenance_tick(force?)
+    journal_tail(n?, op?, since_seconds?)
+    export(path, include_vectors?, include_superseded?, type?, tag?, since?)
+    import(path, on_conflict?, regenerate_vectors?, dry_run?)
 """
 
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -32,7 +37,7 @@ from ai_houkai.memory_system.store import ConflictError
 CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
 COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
 
-store = MemoryStore(path=CHROMA_PATH, collection=COLLECTION)
+store = MemoryStore(path=CHROMA_PATH, collection=COLLECTION, actor="mcp")
 mcp   = FastMCP("AI-Houkai")
 
 
@@ -277,6 +282,87 @@ def maintenance_tick(
         "reflected": result.reflected,
         "decay_error": result.decay_error,
         "reflect_error": result.reflect_error,
+    }
+
+
+@mcp.tool()
+def journal_tail(
+    n: int = 20,
+    op: str | None = None,
+    since_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    """Return the most recent audit-journal entries (newest first).
+
+    op: filter by remember|forget|supersede|restore|link|unlink|reflect|decay|...
+    since_seconds: limit to entries within the last N seconds.
+    """
+    since = (time.time() - since_seconds) if since_seconds else None
+    entries = list(store.journal.read(since=since, op=op))
+    entries = entries[-n:][::-1]
+    return [
+        {"ts": e.ts, "op": e.op, "actor": e.actor,
+         "id": e.id, "summary": e.summary(), "meta": e.meta}
+        for e in entries
+    ]
+
+
+@mcp.tool(name="export")
+def export(
+    path: str,
+    include_vectors: bool = True,
+    include_superseded: bool = False,
+    type: str | None = None,
+    tag: str | None = None,
+    since: float | None = None,
+) -> dict[str, Any]:
+    """Export memories to a portable .ahkai file (gzipped JSONL).
+
+    The path is server-local. Returns summary counts.
+    """
+    summary = store.export(
+        path,
+        include_vectors=include_vectors,
+        include_superseded=include_superseded,
+        types=[type] if type else None,
+        tags=[tag] if tag else None,
+        since=since,
+    )
+    return {
+        "path":    str(summary.path),
+        "count":   summary.count,
+        "bytes":   summary.bytes,
+        "elapsed": summary.elapsed,
+    }
+
+
+@mcp.tool(name="import")
+def import_(
+    path: str,
+    on_conflict: str = "skip",
+    regenerate_vectors: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Import memories from a portable .ahkai file.
+
+    on_conflict: skip | overwrite | rename | error.
+    """
+    try:
+        summary = store.import_(
+            path,
+            on_conflict=on_conflict,            # type: ignore[arg-type]
+            regenerate_vectors=regenerate_vectors,
+            dry_run=dry_run,
+        )
+    except (ImportError, FileNotFoundError) as e:
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "imported":    summary.imported,
+        "skipped":     summary.skipped,
+        "overwritten": summary.overwritten,
+        "renamed":     summary.renamed,
+        "errors":      summary.errors,
+        "vectors_regenerated": summary.vectors_regenerated,
     }
 
 
