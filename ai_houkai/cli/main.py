@@ -3,8 +3,27 @@
 from __future__ import annotations
 
 from typing import Optional
-
 import typer
+
+from importlib.metadata import version, PackageNotFoundError
+
+from ai_houkai.cli.config import load as load_config
+from ai_houkai.memory_system import MemoryStore
+from ai_houkai.cli.commands.remember import remember
+from ai_houkai.cli.commands.recall import recall
+from ai_houkai.cli.commands.list_cmd import list_memories
+from ai_houkai.cli.commands.show import show
+from ai_houkai.cli.commands.forget import forget
+from ai_houkai.cli.commands.edit import edit, tag, bump
+from ai_houkai.cli.commands.link import link, unlink, neighbors, graph
+from ai_houkai.cli.commands.conflicts import conflicts, supersede, restore
+from ai_houkai.cli.commands.decay import prune
+from ai_houkai.cli.commands.reflect import reflect
+from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
+from ai_houkai.cli.commands.stats import stats
+from ai_houkai.cli.commands.maintenance import maintenance_app
+from ai_houkai.cli.commands.journal import journal_app
+
 
 app = typer.Typer(
     name="houkai",
@@ -12,6 +31,17 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=True,
 )
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    try:
+        v = version("ai-houkai")
+    except PackageNotFoundError:
+        v = "unknown (not installed as a distribution)"
+    typer.echo(f"houkai {v}")
+    raise typer.Exit()
 
 
 @app.callback()
@@ -25,10 +55,12 @@ def _callback(
         None, "--collection", "-C", envvar="AI_HOUKAI_COLLECTION",
         help="Override collection name",
     ),
+    _version: Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        callback=_version_callback, is_eager=True, expose_value=False,
+        help="Show the installed ai-houkai version and exit.",
+    ),
 ) -> None:
-    from ai_houkai.cli.config import load as load_config
-    from ai_houkai.memory_system import MemoryStore
-
     cfg = load_config()
     if store_path:
         cfg.store_path = store_path
@@ -43,21 +75,6 @@ def _callback(
 
 
 def _register() -> None:
-    from ai_houkai.cli.commands.remember import remember
-    from ai_houkai.cli.commands.recall import recall
-    from ai_houkai.cli.commands.list_cmd import list_memories
-    from ai_houkai.cli.commands.show import show
-    from ai_houkai.cli.commands.forget import forget
-    from ai_houkai.cli.commands.edit import edit, tag, bump
-    from ai_houkai.cli.commands.link import link, unlink, neighbors, graph
-    from ai_houkai.cli.commands.conflicts import conflicts, supersede, restore
-    from ai_houkai.cli.commands.decay import prune
-    from ai_houkai.cli.commands.reflect import reflect
-    from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
-    from ai_houkai.cli.commands.stats import stats
-    from ai_houkai.cli.commands.maintenance import maintenance_app
-    from ai_houkai.cli.commands.journal import journal_app
-
     app.command("remember")(remember)
     app.command("recall")(recall)
     app.command("list")(list_memories)

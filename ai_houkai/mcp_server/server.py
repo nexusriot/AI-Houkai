@@ -32,7 +32,7 @@ from mcp.server.fastmcp import FastMCP
 from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
-from ai_houkai.memory_system.store import ConflictError
+from ai_houkai.memory_system.store import ConflictError, HybridWeights
 
 CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
 COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
@@ -94,7 +94,6 @@ def recall(
     """Semantic (or hybrid) search across stored memories.
     mode: "semantic" (default) | "hybrid" (cosine + BM25 + recency + importance).
     """
-    from ai_houkai.memory_system.store import HybridWeights
     hits = store.recall(
         query=query,
         k=k,

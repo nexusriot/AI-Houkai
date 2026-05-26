@@ -175,6 +175,9 @@ IDs can be abbreviated to any unique 8-character prefix.
 ### Core commands
 
 ```bash
+# Print the installed version
+houkai --version          # or -V
+
 # Store a memory
 houkai remember "Python's GIL blocks CPU parallelism" \
   --type semantic --tag python --importance 0.85
