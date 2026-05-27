@@ -56,6 +56,15 @@ func main() {
 
 	storeCfg := memory.DefaultStoreConfig(cfg.StorePath, cfg.Collection)
 	storeCfg.DefaultImportance = cfg.DefaultImportance
+	storeCfg.Actor = "mcp"
+	switch cfg.EmbedProvider {
+	case embed.ProviderOpenAI:
+		storeCfg.EmbeddingModel = "openai:" + cfg.OpenAIModel
+	case embed.ProviderDigitalOcean:
+		storeCfg.EmbeddingModel = "digitalocean:" + cfg.DOModel
+	default:
+		storeCfg.EmbeddingModel = "ollama:" + cfg.OllamaModel
+	}
 	store := memory.NewMemoryStore(backend, embedder, storeCfg)
 
 	s := mcpserver.New(store, cfg.StorePath, cfg.Collection)

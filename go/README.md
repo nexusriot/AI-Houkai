@@ -140,7 +140,7 @@ or read [`internal/installer/claude_code.go`](internal/installer/claude_code.go)
 
 ## CLI overview
 
-`houkai --help` lists 23 subcommands. Most-used:
+`houkai --help` lists all subcommands. Most-used:
 
 ```
 remember <text>        Store a new memory
@@ -156,7 +156,9 @@ conflicts              Detect contradictions/duplicates
 supersede / restore    Soft-delete + revive
 prune                  Decay-based pruning (dry-run by default)
 reflect                Cluster episodics into semantic memories
-export / import        JSONL round-trip
+export / import        Portable .ahkai round-trip (gzipped JSONL)
+info <file>            Inspect an .ahkai header without touching the store
+journal tail/show/undo Browse and reverse audit-journal entries
 backup                 Snapshot the chromem-go directory
 stats                  Aggregate counters
 config                 Show resolved config + search order
@@ -300,19 +302,59 @@ houkai reflect --threshold 0.85 --min-cluster 3 --apply
 
 ### Backup, export, import
 
+Export uses the portable **`.ahkai`** format — gzipped JSONL with a header
+line (format/version/source/options) followed by one memory per line.
+Embeddings are included by default so an import can reuse them without
+re-running the model. Format is wire-compatible with the Python version.
+
 ```bash
 # binary snapshot of the chromem-go directory
 houkai backup
 # → ~/.ai_houkai/backups/20260524T120415/
 
-# portable JSONL export (works across stores + Python ↔ Go)
-houkai export -o memories.jsonl
+# everything (memories + vectors) → portable archive
+houkai export dump.ahkai
 
-# pipe straight to import on another host
-houkai export | ssh other-host "houkai import"
+# filter and shrink — omit embeddings for a smaller file
+houkai export dump.ahkai --type episodic --tag project --no-vectors
 
-# import into a fresh store
-houkai import < memories.jsonl
+# peek at an archive header without touching the store
+houkai info dump.ahkai
+
+# import — default policy skips id collisions
+houkai import dump.ahkai --yes
+
+# other conflict policies: overwrite | rename | error
+houkai import dump.ahkai --on-conflict overwrite --yes
+
+# re-embed text on import (required if the export's embedding model differs)
+houkai import dump.ahkai --regenerate-vectors --yes
+
+# preview without writing anything
+houkai import dump.ahkai --dry-run
+```
+
+### Audit journal
+
+Every mutation (`remember`, `forget`, `supersede`, `restore`, `link`,
+`unlink`, `import`, `export`, `reflect`, `decay`, `undo`) is appended to
+an append-only JSONL file next to the store (`journal.log`, rotated and
+gzipped at 64 MB, 90-day retention by default). Entries carry the actor
+(`cli` / `mcp` / `reflection` / `decay` / `import` / `lib`) plus
+`before`/`after` snapshots where applicable.
+
+```bash
+# tail recent entries (newest first)
+houkai journal tail
+houkai journal tail -n 50 --op supersede --actor reflection
+houkai journal tail --all          # include rotated archives
+
+# pretty-print one entry by timestamp (copy the ts= value from `tail`)
+houkai journal show 1748284800.123456
+
+# reverse a single operation
+#   undoable ops: remember | forget | supersede | restore | link | unlink
+houkai journal undo 1748284800.123456 --yes
 ```
 
 ### Stats and config introspection
@@ -461,13 +503,14 @@ cmd/
   ai-houkai-mcp/    MCP server entry point (stdio)
   houkai/           CLI entry point
 internal/
-  memory/           MemoryStore, hybrid scoring, BM25, conflicts, links
+  memory/           MemoryStore, hybrid scoring, BM25, conflicts, links,
+                    audit journal, portable .ahkai export/import, undo
   vector/           Backend interface + chromem-go implementation
   embed/            Embedder interface + Ollama + OpenAI clients
   decay/            Time-based pruning engine
   reflect/          Episodic → semantic clustering
   maintenance/      Background daemon (prune + reflect on a ticker)
-  mcpserver/        11 MCP tool definitions
+  mcpserver/        14 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
   installer/        settings.json patcher for Claude Code
   version/          ldflags-injected build info
@@ -495,7 +538,10 @@ Per-arch shortcuts: `make deb-amd64`, `make deb-arm64`, `make macos-arm64`,
 `make macos-amd64`.
 
 Version is derived from `git describe --tags --always --dirty` and injected at
-link time. Override with `VERSION=1.2.3 make build`.
+link time. Override with `VERSION=1.2.3 make build`. A `go build` without
+`-ldflags` falls back to the in-source default in
+[`internal/version/version.go`](internal/version/version.go) (currently
+`0.4.0`).
 
 ---
 
@@ -504,12 +550,17 @@ link time. Override with `VERSION=1.2.3 make build`.
 The on-disk store is **not** binary-compatible: the Python version uses a
 ChromaDB SQLite store, the Go version uses
 [`chromem-go`](https://github.com/philippgille/chromem-go)'s persistent format.
-Use `houkai export` / `import` (JSONL) to migrate between them.
+Use `houkai export` / `import` to migrate between them — the `.ahkai` format
+(gzipped JSONL with a header line) is identical on both sides.
 
-The MCP tool surface is similar but **trimmed**: 11 Go tools vs. 14 Python
-tools (no separate `update`/`get_by_id`/`subgraph` MCP endpoints — those are
-CLI-only). Tool names match (`remember`, `recall`, `forget`, …) so clients
-that don't depend on the missing tools work unchanged.
+The MCP tool surface is now at parity: **14 tools** in both ports —
+`remember`, `recall`, `forget`, `list_recent`, `stats`, `link`, `unlink`,
+`neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`,
+`export`, `import`.
+
+The audit journal is enabled by default in both ports and uses the same
+JSONL line format, so a journal written by one binary can be read by the
+other.
 
 ---
 

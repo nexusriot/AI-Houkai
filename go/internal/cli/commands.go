@@ -520,81 +520,239 @@ func newReflectCmd() *cobra.Command {
 }
 
 func newExportCmd() *cobra.Command {
-	var out string
+	var memType, tag string
+	var includeSuperseded, noVectors bool
 	cmd := &cobra.Command{
-		Use:   "export",
-		Short: "Export all memories as JSONL",
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		Use:   "export <path>",
+		Short: "Export memories to a portable .ahkai file (gzipped JSONL)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
-			mems, err := store.ListRecent(cmd.Context(), 0, true)
+			opts := memory.ExportOpts{
+				IncludeVectors:    !noVectors,
+				IncludeSuperseded: includeSuperseded,
+			}
+			if memType != "" {
+				opts.Types = []memory.MemoryType{memory.MemoryType(memType)}
+			}
+			if tag != "" {
+				opts.Tags = []string{tag}
+			}
+			summary, err := store.Export(cmd.Context(), args[0], opts)
 			if err != nil {
 				return err
 			}
-			w := os.Stdout
-			if out != "" {
-				f, err := os.Create(out)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-				w = f
-			}
-			for _, m := range mems {
-				b, _ := json.Marshal(m)
-				fmt.Fprintln(w, string(b))
-			}
+			fmt.Printf("Exported %d memories → %s (%d bytes, %.2fs)\n",
+				summary.Count, summary.Path, summary.Bytes, summary.Elapsed)
 			return nil
 		},
 	}
-	cmd.Flags().StringVarP(&out, "output", "o", "", "Output file (default: stdout)")
+	cmd.Flags().StringVarP(&memType, "type", "t", "", "Filter by type")
+	cmd.Flags().StringVarP(&tag, "tag", "g", "", "Filter by tag")
+	cmd.Flags().BoolVar(&includeSuperseded, "include-superseded", false, "Include superseded memories")
+	cmd.Flags().BoolVar(&noVectors, "no-vectors", false, "Omit embeddings — smaller file")
 	return cmd
 }
 
 func newImportCmd() *cobra.Command {
-	var yes bool
-	var in string
+	var onConflict string
+	var regenerateVectors, dryRun, yes bool
 	cmd := &cobra.Command{
-		Use:   "import",
-		Short: "Import memories from JSONL",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if !yes && !Confirm("Import memories? Existing IDs will be skipped.") {
+		Use:   "import <path>",
+		Short: "Import memories from an .ahkai file",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path := args[0]
+			if !dryRun && !yes && !Confirm(fmt.Sprintf("Import from %s?", path)) {
 				fmt.Println("aborted")
 				return nil
 			}
-			r := os.Stdin
-			if in != "" {
-				f, err := os.Open(in)
-				if err != nil {
-					return err
-				}
-				defer f.Close()
-				r = f
-			}
 			store := storeFromCtx(cmd.Context())
-			scanner := bufio.NewScanner(r)
-			var count int
-			for scanner.Scan() {
-				var m memory.Memory
-				if err := json.Unmarshal(scanner.Bytes(), &m); err != nil {
-					continue
-				}
-				opts := memory.RememberOpts{
-					Type:       m.Type,
-					Tags:       m.Tags,
-					Importance: m.Importance,
-					Source:     m.Source,
-					Polarity:   m.Polarity,
-				}
-				if _, _, _, err := store.Remember(cmd.Context(), m.Text, opts); err == nil {
-					count++
-				}
+			opts := memory.ImportOpts{
+				OnConflict:        memory.ImportConflictPolicy(onConflict),
+				RegenerateVectors: regenerateVectors,
+				DryRun:            dryRun,
 			}
-			fmt.Printf("imported %d memories\n", count)
+			summary, err := store.Import(cmd.Context(), path, opts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return err
+			}
+			prefix := ""
+			if dryRun {
+				prefix = "[dry-run] "
+			}
+			fmt.Printf("%simported=%d skipped=%d overwritten=%d renamed=%d errors=%d\n",
+				prefix, summary.Imported, summary.Skipped,
+				summary.Overwritten, summary.Renamed, len(summary.Errors))
+			if summary.VectorsRegenerated {
+				fmt.Println("(embeddings were re-generated for the local model)")
+			}
+			for i, e := range summary.Errors {
+				if i >= 5 {
+					break
+				}
+				fmt.Fprintf(os.Stderr, "  ! %s: %s\n", e.ID, e.Msg)
+			}
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&onConflict, "on-conflict", "skip", "skip | overwrite | rename | error")
+	cmd.Flags().BoolVar(&regenerateVectors, "regenerate-vectors", false, "Re-embed text on import")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview without writing")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation")
-	cmd.Flags().StringVarP(&in, "input", "i", "", "Input file (default: stdin)")
+	return cmd
+}
+
+func newInfoCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "info <path>",
+		Short: "Inspect an .ahkai file header without touching the store",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hdr, count, err := memory.PeekExportHeader(args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				return err
+			}
+			b, _ := json.MarshalIndent(hdr, "", "  ")
+			fmt.Println(string(b))
+			fmt.Printf("\nmemories on disk: %d\n", count)
+			return nil
+		},
+	}
+}
+
+func newJournalCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "journal",
+		Short: "Inspect the audit journal",
+	}
+	cmd.AddCommand(newJournalTailCmd(), newJournalShowCmd(), newJournalUndoCmd())
+	return cmd
+}
+
+func newJournalTailCmd() *cobra.Command {
+	var n int
+	var op, actor, memID string
+	var includeArchives bool
+	cmd := &cobra.Command{
+		Use:   "tail",
+		Short: "Show recent journal entries (newest first)",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store := storeFromCtx(cmd.Context())
+			j := store.Journal()
+			if j == nil {
+				fmt.Println("(journal disabled)")
+				return nil
+			}
+			entries, err := j.Read(memory.ReadOpts{
+				Op: op, Actor: actor, MemoryID: memID,
+				IncludeArchives: includeArchives,
+			})
+			if err != nil {
+				return err
+			}
+			// Tail-N then reverse.
+			if len(entries) > n {
+				entries = entries[len(entries)-n:]
+			}
+			if len(entries) == 0 {
+				fmt.Println("(no journal entries)")
+				return nil
+			}
+			for i := len(entries) - 1; i >= 0; i-- {
+				e := entries[i]
+				secs := int64(e.TS)
+				ts := time.Unix(secs, 0).Format("2006-01-02 15:04:05")
+				fmt.Printf("%s  %-10s  %-10s  %s  (ts=%.6f)\n",
+					ts, e.Op, e.Actor, e.Summary(), e.TS)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().IntVarP(&n, "number", "n", 20, "Number of entries")
+	cmd.Flags().StringVar(&op, "op", "", "Filter by operation")
+	cmd.Flags().StringVar(&actor, "actor", "", "Filter by actor")
+	cmd.Flags().StringVar(&memID, "id", "", "Filter by memory id")
+	cmd.Flags().BoolVar(&includeArchives, "all", false, "Include rotated archives")
+	return cmd
+}
+
+func newJournalShowCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <ts>",
+		Short: "Pretty-print one journal entry by timestamp",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ts, err := strconv.ParseFloat(args[0], 64)
+			if err != nil {
+				return fmt.Errorf("invalid ts: %w", err)
+			}
+			store := storeFromCtx(cmd.Context())
+			j := store.Journal()
+			if j == nil {
+				return fmt.Errorf("journal disabled")
+			}
+			entry, err := j.FindByTS(ts, 0)
+			if err != nil {
+				return err
+			}
+			if entry == nil {
+				fmt.Fprintf(os.Stderr, "No entry at ts=%v\n", ts)
+				return fmt.Errorf("not found")
+			}
+			b, _ := json.MarshalIndent(entry, "", "  ")
+			fmt.Println(string(b))
+			return nil
+		},
+	}
+}
+
+func newJournalUndoCmd() *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{
+		Use:   "undo <ts>",
+		Short: "Reverse a single journal entry",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ts, err := strconv.ParseFloat(args[0], 64)
+			if err != nil {
+				return fmt.Errorf("invalid ts: %w", err)
+			}
+			store := storeFromCtx(cmd.Context())
+			j := store.Journal()
+			if j == nil {
+				return fmt.Errorf("journal disabled")
+			}
+			entry, err := j.FindByTS(ts, 0)
+			if err != nil {
+				return err
+			}
+			if entry == nil {
+				return fmt.Errorf("no entry at ts=%v", ts)
+			}
+			short := entry.ID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			if !yes && !Confirm(fmt.Sprintf("Undo %s %s?", entry.Op, short)) {
+				fmt.Println("aborted")
+				return nil
+			}
+			ok, err := store.Undo(cmd.Context(), *entry)
+			if err != nil {
+				return err
+			}
+			if ok {
+				fmt.Println("Undone.")
+				return nil
+			}
+			fmt.Fprintln(os.Stderr, "Could not undo this entry.")
+			return fmt.Errorf("undo failed")
+		},
+	}
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation")
 	return cmd
 }
 

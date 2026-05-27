@@ -31,6 +31,12 @@ type Storable interface {
 	Link(ctx context.Context, srcID, dstID, rel string) error
 }
 
+// actorScoped is implemented by *memory.MemoryStore. We optionally use it
+// to attribute journal entries to "reflection" without making it required.
+type actorScoped interface {
+	AsActor(name string) func()
+}
+
 func New(store Storable, similarityThreshold float32, minClusterSize int, summarizer Summarizer) *Engine {
 	if similarityThreshold == 0 {
 		similarityThreshold = 0.75
@@ -111,6 +117,13 @@ func (e *Engine) Reflect(ctx context.Context, dryRun, consolidate bool) ([]memor
 	clusters, err := e.Clusters(ctx)
 	if err != nil {
 		return nil, err
+	}
+
+	// Attribute journal entries written by this reflection pass.
+	if !dryRun {
+		if as, ok := e.store.(actorScoped); ok {
+			defer as.AsActor("reflection")()
+		}
 	}
 
 	var created []memory.Memory

@@ -70,6 +70,8 @@ func NewRootCmd() *cobra.Command {
 
 			storeCfg := memory.DefaultStoreConfig(cfg.StorePath, cfg.Collection)
 			storeCfg.DefaultImportance = cfg.DefaultImportance
+			storeCfg.Actor = "cli"
+			storeCfg.EmbeddingModel = embedModelName(cfg)
 			store := memory.NewMemoryStore(backend, embedder, storeCfg)
 
 			// Inject into context.
@@ -108,13 +110,28 @@ func NewRootCmd() *cobra.Command {
 		newReflectCmd(),
 		newExportCmd(),
 		newImportCmd(),
+		newInfoCmd(),
 		newBackupCmd(),
 		newStatsCmd(),
+		newJournalCmd(),
 		newInstallCmd(),
 		newConfigCmd(),
 	)
 
 	return root
+}
+
+// embedModelName returns the embedding model name for the active provider
+// so the export header records a stable identifier.
+func embedModelName(cfg Config) string {
+	switch cfg.EmbedProvider {
+	case "openai":
+		return "openai:" + cfg.OpenAIModel
+	case "digitalocean":
+		return "digitalocean:" + cfg.DOModel
+	default:
+		return "ollama:" + cfg.OllamaModel
+	}
 }
 
 // Execute runs the root command.

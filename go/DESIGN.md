@@ -38,12 +38,14 @@ CLI).
 ### `internal/memory` — domain core
 
 - `Memory`: 13-field record (id, text, type, tags, importance, timestamps,
-  access count, source, links, supersedence pointers, polarity).
+  access count, source, links, supersedence pointers, polarity). Also
+  exposes `ToDict()` / `MemoryFromDict()` for the journal and `.ahkai`
+  payloads — these emit and consume Python's serialisation shape verbatim.
 - `MemoryStore`: the only stateful object. Backed by a `vector.Backend` plus
   an `embed.Embedder`. All public operations are methods on it:
   `Remember`, `Recall`, `Forget`, `ListRecent`, `GetByID`, `UpdateMemory`,
   `Link`, `Unlink`, `Neighbors`, `Subgraph`, `FindConflicts`, `Supersede`,
-  `Restore`, `Stats`, `AllRaw`.
+  `Restore`, `Stats`, `AllRaw`, `Export`, `Import`, `Undo`.
 - `MetadataToMemory` / `MemoryToMetadata`: chromem-go only stores
   `map[string]string`, so every numeric / list / nested field is
   stringified at the boundary and parsed back on read. Links are stored as
@@ -51,6 +53,61 @@ CLI).
   codebase — touch with care.
 - **ID resolution**: any caller may pass an 8-char prefix; `resolvePrefix`
   scans `backend.All()` and errors out on ambiguity. Matches Python behaviour.
+
+### `internal/memory` — audit journal
+
+`journal.go` defines `Journal` and `JournalEntry`. Every mutation on
+`MemoryStore` (`remember`, `forget`, `supersede`, `restore`, `link`,
+`unlink`, plus the higher-level `import` / `export` / `reflect` / `decay`
+markers) is appended as one JSON line to `journal.log` next to the store.
+
+- **Best-effort writes.** `Journal.Append` swallows and logs all errors —
+  a journal failure must never break the underlying memory op.
+- **Size-based gzip rotation.** Hot file caps at `RotateMB` (64 by default);
+  rotated archives carry an ISO timestamp suffix (`journal-YYYYMMDDThhmmss.log.gz`).
+  Rotation truncates the live file in place so any concurrent writer's fd
+  stays valid. Archives older than `KeepDays` (90) are pruned on the next
+  rotation check.
+- **Actor tagging.** Entries are written under a thread-local `actor`
+  string. `MemoryStore.AsActor(name)` swaps the actor and returns a
+  closure that restores the previous value — call sites use it via
+  `defer store.AsActor("reflection")()`. `reflect` and `decay` set this
+  through an optional `actorScoped` interface assertion on the store, so
+  the engines stay testable with smaller fake stores.
+- **Reads tolerate truncation.** A crash mid-write leaves an un-parseable
+  last line; `Journal.Read` silently skips it. The journal is forensics,
+  not consistency.
+
+`store.Undo(entry)` reverses one entry where the semantics are well-defined
+— `remember` ↔ `forget`, `supersede` ↔ `restore`, `link` ↔ `unlink`.
+`reflect` / `decay` / `import` / `export` / `undo` themselves are not
+undoable; the function returns `(false, nil)` for those.
+
+### `internal/memory` — portable .ahkai export/import
+
+The format is **gzipped JSONL** with a header line followed by one
+memory row per line, in `created_at`-ascending order so two exports of
+the same store are byte-identical modulo the header timestamp.
+
+```
+line 1     : {"format":"ai-houkai/export","version":1,"exported_at":…,
+              "source":{"collection","embedding_model","embedding_dim","count"},
+              "options":{"include_vectors","include_superseded","types","tags","since"}}
+line 2..N  : {"id":…,"text":…,"meta":{full ToDict()},"vector":[…]?}
+```
+
+`Export(ctx, path, opts)` streams everything via `encoding/json.Encoder`
+straight into a `gzip.Writer`, with type / tag / since / superseded
+filters applied client-side. `Import(ctx, path, opts)` reads back the
+header, validates `format` and `version ≤ 1`, then decodes rows one at a
+time. Four `OnConflict` policies — `skip` (default), `overwrite`,
+`rename` (assigns a fresh UUID), `error` (collects collisions and raises
+`ImportConflictError`). On embedding-model mismatch, the importer
+refuses unless `RegenerateVectors=true`, in which case `addImported`
+re-embeds text on the way in.
+
+`PeekExportHeader(path)` is used by `houkai info` to inspect a file
+without instantiating a store.
 
 ### `internal/memory` — scoring
 
@@ -135,12 +192,12 @@ optional `--daemon` flag.
 
 ### `internal/mcpserver` — MCP surface
 
-Wraps `mark3labs/mcp-go`. Eleven tools:
+Wraps `mark3labs/mcp-go`. Fourteen tools:
 
 ```
 remember        recall          forget          list_recent     stats
 link            unlink          neighbors       find_conflicts  supersede
-maintenance_tick
+maintenance_tick  journal_tail  export          import
 ```
 
 Every handler converts inputs via `req.GetString/GetFloat/...`, calls the
@@ -148,18 +205,21 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-The Python version exposes 14 tools; the missing three (`update`,
-`get_by_id`, `subgraph`) are CLI-only here. If a client needs them, add them
-— they're 20-line wrappers each.
+The tool surface is at parity with the Python version. `export` / `import`
+take a server-local file path — there's no streaming over MCP yet, and
+binary payloads (the gzipped bytes) are kept off the JSON wire.
 
 ### `internal/cli` — CLI front-end
 
-`cobra` root + 23 subcommands. The root's `PersistentPreRunE` is where the
+`cobra` root + subcommands (25 leaves including `journal {tail,show,undo}`
+and the new `info` inspector). The root's `PersistentPreRunE` is where the
 real work happens: it resolves config, instantiates the embedder + backend +
-store, and stuffs them into the command's context via three typed keys
-(`storeKey`, `cfgKey`, `fmtKey`). Subcommands pull them back out with
-`storeFromCtx` / `cfgFromCtx` / `fmtFromCtx`. This keeps each command's
-`RunE` short and free of construction boilerplate.
+store (with `Actor="cli"` and a qualified `EmbeddingModel` like
+`openai:text-embedding-3-small` for the export header), and stuffs them
+into the command's context via three typed keys (`storeKey`, `cfgKey`,
+`fmtKey`). Subcommands pull them back out with `storeFromCtx` /
+`cfgFromCtx` / `fmtFromCtx`. This keeps each command's `RunE` short and
+free of construction boilerplate.
 
 Output goes through `output.go`:
 - `--format json` → encoder
@@ -244,6 +304,8 @@ Currently sparse. The intended shape is:
 - `memory/store_test.go` — Remember→Recall→Supersede→Restore round-trip
   against a real chromem-go store in a tmpdir, with a stub Embedder that
   hashes text to a deterministic float vector
+- `memory/export_import_test.go` — `.ahkai` round-trip, conflict policies,
+  journal rotation, undo for `remember`
 - `decay/engine_test.go` — protected types, threshold edge cases
 - `reflect/engine_test.go` — cluster boundary at threshold ± ε
 - `cli/config_test.go` — resolution-order precedence
@@ -261,8 +323,8 @@ piece that would make all of the above table-driven and offline.
   `MemoryStore` and is easy to add later — but isn't required today.
 - **No multi-user / multi-tenant store.** Single user per data directory.
   Use the `collection` knob to namespace within one user.
-- **No binary compatibility with the Python store.** Use the JSONL
-  export/import bridge.
+- **No binary compatibility with the Python store.** Use the portable
+  `.ahkai` export/import bridge — same gzipped-JSONL format on both ports.
 
 ## Known rough edges
 

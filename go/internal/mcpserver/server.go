@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -13,7 +14,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 11 tools.
+// New wires up the MCP server with all 14 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -30,6 +31,9 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addFindConflicts(s, store)
 	addSupersede(s, store)
 	addMaintenanceTick(s, store)
+	addJournalTail(s, store)
+	addExport(s, store)
+	addImport(s, store)
 
 	return s
 }
@@ -353,5 +357,111 @@ func addMaintenanceTick(s *server.MCPServer, store *memory.MemoryStore) {
 		}
 
 		return jsonText(result), nil
+	})
+}
+
+func addJournalTail(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("journal_tail",
+		mcp.WithDescription("Return the most recent audit-journal entries (newest first)."),
+		mcp.WithNumber("n", mcp.Description("Max entries (default: 20)")),
+		mcp.WithString("op", mcp.Description("Filter by op: remember|forget|supersede|link|...")),
+		mcp.WithNumber("since_seconds", mcp.Description("Only entries within last N seconds")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		j := store.Journal()
+		if j == nil {
+			return jsonText([]any{}), nil
+		}
+		n := req.GetInt("n", 20)
+		op := req.GetString("op", "")
+		var since float64
+		if v := req.GetFloat("since_seconds", 0); v > 0 {
+			since = float64(time.Now().Unix()) - v
+		}
+		entries, err := j.Read(memory.ReadOpts{Op: op, Since: since})
+		if err != nil {
+			return errResult(err), nil
+		}
+		if len(entries) > n {
+			entries = entries[len(entries)-n:]
+		}
+		// Reverse to newest-first.
+		rev := make([]map[string]any, len(entries))
+		for i, e := range entries {
+			rev[len(entries)-1-i] = map[string]any{
+				"ts": e.TS, "op": e.Op, "actor": e.Actor,
+				"id": e.ID, "summary": e.Summary(), "meta": e.Meta,
+			}
+		}
+		return jsonText(rev), nil
+	})
+}
+
+func addExport(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("export",
+		mcp.WithDescription("Export memories to a portable .ahkai file (gzipped JSONL). Path is server-local."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Output .ahkai file path")),
+		mcp.WithBoolean("include_vectors", mcp.Description("Include embeddings (default: true)")),
+		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+		mcp.WithString("type", mcp.Description("Filter by type")),
+		mcp.WithString("tag", mcp.Description("Filter by tag")),
+		mcp.WithNumber("since", mcp.Description("Only memories created after this unix timestamp")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path, err := req.RequireString("path")
+		if err != nil {
+			return errResult(err), nil
+		}
+		opts := memory.ExportOpts{
+			IncludeVectors:    req.GetBool("include_vectors", true),
+			IncludeSuperseded: req.GetBool("include_superseded", false),
+			Since:             req.GetFloat("since", 0),
+		}
+		if t := req.GetString("type", ""); t != "" {
+			opts.Types = []memory.MemoryType{memory.MemoryType(t)}
+		}
+		if t := req.GetString("tag", ""); t != "" {
+			opts.Tags = []string{t}
+		}
+		summary, err := store.Export(ctx, path, opts)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(summary), nil
+	})
+}
+
+func addImport(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("import",
+		mcp.WithDescription("Import memories from a portable .ahkai file."),
+		mcp.WithString("path", mcp.Required(), mcp.Description(".ahkai file to import")),
+		mcp.WithString("on_conflict", mcp.Description("skip | overwrite | rename | error (default: skip)")),
+		mcp.WithBoolean("regenerate_vectors", mcp.Description("Re-embed text on import")),
+		mcp.WithBoolean("dry_run", mcp.Description("Preview without writing")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path, err := req.RequireString("path")
+		if err != nil {
+			return errResult(err), nil
+		}
+		opts := memory.ImportOpts{
+			OnConflict:        memory.ImportConflictPolicy(req.GetString("on_conflict", "skip")),
+			RegenerateVectors: req.GetBool("regenerate_vectors", false),
+			DryRun:            req.GetBool("dry_run", false),
+		}
+		summary, err := store.Import(ctx, path, opts)
+		if err != nil {
+			return jsonText(map[string]any{"ok": false, "error": err.Error()}), nil
+		}
+		_ = fmt.Sprintf // keep fmt referenced
+		return jsonText(map[string]any{
+			"ok":                    true,
+			"imported":              summary.Imported,
+			"skipped":               summary.Skipped,
+			"overwritten":           summary.Overwritten,
+			"renamed":               summary.Renamed,
+			"errors":                summary.Errors,
+			"vectors_regenerated":   summary.VectorsRegenerated,
+		}), nil
 	})
 }

@@ -175,3 +175,97 @@ func MemoryToMetadata(m Memory) map[string]string {
 }
 
 var ErrNotFound = errors.New("memory not found")
+
+// ToDict produces a full, self-contained snapshot of the memory — used by
+// the audit journal and by the .ahkai export format.
+func (m Memory) ToDict() map[string]any {
+	tags := make([]any, len(m.Tags))
+	for i, t := range m.Tags {
+		tags[i] = t
+	}
+	links := make([]any, len(m.Links))
+	for i, l := range m.Links {
+		links[i] = map[string]any{"to": l.To, "rel": l.Rel}
+	}
+	return map[string]any{
+		"id":            m.ID,
+		"text":          m.Text,
+		"type":          string(m.Type),
+		"tags":          tags,
+		"importance":    m.Importance,
+		"created_at":    m.CreatedAt,
+		"last_accessed": m.LastAccessed,
+		"access_count":  m.AccessCount,
+		"source":        m.Source,
+		"links":         links,
+		"superseded_by": m.SupersededBy,
+		"superseded_at": m.SupersededAt,
+		"polarity":      m.Polarity,
+	}
+}
+
+// MemoryFromDict rehydrates a Memory from a ToDict() / journal payload.
+func MemoryFromDict(d map[string]any) Memory {
+	asString := func(v any) string {
+		s, _ := v.(string)
+		return s
+	}
+	asFloat := func(v any) float64 {
+		switch x := v.(type) {
+		case float64:
+			return x
+		case float32:
+			return float64(x)
+		case int:
+			return float64(x)
+		case int64:
+			return float64(x)
+		}
+		return 0
+	}
+	asInt := func(v any) int {
+		switch x := v.(type) {
+		case float64:
+			return int(x)
+		case int:
+			return x
+		case int64:
+			return int(x)
+		}
+		return 0
+	}
+	tags := []string{}
+	if raw, ok := d["tags"].([]any); ok {
+		for _, t := range raw {
+			if s, ok := t.(string); ok {
+				tags = append(tags, s)
+			}
+		}
+	}
+	links := []Link{}
+	if raw, ok := d["links"].([]any); ok {
+		for _, l := range raw {
+			lm, _ := l.(map[string]any)
+			links = append(links, Link{To: asString(lm["to"]), Rel: asString(lm["rel"])})
+		}
+	}
+	mt := MemoryType(asString(d["type"]))
+	if mt == "" {
+		mt = Semantic
+	}
+	return Memory{
+		ID:           asString(d["id"]),
+		Text:         asString(d["text"]),
+		Type:         mt,
+		Tags:         tags,
+		Importance:   float32(asFloat(d["importance"])),
+		CreatedAt:    asFloat(d["created_at"]),
+		LastAccessed: asFloat(d["last_accessed"]),
+		AccessCount:  asInt(d["access_count"]),
+		Source:       asString(d["source"]),
+		Links:        links,
+		SupersededBy: asString(d["superseded_by"]),
+		SupersededAt: asFloat(d["superseded_at"]),
+		Polarity:     asInt(d["polarity"]),
+	}
+}

@@ -23,6 +23,12 @@ type Storable interface {
 	Forget(ctx context.Context, id string) (bool, error)
 }
 
+// actorScoped is implemented by *memory.MemoryStore; we use it to attribute
+// journal entries to "decay" without making it required for tests.
+type actorScoped interface {
+	AsActor(name string) func()
+}
+
 func New(store Storable, decayRate, minScore float32, protectTypes []memory.MemoryType) *Engine {
 	if decayRate == 0 {
 		decayRate = 0.1
@@ -80,6 +86,11 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 	mems, err := e.store.ListRecent(ctx, 0, false)
 	if err != nil {
 		return nil, err
+	}
+	if !dryRun {
+		if as, ok := e.store.(actorScoped); ok {
+			defer as.AsActor("decay")()
+		}
 	}
 	now := time.Now()
 	var pruned []memory.Memory

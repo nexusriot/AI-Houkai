@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,11 +27,19 @@ const (
 type StoreConfig struct {
 	Path              string
 	Collection        string
+	EmbeddingModel    string // recorded in export headers
 	ConflictPolicy    ConflictPolicy
 	ConflictThreshold float32
 	ConflictFn        func(a, b Memory) bool
 	DefaultImportance float32
 	DecayRate         float32 // used for recency in hybrid scoring
+
+	// Audit-journal options.
+	Actor           string // "cli" | "mcp" | "lib" | "reflection" | "decay" | "import"
+	JournalEnabled  bool   // default: true
+	JournalPath     string // default: <Path>/../journal.log
+	JournalRotateMB int    // default: 64
+	JournalKeepDays int    // default: 90
 }
 
 func DefaultStoreConfig(path, collection string) StoreConfig {
@@ -41,6 +50,10 @@ func DefaultStoreConfig(path, collection string) StoreConfig {
 		ConflictThreshold: 0.80,
 		DefaultImportance: 0.5,
 		DecayRate:         0.1,
+		Actor:             "lib",
+		JournalEnabled:    true,
+		JournalRotateMB:   64,
+		JournalKeepDays:   90,
 	}
 }
 
@@ -49,11 +62,60 @@ type MemoryStore struct {
 	backend  vector.Backend
 	embedder embed.Embedder
 	cfg      StoreConfig
+	journal  *Journal
+	actor    string
 }
 
 // NewMemoryStore creates a new store backed by the given vector backend + embedder.
 func NewMemoryStore(backend vector.Backend, embedder embed.Embedder, cfg StoreConfig) *MemoryStore {
-	return &MemoryStore{backend: backend, embedder: embedder, cfg: cfg}
+	if cfg.Actor == "" {
+		cfg.Actor = "lib"
+	}
+	s := &MemoryStore{backend: backend, embedder: embedder, cfg: cfg, actor: cfg.Actor}
+	if cfg.JournalEnabled {
+		jp := cfg.JournalPath
+		if jp == "" {
+			// Default sits next to the store directory.
+			jp = filepath.Join(filepath.Dir(cfg.Path), "journal.log")
+		}
+		s.journal = NewJournal(jp, cfg.JournalRotateMB, cfg.JournalKeepDays)
+	}
+	return s
+}
+
+// Journal returns the underlying audit journal (may be nil if disabled).
+func (s *MemoryStore) Journal() *Journal { return s.journal }
+
+// Config returns the store's configuration (collection name, embedding
+// model, …). Used by the export header.
+func (s *MemoryStore) Config() StoreConfig { return s.cfg }
+
+// AsActor temporarily attributes journal entries to *name*. The returned
+// closure restores the previous actor — call it via `defer`.
+//
+//	defer store.AsActor("reflection")()
+func (s *MemoryStore) AsActor(name string) func() {
+	prev := s.actor
+	s.actor = name
+	return func() { s.actor = prev }
+}
+
+// nowFloat returns sub-second-precision time, matching Python's time.time().
+func nowFloat() float64 {
+	return float64(time.Now().UnixNano()) / 1e9
+}
+
+func (s *MemoryStore) journalEntry(op, id string, before, after, meta map[string]any) {
+	if s.journal == nil {
+		return
+	}
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	s.journal.Append(JournalEntry{
+		TS: nowFloat(), Op: op, Actor: s.actor, ID: id,
+		Before: before, After: after, Meta: meta,
+	})
 }
 
 // Remember stores a new memory and returns it.
@@ -127,6 +189,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	if err != nil {
 		return Memory{}, false, nil, err
 	}
+	s.journalEntry("remember", m.ID, nil, m.ToDict(), nil)
 	return m, true, nil, nil
 }
 
@@ -246,7 +309,12 @@ func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
 	if err != nil || len(items) == 0 {
 		return false, err
 	}
-	return true, s.backend.Delete(ctx, []string{id})
+	before := MetadataToMemory(items[0].ID, items[0].Content, items[0].Metadata)
+	if err := s.backend.Delete(ctx, []string{id}); err != nil {
+		return false, err
+	}
+	s.journalEntry("forget", id, before.ToDict(), nil, nil)
+	return true, nil
 }
 
 // ListRecent returns up to limit memories sorted by created_at desc.
@@ -315,15 +383,48 @@ func (s *MemoryStore) Link(ctx context.Context, srcID, dstID, rel string) error 
 	if rel == "" {
 		rel = RelRelated
 	}
+	added, err := s.linkRaw(ctx, srcID, dstID, rel)
+	if err != nil {
+		return err
+	}
+	if added {
+		s.journalEntry("link", srcID, nil, nil, map[string]any{
+			"src_id": srcID, "dst_id": dstID, "rel": rel,
+		})
+	}
+	return nil
+}
+
+// linkRaw adds a link without journaling. Returns true iff a new edge was inserted.
+func (s *MemoryStore) linkRaw(ctx context.Context, srcID, dstID, rel string) (bool, error) {
 	src, err := s.GetByID(ctx, srcID)
 	if err != nil {
-		return fmt.Errorf("link src: %w", err)
+		return false, fmt.Errorf("link src: %w", err)
+	}
+	for _, l := range src.Links {
+		if l.To == dstID && l.Rel == rel {
+			return false, nil
+		}
 	}
 	addLink(&src, dstID, rel)
-	return s.backend.UpdateMetadata(ctx, src.ID, MemoryToMetadata(src))
+	return true, s.backend.UpdateMetadata(ctx, src.ID, MemoryToMetadata(src))
 }
 
 func (s *MemoryStore) Unlink(ctx context.Context, srcID, dstID, rel string) (int, error) {
+	removed, err := s.unlinkRaw(ctx, srcID, dstID, rel)
+	if err != nil {
+		return 0, err
+	}
+	if removed > 0 {
+		s.journalEntry("unlink", srcID, nil, nil, map[string]any{
+			"src_id": srcID, "dst_id": dstID, "rel": rel, "removed": removed,
+		})
+	}
+	return removed, nil
+}
+
+// unlinkRaw removes link(s) without journaling.
+func (s *MemoryStore) unlinkRaw(ctx context.Context, srcID, dstID, rel string) (int, error) {
 	src, err := s.GetByID(ctx, srcID)
 	if err != nil {
 		return 0, fmt.Errorf("unlink src: %w", err)
@@ -489,7 +590,8 @@ func (s *MemoryStore) doSupersede(ctx context.Context, oldID, newID string) erro
 	if err != nil {
 		return fmt.Errorf("supersede old: %w", err)
 	}
-	now := float64(time.Now().Unix())
+	before := old.ToDict()
+	now := nowFloat()
 	old.SupersededBy = newID
 	old.SupersededAt = now
 	addLink(&old, newID, RelSupersedes)
@@ -502,6 +604,8 @@ func (s *MemoryStore) doSupersede(ctx context.Context, oldID, newID string) erro
 		addLink(&newMem, oldID, RelSupersedes)
 		_ = s.backend.UpdateMetadata(ctx, newMem.ID, MemoryToMetadata(newMem))
 	}
+	s.journalEntry("supersede", oldID, before, old.ToDict(),
+		map[string]any{"old_id": oldID, "new_id": newID})
 	return nil
 }
 
@@ -510,9 +614,21 @@ func (s *MemoryStore) Restore(ctx context.Context, memID string) error {
 	if err != nil {
 		return err
 	}
+	if m.SupersededBy == "" {
+		return nil
+	}
+	before := m.ToDict()
+	superseder := m.SupersededBy
 	m.SupersededBy = ""
 	m.SupersededAt = 0
-	return s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(m))
+	if err := s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(m)); err != nil {
+		return err
+	}
+	// Remove the "supersedes" edge from the superseder, matching Python.
+	_, _ = s.unlinkRaw(ctx, superseder, memID, RelSupersedes)
+	s.journalEntry("restore", memID, before, m.ToDict(),
+		map[string]any{"superseder_id": superseder})
+	return nil
 }
 
 func (s *MemoryStore) touch(ctx context.Context, m *Memory) error {
