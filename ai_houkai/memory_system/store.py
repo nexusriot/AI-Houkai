@@ -101,6 +101,31 @@ class ExpandSpec:
 
 
 @dataclass
+class PackedMemory:
+    """A memory selected for a context pack, with its token cost."""
+    memory: "Memory"
+    score:  float
+    tokens: int
+
+
+@dataclass
+class PackResult:
+    """Result of recall_pack — memories that fit a token budget plus a
+    ready-to-inject context block."""
+    items:       list[PackedMemory]
+    text:        str        # formatted block (empty when no items fit)
+    used_tokens: int
+    budget:      int
+    truncated:   bool       # True if ranked candidates were dropped to fit
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def ids(self) -> list[str]:
+        return [p.memory.id for p in self.items]
+
+
+@dataclass
 class Conflict:
     a:          "Memory"
     b:          "Memory"
@@ -310,6 +335,15 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+def _estimate_tokens(text: str) -> int:
+    """Cheap, tokenizer-free token estimate (~4 chars/token).
+
+    A soft heuristic so token_budget stays a dependency-free ceiling.
+    Callers wanting exact counts pass their own token_counter.
+    """
+    return max(1, round(len(text) / 4))
+
+
 class MemoryStore:
     """Long-term memory backed by ChromaDB with linking, conflict detection,
     and hybrid retrieval."""
@@ -486,6 +520,77 @@ class MemoryStore:
             out = self._expand_links(out, expand, include_superseded)
 
         return out
+
+    def recall_pack(
+        self,
+        query: str,
+        *,
+        token_budget: int = 800,
+        type: MemoryType | None = None,
+        tag: str | None = None,
+        min_importance: float | None = None,
+        mode: Literal["semantic", "hybrid"] = "hybrid",
+        weights: HybridWeights | None = None,
+        expand: ExpandSpec | None = None,
+        include_superseded: bool = False,
+        max_items: int = 50,
+        token_counter: Callable[[str], int] | None = None,
+        header: str = "## Relevant memory",
+    ) -> PackResult:
+        """Assemble the highest-ranked memories that fit a token budget into a
+        ready-to-inject context block.
+
+        Ranks candidates with :meth:`recall` (hybrid by default), then greedily
+        packs them in rank order while the running token estimate stays within
+        ``token_budget``. ``token_budget`` covers the rendered memory lines
+        only — the ``header`` is not counted against it.
+
+        ``token_counter`` overrides the default ~4-chars/token estimate; the
+        budget is therefore a soft ceiling unless an exact counter is supplied.
+        """
+        count_fn = token_counter or _estimate_tokens
+
+        ranked = self.recall(
+            query=query,
+            k=max_items,
+            type=type,
+            tag=tag,
+            min_importance=min_importance,
+            mode=mode,
+            weights=weights,
+            expand=expand,
+            include_superseded=include_superseded,
+        )
+
+        items: list[PackedMemory] = []
+        used = 0
+        truncated = False
+        for mem, score in ranked:
+            line = self._pack_line(mem)
+            cost = count_fn(line)
+            if used + cost > token_budget:
+                truncated = True
+                continue  # a smaller, lower-ranked item may still fit
+            items.append(PackedMemory(memory=mem, score=score, tokens=cost))
+            used += cost
+
+        if items:
+            body = "\n".join(self._pack_line(p.memory) for p in items)
+            text = f"{header}\n{body}" if header else body
+        else:
+            text = ""
+
+        return PackResult(
+            items=items,
+            text=text,
+            used_tokens=used,
+            budget=token_budget,
+            truncated=truncated,
+        )
+
+    @staticmethod
+    def _pack_line(mem: Memory) -> str:
+        return f"- ({mem.type}) {mem.text}"
 
     def list_recent(
         self,
