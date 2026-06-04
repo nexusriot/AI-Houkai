@@ -57,8 +57,8 @@ Four cognitive operations model how humans manage long-term memory:
             ▼                                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      MemoryStore                             │
-│   remember()  recall()  forget()  list_recent()  count()     │
-│   link()  unlink()  neighbors()  subgraph()                  │
+│   remember()  recall()  recall_pack()  forget()  count()     │
+│   list_recent()  link()  unlink()  neighbors()  subgraph()   │
 │   supersede()  restore()  find_conflicts()                   │
 └───────────────────────────┬──────────────────────────────────┘
                             │
@@ -91,13 +91,23 @@ ai_houkai/                        pip package name: ai-houkai
 │   ├── __init__.py               exports Memory, MemoryStore, MemoryType,
 │   │                             Link, Graph, HybridWeights, ExpandSpec,
 │   │                             Conflict, ConflictError, ConflictFn,
+│   │                             PackResult, PackedMemory,
+│   │                             ExportSummary, ImportSummary,
+│   │                             ImportConflictError, Journal, JournalEntry,
 │   │                             DecayEngine, ReflectionEngine
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
+│   ├── journal.py                Journal — append-only JSONL audit log
 │   ├── decay.py                  DecayEngine
 │   └── reflection.py            ReflectionEngine
+├── maintenance/
+│   ├── __init__.py
+│   ├── durations.py              parse/format human duration strings
+│   ├── state.py                  MaintenanceState — JSON run history
+│   ├── scheduler.py              MaintenanceScheduler — tick + run_forever
+│   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 10 tools
+│   └── server.py                 FastMCP server — 15 tools
 ├── cli/
 │   ├── __init__.py
 │   ├── __main__.py               python -m ai_houkai.cli
@@ -107,6 +117,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── commands/
 │       ├── remember.py           houkai remember
 │       ├── recall.py             houkai recall
+│       ├── pack.py               houkai pack
 │       ├── list_cmd.py           houkai list
 │       ├── show.py               houkai show
 │       ├── forget.py             houkai forget
@@ -115,7 +126,9 @@ ai_houkai/                        pip package name: ai-houkai
 │       ├── conflicts.py          houkai conflicts / supersede / restore
 │       ├── decay.py              houkai prune  (wraps DecayEngine)
 │       ├── reflect.py            houkai reflect (wraps ReflectionEngine)
-│       ├── io.py                 houkai export / import / backup
+│       ├── maintenance.py        houkai maintenance tick/run/start/stop/status
+│       ├── journal.py            houkai journal tail/show/undo
+│       ├── io.py                 houkai export / import / info / backup
 │       └── stats.py              houkai stats
 └── installers/
     ├── __init__.py               re-exports ClaudeCodeInstaller
@@ -290,6 +303,28 @@ be fine — HNSW ensures queries stay fast as collections grow.
 4. Call `_touch()` on every returned memory.
 5. Convert cosine distance → similarity score and return.
 
+#### recall_pack() — token-budgeted assembly
+
+`recall_pack()` is a thin read-path layer over `recall()` that solves the
+agent's real consumption pattern: *"fill ~N tokens of context with the most
+useful memory,"* not *"give me exactly k rows."*
+
+1. Rank candidates via `recall(query, k=max_items, …)` — inheriting hybrid
+   scoring (the pack default), tag/type filters, link expansion, superseded
+   exclusion, and `_touch()` for free. No query logic is duplicated.
+2. Walk candidates in rank order, rendering each as `- (type) text` and
+   estimating its token cost. Greedily admit items while the running total
+   stays within `token_budget`; a candidate that doesn't fit is skipped but
+   the walk continues, so a smaller lower-ranked memory can still slot in.
+3. Return a `PackResult` — the rendered block (`text`), the admitted `items`
+   (each with its `score` and `tokens`), `used_tokens`, `budget`, and a
+   `truncated` flag (true when any ranked candidate was dropped to fit).
+
+Token estimation is tokenizer-free (`max(1, round(len/4))`), so `token_budget`
+is a **soft ceiling** covering the memory lines only — the header is excluded.
+Callers needing exact budgets pass `token_counter=`. The budget has no
+data-model impact and is purely additive on the read path.
+
 ---
 
 ## 6. Decay Engine
@@ -437,7 +472,7 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose ten tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose fifteen tools:
 
 **Core tools**
 
@@ -445,6 +480,7 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 |---|---|---|
 | `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored}` or `{stored:false, conflicts:[…]}` |
 | `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
+| `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `mode?`, `max_items?`, `include_superseded?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}]}` |
 | `forget` | `memory_id` | `{deleted}` |
 | `list_recent` | `limit?`, `include_superseded?` | `list[{…,superseded_by}]` |
 | `stats` | — | `{count, path, collection}` |
@@ -691,15 +727,22 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 168 tests across 5 files
+### 263 tests across 12 files
 
 | File | Tests | What it covers |
 |---|---|---|
-| `test_memory.py` | 18 | `MemoryStore`: remember, forget, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
+| `test_memory.py` | 22 | `MemoryStore`: remember, forget, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
 | `test_decay.py` | 15 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store) |
-| `test_reflection.py` | 17 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
-| `test_dispatch.py` | 30 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
-| `test_cli.py` | 11 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin |
+| `test_reflection.py` | 19 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
+| `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
+| `test_cli.py` | 13 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack |
+| `test_hybrid.py` | 24 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion |
+| `test_conflicts.py` | 31 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
+| `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
+| `test_journal.py` | 13 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
+| `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
+| `test_maintenance.py` | 52 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
+| `test_pack.py` | 15 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
 
 ### Test isolation strategy
 
@@ -710,11 +753,15 @@ use `PersistentClient` with a `tmp_path`-backed directory:
 # tests/conftest.py
 @pytest.fixture()
 def store(tmp_path) -> MemoryStore:
-    return MemoryStore(path=str(tmp_path / "chroma"), collection="test_memory")
+    s = MemoryStore(path=str(tmp_path / "chroma"), collection="test_memory")
+    yield s
+    s.client.close()      # PersistentClient leaks FDs without explicit close
 ```
 
 pytest's `tmp_path` fixture creates a unique directory per test and
-cleans it up afterwards.
+cleans it up afterwards.  The fixture `yield`s and then closes the
+client — `PersistentClient` holds file handles open until closed, and
+without teardown the OS FD limit (~1024) is exhausted after ~100 tests.
 
 ### Loading digit-prefixed modules
 
@@ -960,8 +1007,9 @@ friendly install hint if the extras are absent.
 
 ```
 houkai (bin)
-  └── ai_houkai/cli/main.py          Typer app; registers 22 commands;
-                                     shared --store / --collection flags
+  └── ai_houkai/cli/main.py          Typer app; registers 23 commands plus
+                                     two sub-command groups (maintenance,
+                                     journal); shared --store / --collection flags
         ├── config.py                Config resolution chain:
         │                             1. --store / --collection CLI flags
         │                             2. AI_HOUKAI_PATH / AI_HOUKAI_COLLECTION env
@@ -990,6 +1038,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 |---|---|---|
 | `remember` | `remember.py` | `store.remember()` |
 | `recall` | `recall.py` | `store.recall()` |
+| `pack` | `pack.py` | `store.recall_pack()` |
 | `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
 | `show` | `show.py` | `store._get_by_id()` |
 | `forget` | `forget.py` | `store.forget()` |
@@ -1007,8 +1056,11 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `reflect` | `reflect.py` | `ReflectionEngine.reflect()` |
 | `export` | `io.py` | `store.list_recent()` → JSONL |
 | `import` | `io.py` | JSONL → `store.remember()` |
+| `info` | `io.py` | inspect a `.ahkai` archive without importing |
 | `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
 | `stats` | `stats.py` | `store.list_recent()` + Counter |
+| `maintenance` (group) | `maintenance.py` | `MaintenanceScheduler` — tick/run/start/stop/status |
+| `journal` (group) | `journal.py` | `Journal` — tail/show/undo |
 
 ### Output system
 

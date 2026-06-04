@@ -65,6 +65,29 @@ def test_recall(tmp_path):
     assert "score" in data[0]
 
 
+def test_pack_text(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "Roses are red", "--type", "episodic"], store_path)
+    _invoke(["remember", "Violets are blue", "--type", "episodic"], store_path)
+
+    result = _invoke(["pack", "flowers colors", "--budget", "1000"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "## Relevant memory" in result.output
+    assert "Roses are red" in result.output or "Violets are blue" in result.output
+
+
+def test_pack_json(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "Python uses indentation", "--type", "semantic"], store_path)
+
+    result = _invoke(["pack", "python syntax", "--format", "json", "--budget", "1000"], store_path)
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert "text" in data and "items" in data
+    assert data["budget"] == 1000
+    assert data["used_tokens"] == sum(i["tokens"] for i in data["items"])
+
+
 def test_show(tmp_path):
     store_path = str(tmp_path / "chroma")
     r = _invoke(["remember", "Test memory for show"], store_path)

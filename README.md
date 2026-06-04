@@ -21,10 +21,11 @@ and periodic reflection that condenses experience into knowledge.
 | **Memory linking** | Typed directed edges — `refines`, `supersedes`, `derived_from`, … |
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
+| **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
-| **MCP server** | 14 tools for any MCP client (Claude Code, Claude Desktop) |
+| **MCP server** | 15 tools for any MCP client (Claude Code, Claude Desktop) |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -48,7 +49,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (14 tools)
+│   │   └── server.py             # FastMCP server (15 tools)
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── __main__.py           # python -m ai_houkai.cli
@@ -58,6 +59,7 @@ AI-Houkai/
 │   │   └── commands/
 │   │       ├── remember.py       # houkai remember
 │   │       ├── recall.py         # houkai recall
+│   │       ├── pack.py           # houkai pack
 │   │       ├── list_cmd.py       # houkai list
 │   │       ├── show.py           # houkai show
 │   │       ├── forget.py         # houkai forget
@@ -154,6 +156,11 @@ store.remember("Python's GIL blocks CPU parallelism",
 
 for mem, score in store.recall("parallel execution", k=3):
     print(f"{score:.3f}  {mem.text}")
+
+# Or assemble a token-budgeted block ready to drop into a prompt:
+pack = store.recall_pack("parallel execution", token_budget=600)
+print(pack.text)          # "## Relevant memory\n- (semantic) Python's GIL …"
+print(pack.used_tokens, "/", pack.budget, "truncated:", pack.truncated)
 ```
 
 ---
@@ -188,6 +195,12 @@ echo "Deploy with: make release" | houkai remember --stdin --type procedural
 # Semantic search
 houkai recall "parallel execution" -k 5
 houkai recall "deploy" --mode hybrid --format json
+
+# Pack the most relevant memories into a token-budgeted context block.
+# The block prints to stdout (pipe it into a prompt); a summary goes to stderr.
+houkai pack "how do we deploy and test" --budget 800
+houkai pack "deploy" --budget 500 > context.md      # clean block, no summary
+houkai pack "deploy" --format json                  # block + per-item scores/tokens
 
 # List recent memories
 houkai list
@@ -354,9 +367,12 @@ editor              = "nvim"
 
 ---
 
-## Roadmap
+## Design docs
 
-Designs for upcoming features live in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
+In-depth design notes live in [DESIGN.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/DESIGN.md).
+The original feature proposals for hybrid retrieval, conflict detection, and
+memory linking — all now shipped — are archived in
+[PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
 
 ## Run the tests
 
@@ -521,7 +537,12 @@ ai-houkai-mcp
 # or: python -m ai_houkai.mcp_server.server
 ```
 
-Exposed tools: `remember` · `recall` · `forget` · `list_recent` · `stats`.
+Exposed tools (15):
+
+- **Core** — `remember` · `recall` · `recall_pack` · `forget` · `list_recent` · `stats`
+- **Linking** — `link` · `unlink` · `neighbors`
+- **Conflicts** — `find_conflicts` · `supersede`
+- **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `export` · `import`
 
 Environment variables:
 

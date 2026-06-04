@@ -4,9 +4,10 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed (14):
+Tools exposed (15):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
     recall(query, k?, type?, tag?, min_importance?, mode?, overfetch?)
+    recall_pack(query, token_budget?, type?, tag?, min_importance?, mode?, max_items?)
     forget(memory_id)
     list_recent(limit?, include_superseded?)
     stats()
@@ -117,6 +118,54 @@ def recall(
         }
         for m, score in hits
     ]
+
+
+@mcp.tool()
+def recall_pack(
+    query: str,
+    token_budget: int = 800,
+    type: str | None = None,
+    tag: str | None = None,
+    min_importance: float | None = None,
+    mode: str = "hybrid",
+    max_items: int = 50,
+    include_superseded: bool = False,
+) -> dict[str, Any]:
+    """Assemble the most relevant memories into a token-budgeted context block.
+
+    Ranks with hybrid scoring (cosine + BM25 + recency + importance) by default,
+    then greedily packs results until token_budget is reached. Returns a ready-to-
+    inject `text` block plus the packed items. token_budget is a soft ceiling
+    (estimated at ~4 chars/token) covering the memory lines, not the header.
+    """
+    pack = store.recall_pack(
+        query=query,
+        token_budget=token_budget,
+        type=type,             # type: ignore[arg-type]
+        tag=tag,
+        min_importance=min_importance,
+        mode=mode,             # type: ignore[arg-type]
+        max_items=max_items,
+        include_superseded=include_superseded,
+    )
+    return {
+        "text": pack.text,
+        "used_tokens": pack.used_tokens,
+        "budget": pack.budget,
+        "truncated": pack.truncated,
+        "items": [
+            {
+                "id": p.memory.id,
+                "text": p.memory.text,
+                "type": p.memory.type,
+                "tags": p.memory.tags,
+                "importance": p.memory.importance,
+                "score": round(p.score, 4),
+                "tokens": p.tokens,
+            }
+            for p in pack.items
+        ],
+    }
 
 
 @mcp.tool()

@@ -1,6 +1,11 @@
 # AI-Houkai — Feature Design Proposals
 
-Designs for three queued features.  Status: **proposed, not yet implemented**.
+> **Status: all three shipped.** This document is the original design record
+> for hybrid retrieval, conflict/contradiction detection, and memory linking —
+> all now implemented and live. Kept for historical context; see
+> [DESIGN.md](DESIGN.md) for the current behaviour.
+
+Designs for three (now-implemented) features.
 
 1. [Hybrid retrieval](#1-hybrid-retrieval)
 2. [Conflict / contradiction detection](#2-conflict--contradiction-detection)
