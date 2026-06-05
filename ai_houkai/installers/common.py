@@ -14,6 +14,9 @@ import shutil
 import sys
 import textwrap
 
+from ai_houkai.mcp_server import server as srv
+
+
 CONSOLE_SCRIPT = "ai-houkai-mcp"
 
 
@@ -65,7 +68,6 @@ def verify_server(server_name: str, *, stream=sys.stdout) -> bool:
         ok = False
 
     try:
-        from ai_houkai.mcp_server import server as srv
         tools = ["remember", "recall", "forget", "list_recent", "stats"]
         missing = [t for t in tools if not hasattr(srv, t)]
         if missing:

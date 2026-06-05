@@ -34,6 +34,8 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Optional
 
+from ai_houkai.mcp_server import server as srv
+
 
 DEFAULT_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 DEFAULT_MEMORY_PATH   = os.path.expanduser("~/.ai_houkai")
@@ -146,7 +148,6 @@ class ClaudeCodeInstaller:
             ok = False
 
         try:
-            from ai_houkai.mcp_server import server as srv
             tools = ["remember", "recall", "forget", "list_recent", "stats"]
             missing = [t for t in tools if not hasattr(srv, t)]
             if missing:
