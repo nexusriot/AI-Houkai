@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.5.0"
+version         = "0.5.5"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -61,6 +61,12 @@ ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
 
 # Register the MCP server with Claude Code (~/.claude/settings.json)
 ai-houkai-install-claude-code = "ai_houkai.installers.claude_code:_main"
+
+# Register the MCP server with Cursor (~/.cursor/mcp.json)
+ai-houkai-install-cursor = "ai_houkai.installers.cursor:_main"
+
+# Register the MCP server with OpenCode (~/.config/opencode/opencode.json)
+ai-houkai-install-opencode = "ai_houkai.installers.opencode:_main"
 
 # Terminal CLI — requires pip install "ai-houkai[cli]"
 houkai = "ai_houkai.cli.main:_main"
