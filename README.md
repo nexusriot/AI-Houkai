@@ -74,7 +74,10 @@ AI-Houkai/
 │   │       └── stats.py          # houkai stats
 │   └── installers/
 │       ├── __init__.py
-│       └── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
+│       ├── common.py             # shared command resolver / JSON patcher / memory guide
+│       ├── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
+│       ├── cursor.py             # CursorInstaller   — register MCP w/ Cursor
+│       └── opencode.py           # OpenCodeInstaller — register MCP w/ OpenCode
 ├── examples/
 │   ├── 01_standalone.py          # pure-Python walkthrough, no LLM
 │   ├── 02_ollama_local_network.py  # Ollama on LAN, fully offline
@@ -571,6 +574,77 @@ claude mcp add ai-houkai -- ai-houkai-mcp
 ```
 
 **Claude Desktop** — use `examples/03_claude_desktop.py --install`.
+
+**Cursor** (`~/.cursor/mcp.json`, or `--project` for `./.cursor/mcp.json`):
+
+```bash
+ai-houkai-install-cursor --install      # patch ~/.cursor/mcp.json
+ai-houkai-install-cursor --verify       # smoke-test the server + registration
+ai-houkai-install-cursor --rule         # print a .cursor/rules/*.mdc snippet
+ai-houkai-install-cursor                # preview the JSON block (no write)
+```
+
+Cursor uses the same `mcpServers` schema as Claude. The written block:
+
+```json
+{
+  "mcpServers": {
+    "ai-houkai": {
+      "command": "ai-houkai-mcp",
+      "env": {
+        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_COLLECTION": "cursor"
+      }
+    }
+  }
+}
+```
+
+After installing, reload Cursor and confirm under **Settings → MCP**. Drop the
+`--rule` output into `.cursor/rules/ai-houkai-memory.mdc` so the agent knows
+when to call the memory tools.
+
+**OpenCode** (`~/.config/opencode/opencode.json`, or `--project` for
+`./opencode.json`):
+
+```bash
+ai-houkai-install-opencode --install    # patch ~/.config/opencode/opencode.json
+ai-houkai-install-opencode --verify     # smoke-test the server + registration
+ai-houkai-install-opencode --agents     # print an AGENTS.md snippet
+ai-houkai-install-opencode              # preview the JSON block (no write)
+```
+
+OpenCode uses its own `mcp` schema (note the `command` array and `environment`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "ai-houkai": {
+      "type": "local",
+      "command": ["ai-houkai-mcp"],
+      "enabled": true,
+      "environment": {
+        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_COLLECTION": "opencode"
+      }
+    }
+  }
+}
+```
+
+Restart OpenCode after installing. Append the `--agents` output to your
+project (or global `~/.config/opencode/`) `AGENTS.md` to teach the agent the
+memory workflow.
+
+Both installers are reusable library classes, mirroring `ClaudeCodeInstaller`:
+
+```python
+from ai_houkai.installers import CursorInstaller, OpenCodeInstaller
+
+CursorInstaller(memory_path="~/.ai_houkai").install()
+OpenCodeInstaller(memory_path="~/.ai_houkai", settings_path="opencode.json").install()
+```
 
 ---
 
