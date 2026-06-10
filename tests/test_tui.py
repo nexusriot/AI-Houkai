@@ -1,0 +1,142 @@
+"""Tests for the TUI — data-layer view models plus a few Textual pilot runs."""
+
+from __future__ import annotations
+
+import pytest
+
+from ai_houkai.tui.data import (
+    Navigator,
+    detail_markup,
+    mem_row,
+    neighbors_view,
+    recent_view,
+    search_view,
+)
+
+from ai_houkai.tui.app import HoukaiTui  # noqa: E402
+
+textual = pytest.importorskip("textual")
+pytest_asyncio = pytest.importorskip("pytest_asyncio")
+
+
+@pytest.fixture()
+def seeded(store):
+    a = store.remember("Deploys go through make release", type="procedural",
+                       importance=0.9, tags=["ops"])
+    b = store.remember("The staging box runs Debian 12", type="semantic")
+    c = store.remember("Fixed a flaky test in the journal suite", type="episodic")
+    store.link(a.id, b.id, rel="refines")
+    return store, (a, b, c)
+
+
+class TestViews:
+    def test_mem_row_shape_and_snippet(self, seeded):
+        _, (a, _, _) = seeded
+        row = mem_row(a, extra="x")
+        assert row[0] == a.id[:8]
+        assert row[1] == "procedural"
+        assert row[2] == "0.90"
+        assert row[4] == "x"
+        long = mem_row(a.__class__(id="i" * 36, text="word " * 50, type="episodic"))
+        assert len(long[5]) <= 60
+        assert long[5].endswith("…")
+
+    def test_recent_view(self, seeded):
+        store, mems = seeded
+        view = recent_view(store)
+        assert view.kind == "recent"
+        assert len(view.rows) == 3
+        assert set(view.memories) == {m.id[:8] for m in mems}
+
+    def test_search_view_scores_in_extra(self, seeded):
+        store, _ = seeded
+        view = search_view(store, "deployment release")
+        assert view.kind == "search"
+        assert view.rows
+        float(view.rows[0][4])  # extra column is a parseable score
+        assert "make release" in view.rows[0][5]
+
+    def test_neighbors_view_rel_in_extra(self, seeded):
+        store, (a, b, _) = seeded
+        view = neighbors_view(store, a)
+        assert [r[0] for r in view.rows] == [b.id[:8]]
+        assert view.rows[0][4] == "refines"
+
+    def test_detail_markup_contents(self, seeded):
+        store, (a, b, _) = seeded
+        a = store._get_by_id(a.id)  # refetch: links were added after remember()
+        text = detail_markup(a)
+        assert a.id[:8] in text
+        assert "make release" in text
+        assert "#ops" in text
+        assert f"--refines--> [cyan]{b.id[:8]}" in text
+
+
+class TestNavigator:
+    def test_stack_push_back_bottoms_out(self, seeded):
+        store, (a, _, _) = seeded
+        nav = Navigator(store)
+        assert nav.current.kind == "recent"      # lazily opened
+        nav.open_search("deploy")
+        nav.open_neighbors(a)
+        assert [v.kind for v in nav.stack] == ["recent", "search", "neighbors"]
+        assert " > " in nav.breadcrumb
+        nav.back()
+        assert nav.current.kind == "search"
+        nav.back()
+        nav.back()                                # bottom — stays on recent
+        assert nav.current.kind == "recent"
+
+    def test_open_recent_resets_stack(self, seeded):
+        store, (a, _, _) = seeded
+        nav = Navigator(store)
+        nav.open_search("deploy")
+        nav.open_neighbors(a)
+        nav.open_recent()
+        assert len(nav.stack) == 1
+
+
+@pytest.mark.asyncio
+async def test_app_lists_memories_and_shows_detail(seeded):
+    store, mems = seeded
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        table = app.query_one("#list")
+        assert table.row_count == 3
+        detail = app.query_one("#detail")
+        assert str(detail.render()) != ""
+
+
+@pytest.mark.asyncio
+async def test_app_neighbors_and_back(seeded):
+    store, (a, b, _) = seeded
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        table = app.query_one("#list")
+        # move cursor to memory `a` (row order is recency, c/b/a or similar)
+        for i in range(table.row_count):
+            key = table.coordinate_to_cell_key((i, 0)).row_key
+            if str(key.value) == a.id[:8]:
+                table.move_cursor(row=i)
+                break
+        await pilot.press("n")
+        assert app.nav.current.kind == "neighbors"
+        assert table.row_count == 1
+        await pilot.press("b")
+        assert app.nav.current.kind == "recent"
+        assert table.row_count == 3
+
+
+@pytest.mark.asyncio
+async def test_app_search_flow(seeded):
+    store, _ = seeded
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        await pilot.press("/")
+        search = app.query_one("#search")
+        assert app.focused is search
+        await pilot.press(*"deploy")
+        await pilot.press("enter")
+        assert app.nav.current.kind == "search"
+        table = app.query_one("#list")
+        assert table.row_count > 0

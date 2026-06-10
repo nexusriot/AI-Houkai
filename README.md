@@ -22,6 +22,10 @@ and periodic reflection that condenses experience into knowledge.
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
 | **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
+| **Importance auto-assignment** | Heuristic 0–1 scoring from text (instructions > decisions > completions > observations) |
+| **Bulk ingest** | `houkai ingest` — chunk files/stdin into memories (markdown-aware) |
+| **Collections** | `houkai collections` — list/create/delete/copy namespaces in one store |
+| **TUI browser** | `houkai tui` — Textual UI: search, detail pane, link-graph walking |
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
@@ -41,7 +45,9 @@ AI-Houkai/
 │   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   ├── reflection.py         # ReflectionEngine — episodic → semantic
-│   │   └── summarizers.py        # build_summarizer("ollama:…|openai:…|anthropic:…")
+│   │   ├── summarizers.py        # build_summarizer("ollama:…|openai:…|anthropic:…")
+│   │   ├── importance.py         # score_importance — heuristic auto-assignment
+│   │   └── ingest.py             # chunk_text — markdown-aware chunking
 │   ├── maintenance/
 │   │   ├── __init__.py
 │   │   ├── durations.py          # parse/format human duration strings
@@ -72,7 +78,13 @@ AI-Houkai/
 │   │       ├── maintenance.py    # houkai maintenance tick/run/start/stop/status
 │   │       ├── journal.py        # houkai journal tail/show/undo
 │   │       ├── io.py             # houkai export / import / info / backup
+│   │       ├── ingest.py         # houkai ingest
+│   │       ├── collections.py    # houkai collections list/create/delete/copy
+│   │       ├── tui_cmd.py        # houkai tui
 │   │       └── stats.py          # houkai stats
+│   ├── tui/
+│   │   ├── data.py               # view models: recent/search/neighbors + Navigator
+│   │   └── app.py                # HoukaiTui — Textual memory browser
 │   └── installers/
 │       ├── __init__.py
 │       ├── common.py             # shared command resolver / JSON patcher / memory guide
@@ -88,7 +100,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 284 tests across 13 files
+├── tests/                        # 330 tests across 16 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -102,7 +114,10 @@ AI-Houkai/
 │   ├── test_journal.py           # audit journal tail/show/undo
 │   ├── test_export_import.py     # portable .ahkai archives
 │   ├── test_maintenance.py       # scheduler, daemon, durations, state
-│   └── test_summarizers.py       # LLM summarizer specs, fallback, wiring
+│   ├── test_summarizers.py       # LLM summarizer specs, fallback, wiring
+│   ├── test_importance.py        # heuristic importance tiers + wiring
+│   ├── test_ingest.py            # chunk_text + ingest/collections commands
+│   └── test_tui.py               # TUI view models + Textual pilot runs
 ├── pyproject.toml
 └── requirements.txt
 ```
@@ -149,7 +164,8 @@ uv run --with ai-houkai python examples/pip_package_example.py
 pip install "ai-houkai[claude]"   # + Anthropic SDK
 pip install "ai-houkai[openai]"   # + OpenAI SDK (also covers Ollama)
 pip install "ai-houkai[cli]"      # + houkai terminal CLI (typer + rich)
-pip install "ai-houkai[all]"      # all providers + CLI
+pip install "ai-houkai[tui]"      # + houkai tui memory browser (textual)
+pip install "ai-houkai[all]"      # all providers + CLI + TUI
 pip install "ai-houkai[dev]"      # + pytest + CLI
 ```
 
@@ -204,6 +220,17 @@ houkai remember "Python's GIL blocks CPU parallelism" \
 
 # Read from stdin (pipe-friendly)
 echo "Deploy with: make release" | houkai remember --stdin --type procedural
+
+# Score importance heuristically from the text (instructions/corrections ≈ 0.9,
+# decisions ≈ 0.75, completions ≈ 0.6, hedged observations ≈ 0.35)
+houkai remember "Never push directly to main" --auto-importance
+# …or make it the default: default_importance = "auto" in config.toml
+
+# Bulk-ingest files (or stdin): blank-line chunking, markdown headings kept
+# with their paragraph, long paragraphs re-packed on sentence boundaries
+houkai ingest notes.md meeting.txt --type semantic --tag project --yes
+houkai ingest notes.md --dry-run                 # preview chunks
+git log --oneline -20 | houkai ingest --tag git --auto-importance --yes
 
 # Semantic search
 houkai recall "parallel execution" -k 5
@@ -355,6 +382,32 @@ houkai journal show 1748284800.123
 houkai journal undo 1748284800.123 --yes
 ```
 
+### Collections
+
+One Chroma store can hold many collections (namespaces) — e.g. one per
+agent or per project (`claude_code` / `cursor` / `opencode`).
+
+```bash
+houkai collections list                    # names, counts, active marker
+houkai collections create scratch
+houkai collections copy ai_houkai backup --yes   # embeddings included, no re-embed
+houkai collections delete scratch --yes          # refuses the active collection
+```
+
+All other commands target a collection via `--collection NAME`.
+
+### TUI browser
+
+```bash
+pip install "ai-houkai[tui]"
+houkai tui
+```
+
+A Textual full-screen browser: memory list with detail pane, `/` for
+semantic search, `n` to walk the link graph from the selected memory
+(neighbors view with rel labels), `b` to go back along the breadcrumb,
+`r` for recent, `q` to quit. Read-only — it never mutates the store.
+
 ### Stats
 
 ```bash
@@ -377,7 +430,7 @@ Every listing command accepts `--format auto|rich|tsv|json`.
 store_path          = "~/.ai_houkai/.chroma"
 collection          = "ai_houkai"
 default_type        = "semantic"
-default_importance  = 0.5
+default_importance  = 0.5        # or "auto" — heuristic scoring per memory
 editor              = "nvim"
 ```
 
@@ -566,6 +619,8 @@ Environment variables:
 |---|---|
 | `AI_HOUKAI_PATH` | `./.chroma` |
 | `AI_HOUKAI_COLLECTION` | `ai_houkai` |
+| `AI_HOUKAI_AUTO_IMPORTANCE` | unset — set `1` to heuristically score `remember` calls that omit `importance` |
+| `AI_HOUKAI_SUMMARIZER` | unset — e.g. `ollama:llama3.1` for `maintenance_tick` reflection |
 
 **Claude Code** (global):
 

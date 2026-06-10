@@ -102,7 +102,12 @@ ai_houkai/                        pip package name: ai-houkai
 │   ├── journal.py                Journal — append-only JSONL audit log
 │   ├── decay.py                  DecayEngine
 │   ├── reflection.py             ReflectionEngine
-│   └── summarizers.py            build_summarizer — LLM summarizer specs
+│   ├── summarizers.py            build_summarizer — LLM summarizer specs
+│   ├── importance.py             score_importance — heuristic auto-assignment
+│   └── ingest.py                 chunk_text — markdown-aware chunking
+├── tui/
+│   ├── data.py                   View/Navigator view models (no textual import)
+│   └── app.py                    HoukaiTui — Textual browser (houkai tui)
 ├── maintenance/
 │   ├── __init__.py
 │   ├── durations.py              parse/format human duration strings
@@ -804,7 +809,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 284 tests across 13 files
+### 330 tests across 16 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -821,6 +826,9 @@ LLM API  ──►  assistant reply to user
 | `test_maintenance.py` | 52 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
 | `test_pack.py` | 15 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
 | `test_summarizers.py` | 21 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
+| `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
+| `test_ingest.py` | 18 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
+| `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
 
 ### Test isolation strategy
 
@@ -1026,12 +1034,20 @@ engine = ReflectionEngine(store, summarizer=my_summarizer)
 
 ### Importance auto-assignment
 
-Assign importance based on context rather than caller-supplied values:
+Built in — `ai_houkai/memory_system/importance.py` implements the tiers
+below as a deterministic regex heuristic (`score_importance(text, type,
+tags)`), wired via `MemoryStore(importance_fn=…)`, the CLI
+(`--auto-importance` or `default_importance = "auto"`), and the MCP
+server (`AI_HOUKAI_AUTO_IMPORTANCE=1`):
 
-- **High** (0.9+): explicit user instructions, corrections, preferences
-- **Medium** (0.6–0.8): task completions, project decisions
-- **Low** (0.2–0.4): passing observations, intermediate steps
-- **LLM-based**: ask the model to rate 0–1 before storing
+- **High** (0.9): explicit user instructions, corrections, preferences
+- **Medium-high** (0.75): decisions, conventions, policies
+- **Medium** (0.6): task completions, durable project facts
+- **Low** (0.35): hedged/passing observations
+- Modifiers: +0.10 procedural/feedback, −0.15 questions, −0.10 fragments
+
+Still open as an extension: **LLM-based** scoring (ask the model to rate
+0–1 before storing) — pass any callable as `importance_fn`.
 
 ---
 
@@ -1062,9 +1078,10 @@ friendly install hint if the extras are absent.
 
 ```
 houkai (bin)
-  └── ai_houkai/cli/main.py          Typer app; registers 23 commands plus
-                                     two sub-command groups (maintenance,
-                                     journal); shared --store / --collection flags
+  └── ai_houkai/cli/main.py          Typer app; registers 25 commands plus
+                                     three sub-command groups (maintenance,
+                                     journal, collections); shared
+                                     --store / --collection flags
         ├── config.py                Config resolution chain:
         │                             1. --store / --collection CLI flags
         │                             2. AI_HOUKAI_PATH / AI_HOUKAI_COLLECTION env
@@ -1114,8 +1131,11 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `info` | `io.py` | inspect a `.ahkai` archive without importing |
 | `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
 | `stats` | `stats.py` | `store.list_recent()` + Counter |
+| `ingest` | `ingest.py` | `chunk_text()` → one `store.remember()` per chunk |
+| `tui` | `tui_cmd.py` | `HoukaiTui` (Textual; needs the `tui` extra) |
 | `maintenance` (group) | `maintenance.py` | `MaintenanceScheduler` — tick/run/start/stop/status |
 | `journal` (group) | `journal.py` | `Journal` — tail/show/undo |
+| `collections` (group) | `collections.py` | Chroma client — list/create/delete/copy (embeddings copied verbatim) |
 
 ### Output system
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.5.5"
+version         = "0.7.0"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -41,16 +41,21 @@ openai = ["openai>=1.50.0"]
 # pip install "ai-houkai[cli]"
 cli = ["typer>=0.12", "rich>=13.7"]
 
+# pip install "ai-houkai[tui]"  — houkai tui memory browser (includes cli deps)
+tui = ["typer>=0.12", "rich>=13.7", "textual>=0.50"]
+
 # pip install "ai-houkai[all]"
-all = ["anthropic>=0.40.0", "openai>=1.50.0", "typer>=0.12", "rich>=13.7"]
+all = ["anthropic>=0.40.0", "openai>=1.50.0", "typer>=0.12", "rich>=13.7", "textual>=0.50"]
 
 # pip install "ai-houkai[dev]"
 dev = [
     "anthropic>=0.40.0",
     "openai>=1.50.0",
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.24",
     "typer>=0.12",
     "rich>=13.7",
+    "textual>=0.50",
 ]
 
 

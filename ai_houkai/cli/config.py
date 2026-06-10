@@ -20,7 +20,7 @@ class Config:
     store_path: str
     collection: str
     default_type: str
-    default_importance: float
+    default_importance: float | str   # a float, or "auto" → heuristic scorer
     editor: str
 
 
@@ -41,6 +41,13 @@ class MaintenanceConfig:
     min_cluster_size: int
     reflect_apply: bool             # False → reflect in dry-run (observe only)
     summarizer: str | None          # e.g. "ollama:llama3.1"; None → extractive
+
+
+def _resolve_importance(value: object) -> float | str:
+    """A default_importance is a float, or the literal string "auto"."""
+    if value == "auto":
+        return "auto"
+    return float(value)  # type: ignore[arg-type]
 
 
 def _resolve_interval(value: object) -> int | None:
@@ -64,7 +71,9 @@ def load() -> Config:
         collection=os.environ.get("AI_HOUKAI_COLLECTION")
             or file_cfg.get("collection", _DEFAULT_COLLECTION),
         default_type=file_cfg.get("default_type", "semantic"),
-        default_importance=float(file_cfg.get("default_importance", 0.5)),
+        default_importance=_resolve_importance(
+            file_cfg.get("default_importance", 0.5)
+        ),
         editor=file_cfg.get("editor") or os.environ.get("EDITOR", "nano"),
     )
 

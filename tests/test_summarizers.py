@@ -176,9 +176,7 @@ class TestSdkProviders:
             chat=types.SimpleNamespace(
                 completions=types.SimpleNamespace(create=create))
         )
-        mod = types.ModuleType("openai")
-        mod.OpenAI = lambda **kw: client
-        monkeypatch.setitem(sys.modules, "openai", mod)
+        monkeypatch.setattr(summarizers, "OpenAI", lambda **kw: client)
 
         out = build_summarizer("openai:gpt-4o-mini")(_mems())
         assert out == "openai summary"
@@ -196,9 +194,7 @@ class TestSdkProviders:
         client = types.SimpleNamespace(
             messages=types.SimpleNamespace(create=create)
         )
-        mod = types.ModuleType("anthropic")
-        mod.Anthropic = lambda **kw: client
-        monkeypatch.setitem(sys.modules, "anthropic", mod)
+        monkeypatch.setattr(summarizers, "Anthropic", lambda **kw: client)
 
         out = build_summarizer("anthropic:claude-haiku-4-5")(_mems())
         assert out == "anthropic summary"
@@ -206,7 +202,7 @@ class TestSdkProviders:
         assert seen["max_tokens"] > 0
 
     def test_missing_sdk_raises_import_error_with_hint(self, monkeypatch):
-        monkeypatch.setitem(sys.modules, "openai", None)
+        monkeypatch.setattr(summarizers, "OpenAI", None)
         with pytest.raises(ImportError, match="ai-houkai\\[openai\\]"):
             build_summarizer("openai:gpt-4o-mini")
 
