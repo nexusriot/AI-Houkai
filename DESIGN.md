@@ -1,5 +1,10 @@
 # AI-Houkai — Architecture & Design
 
+> This document covers the **Python** implementation (`ai_houkai/`). The Go
+> port under `go/` has the same feature surface (15 MCP tools, identical
+> `.ahkai` format and journal line format) but its own internals — see
+> [go/DESIGN.md](go/DESIGN.md).
+
 ## Table of Contents
 
 1. [Motivation](#1-motivation)

@@ -83,10 +83,12 @@ Install:
 
   4. Install Ollama (https://ollama.com) and pull the embedding model:
          ollama pull all-minilm
-     ...or switch to OpenAI in the config.
+     ...or switch to OpenAI / DigitalOcean in the config.
 
-  5. Register with Claude Code:
-         houkai install
+  5. Register with an MCP client:
+         houkai install            # Claude Code
+         houkai install cursor     # Cursor
+         houkai install opencode   # OpenCode
 
 Homepage: https://github.com/nexusriot/AI-Houkai
 EOF

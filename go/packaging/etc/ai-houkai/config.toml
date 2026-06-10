@@ -28,7 +28,25 @@ collection         = "ai_houkai"
 # ---------------------------------------------------------------------------
 
 default_type       = "episodic"
+
+# A float 0..1, or the string "auto" to score importance heuristically from
+# the text (standing instructions ≈ 0.9, decisions ≈ 0.75, completions ≈ 0.6,
+# hedged observations ≈ 0.35). Env equivalent for the MCP server:
+# AI_HOUKAI_AUTO_IMPORTANCE=1.
 default_importance = 0.5
+
+# ---------------------------------------------------------------------------
+# Reflection summarizer
+# ---------------------------------------------------------------------------
+
+# How `houkai reflect` / maintenance condense a memory cluster into one
+# summary. Empty = built-in extractive (no LLM). Or "provider:model":
+#   summarizer = "ollama:llama3.1"             local, honours OLLAMA_BASE_URL
+#   summarizer = "openai:gpt-4o-mini"          needs OPENAI_API_KEY
+#   summarizer = "anthropic:claude-haiku-4-5"  needs ANTHROPIC_API_KEY
+# LLM failures fall back to the extractive summarizer with a logged warning.
+# Env override: AI_HOUKAI_SUMMARIZER.
+# summarizer = ""
 
 # ---------------------------------------------------------------------------
 # Embedding backend

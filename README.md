@@ -91,6 +91,11 @@ AI-Houkai/
 │       ├── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
 │       ├── cursor.py             # CursorInstaller   — register MCP w/ Cursor
 │       └── opencode.py           # OpenCodeInstaller — register MCP w/ OpenCode
+├── go/                           # Go port — static houkai + ai-houkai-mcp binaries
+│   ├── cmd/                      # entry points (CLI, MCP server)
+│   ├── internal/                 # memory core, embedders, CLI, MCP, TUI, installers
+│   ├── README.md                 # user guide for the Go port
+│   └── DESIGN.md                 # Go port internals
 ├── examples/
 │   ├── 01_standalone.py          # pure-Python walkthrough, no LLM
 │   ├── 02_ollama_local_network.py  # Ollama on LAN, fully offline
@@ -436,12 +441,29 @@ editor              = "nvim"
 
 ---
 
+## Go port
+
+A full Go port lives in [`go/`](go/) — two static binaries (`houkai` CLI +
+`ai-houkai-mcp` MCP server), no Python runtime, packaged as a Debian `.deb`
+and macOS tarballs. It is at feature parity with this Python version: the
+same 15 MCP tools, hybrid retrieval, decay/reflection with LLM summarizers,
+context packing, bulk ingest, collections, importance auto-assignment,
+installers for Claude Code / Cursor / OpenCode, and a Bubble Tea TUI.
+Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean
+instead of bundled sentence-transformers, and the store is
+[chromem-go](https://github.com/philippgille/chromem-go) — not
+binary-compatible with ChromaDB, but the portable `.ahkai` export/import
+format bridges the two. See [go/README.md](go/README.md).
+
 ## Design docs
 
 In-depth design notes live in [DESIGN.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/DESIGN.md).
 The original feature proposals for hybrid retrieval, conflict detection, and
 memory linking — all now shipped — are archived in
 [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
+The Go port has its own internals doc in [go/DESIGN.md](go/DESIGN.md); the
+original porting feasibility study is archived in
+[GO_PORT_DESIGN.md](GO_PORT_DESIGN.md).
 
 ## Run the tests
 

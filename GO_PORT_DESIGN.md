@@ -1,7 +1,43 @@
 # AI-Houkai — Go Port Feasibility & Design
 
-Status: design proposal — 2026-05-20
-Source baseline: ai-houkai 0.3.4 (Python, ~3.6 kLOC under `ai_houkai/`)
+Status: **implemented** — the port shipped in `go/` (merged 2026-06-10) and
+has since reached full feature parity with the Python version (15 MCP tools,
+pack/ingest/collections/TUI/installers/summarizers). This file is the
+original 2026-05-20 feasibility study, kept as a historical record; the
+authoritative docs for the shipped port are [go/README.md](go/README.md)
+and [go/DESIGN.md](go/DESIGN.md).
+
+Source baseline at writing: ai-houkai 0.3.4 (Python, ~3.6 kLOC under `ai_houkai/`)
+
+## How it actually turned out
+
+Where the implementation diverged from this proposal:
+
+- **Vector store:** `chromem-go`, as recommended (§4.1). ✓
+- **Embeddings:** the ONNX/MiniLM default (§4.2) was **never built** — the
+  port went with open question #4's alternative: HTTP embedders only.
+  Ollama (`all-minilm`) is the default, with OpenAI and DigitalOcean
+  Serverless Inference as alternatives. No CGO anywhere; the binaries are
+  fully static. Consequence: Python and Go stores use different vector
+  spaces, so migration always re-embeds.
+- **Migration (§9):** no `houkai migrate --from-chroma` command. The
+  portable `.ahkai` export/import format (added to both ports later)
+  covers migration instead — `houkai export` on one side,
+  `houkai import --regenerate-vectors` on the other.
+- **MCP SDK (§7):** `mark3labs/mcp-go` (the proposal's fallback), not the
+  official `modelcontextprotocol/go-sdk`. Tool count grew from 10 to 15
+  (`maintenance_tick`, `journal_tail`, `export`, `import`, `recall_pack`).
+- **Layout (§5):** close to proposed, with deltas: no third
+  `ai-houkai-install` binary (installers are `houkai install` subcommands);
+  no `sqlitevec.go` / `onnx_minilm.go`; added `ingest/`, `tui/`,
+  `maintenance/` packages; `supersede.go` folded into `store.go`.
+- **Packaging:** Debian `.deb` (`scripts/build-deb.sh`, conffile + systemd
+  unit) and macOS tarballs — not GoReleaser. No Windows builds.
+- **Open questions (§12):** 1 — both ports live on in parallel, at parity;
+  2 — same repo, `go/` subdir; 3 — stdio only, no HTTP transport;
+  4 — yes: Ollama-by-default won, dropping MiniLM/ONNX entirely.
+
+The original study follows, unedited.
 
 ---
 
