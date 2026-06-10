@@ -24,8 +24,6 @@ def _mems() -> list[Memory]:
     ]
 
 
-# ── spec parsing ─────────────────────────────────────────────────────────
-
 
 class TestSpecParsing:
     def test_none_returns_extractive_default(self):
@@ -61,8 +59,6 @@ class TestSpecParsing:
         assert seen["body"]["model"] == "llama3.1:8b"
 
 
-# ── prompt ───────────────────────────────────────────────────────────────
-
 
 class TestPrompt:
     def test_prompt_contains_all_texts_importance_first(self):
@@ -71,8 +67,6 @@ class TestPrompt:
         assert "- fixed the deploy script" in prompt
         assert prompt.index("make release") < prompt.index("deploy script")
 
-
-# ── ollama provider (stdlib urllib, no SDK) ──────────────────────────────
 
 
 class _FakeHTTPResponse:
@@ -132,8 +126,6 @@ class TestOllama:
         assert seen["url"] == "http://box:11434/v1/chat/completions"
 
 
-# ── fallback behaviour ───────────────────────────────────────────────────
-
 
 class TestFallback:
     def test_falls_back_to_extractive_on_error(self, monkeypatch):
@@ -167,8 +159,6 @@ class TestFallback:
         )
         assert build_summarizer("ollama:m")(_mems()) == "summary text"
 
-
-# ── SDK providers (stubbed modules, no network) ──────────────────────────
 
 
 class TestSdkProviders:
@@ -220,8 +210,6 @@ class TestSdkProviders:
         with pytest.raises(ImportError, match="ai-houkai\\[openai\\]"):
             build_summarizer("openai:gpt-4o-mini")
 
-
-# ── config + scheduler wiring ────────────────────────────────────────────
 
 
 class TestWiring:

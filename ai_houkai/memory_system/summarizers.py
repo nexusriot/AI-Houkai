@@ -32,6 +32,16 @@ from .reflection import _default_summarizer
 if TYPE_CHECKING:
     from .store import Memory
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # type: ignore
+
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 Summarizer = Callable[["list[Memory]"], str]
@@ -81,13 +91,11 @@ def _ollama_summarizer(model: str) -> Summarizer:
 
 
 def _openai_summarizer(model: str) -> Summarizer:
-    try:
-        from openai import OpenAI
-    except ImportError as e:
+    if OpenAI is None:
         raise ImportError(
             "openai SDK is required for an 'openai:' summarizer — "
             'pip install "ai-houkai[openai]"'
-        ) from e
+        )
     client = OpenAI()
 
     def summarize(memories: "list[Memory]") -> str:
@@ -101,13 +109,11 @@ def _openai_summarizer(model: str) -> Summarizer:
 
 
 def _anthropic_summarizer(model: str) -> Summarizer:
-    try:
-        from anthropic import Anthropic
-    except ImportError as e:
+    if Anthropic is None:
         raise ImportError(
             "anthropic SDK is required for an 'anthropic:' summarizer — "
             'pip install "ai-houkai[claude]"'
-        ) from e
+        )
     client = Anthropic()
 
     def summarize(memories: "list[Memory]") -> str:
