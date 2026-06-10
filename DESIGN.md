@@ -18,6 +18,9 @@
 14. [Hybrid Retrieval](#14-hybrid-retrieval)
 15. [Extension Points](#15-extension-points)
 16. [CLI — houkai](#16-cli--houkai)
+17. [Scheduled Maintenance](#17-scheduled-maintenance)
+18. [Audit Journal](#18-audit-journal)
+19. [Portable Import / Export](#19-portable-import--export)
 
 ---
 
@@ -94,11 +97,12 @@ ai_houkai/                        pip package name: ai-houkai
 │   │                             PackResult, PackedMemory,
 │   │                             ExportSummary, ImportSummary,
 │   │                             ImportConflictError, Journal, JournalEntry,
-│   │                             DecayEngine, ReflectionEngine
+│   │                             DecayEngine, ReflectionEngine, build_summarizer
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
 │   ├── journal.py                Journal — append-only JSONL audit log
 │   ├── decay.py                  DecayEngine
-│   └── reflection.py            ReflectionEngine
+│   ├── reflection.py             ReflectionEngine
+│   └── summarizers.py            build_summarizer — LLM summarizer specs
 ├── maintenance/
 │   ├── __init__.py
 │   ├── durations.py              parse/format human duration strings
@@ -429,11 +433,48 @@ def _default_summarizer(memories):
     return ("[Reflection ×N] " + body)[:512]
 ```
 
-### Custom (LLM) summarizer
+### LLM summarizers (`summarizers.py`)
+
+`build_summarizer(spec)` turns a `provider:model` string into a
+summarizer callable:
 
 ```python
-from ai_houkai.memory_system import ReflectionEngine
+from ai_houkai.memory_system import ReflectionEngine, build_summarizer
 
+engine = ReflectionEngine(store, summarizer=build_summarizer("ollama:llama3.1"))
+```
+
+| Provider | Transport | Notes |
+|---|---|---|
+| `extractive` | — | the built-in default; also used for `None`/`""` |
+| `ollama:MODEL` | stdlib `urllib` → OpenAI-compat `/v1/chat/completions` | no SDK dependency; `OLLAMA_BASE_URL` env (default `http://localhost:11434`); model may contain colons (`ollama:llama3.1:8b`) |
+| `openai:MODEL` | `openai` SDK (lazy import) | raises ImportError with an `ai-houkai[openai]` hint if absent |
+| `anthropic:MODEL` | `anthropic` SDK (lazy import) | `ai-houkai[claude]` hint; joins `text` content blocks |
+
+All providers share one prompt (`render_prompt()`): events ordered by
+importance, an instruction to produce a 1–3 sentence summary without
+inventing facts.
+
+**Fallback wrapper** (default on): if the LLM call raises or returns
+empty/whitespace output, the extractive summarizer is used for that
+cluster and a warning is logged.  This matters because reflection runs
+unattended inside the maintenance daemon — a down Ollama box must not
+fail the tick.  Pass `fallback=False` to surface errors instead.
+
+Spec errors (`unknown provider`, missing model) raise `ValueError` at
+build time, so a typo'd config fails fast at CLI/daemon startup — not
+silently at 3 AM inside a tick.
+
+The single config key `[maintenance.reflect].summarizer` (env override
+`AI_HOUKAI_SUMMARIZER`) feeds all three consumers: `houkai reflect`
+(overridable per-run with `--summarizer`), `houkai maintenance
+tick/run/start`, and the MCP `maintenance_tick` tool.
+
+### Custom summarizer
+
+Any `Callable[[list[Memory]], str]` still works:
+
+```python
 def my_summarizer(memories):
     prompt = "\n".join(m.text for m in memories)
     return call_llm(f"Summarise these events into one insight:\n{prompt}")
@@ -499,6 +540,19 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 |---|---|---|
 | `find_conflicts` | `memory_id?`, `threshold?` | `list[{kind,reason,similarity,a,b}]` |
 | `supersede`      | `old_id`, `new_id`         | `{ok, old_id, new_id}` |
+
+**Maintenance & audit tools**
+
+| Tool | Key parameters | Returns |
+|---|---|---|
+| `maintenance_tick` | `reflect_apply?` | `{summary, ran_decay, ran_reflect, decayed, reflected, decay_error, reflect_error}` |
+| `journal_tail` | `n?`, `op?`, `since_seconds?` | `list[{ts,op,actor,id,summary,meta}]` (newest first) |
+| `export` | `path`, `include_vectors?`, `include_superseded?`, `type?`, `tag?`, `since?` | `{path, count, bytes, elapsed}` |
+| `import` | `path`, `on_conflict?`, `regenerate_vectors?`, `dry_run?` | `{ok, imported, skipped, overwritten, renamed, errors, vectors_regenerated}` |
+
+`maintenance_tick` honours the `[maintenance]` schedule from
+`~/.config/ai_houkai/config.toml` — jobs only run when their interval has
+elapsed, so MCP clients may call it freely (see §17).
 
 Configuration via environment variables:
 
@@ -621,13 +675,18 @@ config path and patches the `mcpServers` block automatically.
 ## 9. Installers
 
 The `ai_houkai.installers` subpackage isolates the boilerplate needed to
-register the MCP server with various MCP clients.  It used to live inside
-`examples/06_claude_code.py`; promoting it to a real module means:
+register the MCP server with various MCP clients.  Three installers ship
+today — **Claude Code**, **Cursor**, and **OpenCode** — all built on a
+shared `common.py` (command resolution, JSON load/patch/write,
+`verify_server()` smoke test, and the memory-guide snippet).  The logic
+used to live inside `examples/06_claude_code.py`; promoting it to a real
+module means:
 
-- Third-party tools can import `ClaudeCodeInstaller` as a library.
-- The console script `ai-houkai-install-claude-code` is available
+- Third-party tools can import the installers as a library.
+- The console scripts (`ai-houkai-install-claude-code`,
+  `ai-houkai-install-cursor`, `ai-houkai-install-opencode`) are available
   immediately after `pip install ai-houkai` — no example file required.
-- Tests can target the installer directly without `spec_from_file_location`
+- Tests can target the installers directly without `spec_from_file_location`
   hacks for digit-prefixed examples.
 
 ### `ClaudeCodeInstaller`
@@ -658,8 +717,23 @@ class ClaudeCodeInstaller:
   rather than aborting (toggle with `overwrite_unparseable=False`).
 - **Per-project install**: pass `settings_path=".claude/settings.json"`
   to scope the registration to a single repo.
-- **Future installers** (e.g. `claude_desktop.py`) follow the same shape
-  so that callers can dispatch generically.
+- **Common shape**: all installers expose the same surface
+  (`build_mcp_block` / `build_settings_block` / `install` / `print_config`
+  / `verify` + a client-specific guidance snippet) so callers can dispatch
+  generically; future installers follow the same pattern.
+
+### `CursorInstaller` and `OpenCodeInstaller`
+
+Both mirror `ClaudeCodeInstaller` with client-specific defaults and
+guidance snippets:
+
+| | Cursor | OpenCode |
+|---|---|---|
+| Settings file | `~/.cursor/mcp.json` (`--project` → `./.cursor/mcp.json`) | `~/.config/opencode/opencode.json` (`--project` → `./opencode.json`) |
+| Config schema | same `mcpServers` block as Claude | own `mcp` schema: `command` array, `environment`, `enabled`, `type: local` |
+| Default collection | `cursor` | `opencode` |
+| Guidance snippet | `rule_snippet()` → `.cursor/rules/*.mdc` | `agents_snippet()` → `AGENTS.md` |
+| Console script | `ai-houkai-install-cursor` | `ai-houkai-install-opencode` |
 
 ### Console script wiring (`pyproject.toml`)
 
@@ -667,6 +741,9 @@ class ClaudeCodeInstaller:
 [project.scripts]
 ai-houkai-mcp                 = "ai_houkai.mcp_server.server:run"
 ai-houkai-install-claude-code = "ai_houkai.installers.claude_code:_main"
+ai-houkai-install-cursor      = "ai_houkai.installers.cursor:_main"
+ai-houkai-install-opencode    = "ai_houkai.installers.opencode:_main"
+houkai                        = "ai_houkai.cli.main:_main"
 ```
 
 ---
@@ -727,7 +804,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 263 tests across 12 files
+### 284 tests across 13 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -743,6 +820,7 @@ LLM API  ──►  assistant reply to user
 | `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_maintenance.py` | 52 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
 | `test_pack.py` | 15 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
+| `test_summarizers.py` | 21 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 
 ### Test isolation strategy
 
@@ -897,34 +975,10 @@ Default `mode="semantic"` is unchanged — zero risk for existing callers.
 ## 15. Extension Points
 
 > The designs in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/) are now implemented (§12–14).
-> The sketches below remain valid for further customisation.
-> The sketches below remain valid as quick recipes.
-
-
-### Hybrid retrieval score
-
-```python
-score = α·cosine_sim + β·(1 − age_days/max_age) + γ·importance
-```
-
-Implement as a post-ranking step after `recall()` returns.
-
-### Scheduled cognitive maintenance
-
-```python
-import threading, time
-from ai_houkai.memory_system import DecayEngine, ReflectionEngine
-
-def _maintenance(store, interval=3600):
-    decay   = DecayEngine(store)
-    reflect = ReflectionEngine(store)
-    while True:
-        time.sleep(interval)
-        decay.prune()
-        reflect.reflect(consolidate=True)
-
-threading.Thread(target=_maintenance, args=(store,), daemon=True).start()
-```
+> Hybrid retrieval scoring is built in (§14, `mode="hybrid"`), and scheduled
+> maintenance shipped as the `ai_houkai.maintenance` subsystem (§17) — no
+> hand-rolled threads needed.  The sketches below remain valid as quick
+> recipes for further customisation.
 
 ### Multi-user / multi-agent
 
@@ -955,18 +1009,19 @@ store.collection = store.client.get_or_create_collection(
 
 ### LLM reflection summarizer
 
+Built in — see §7 (`build_summarizer("ollama:llama3.1")` /
+`openai:…` / `anthropic:…`, configured via
+`[maintenance.reflect].summarizer`).  For anything beyond the three
+providers, pass any callable:
+
 ```python
 from ai_houkai.memory_system import ReflectionEngine
 
-def gpt_summarizer(memories):
+def my_summarizer(memories):
     prompt = "\n".join(f"- {m.text}" for m in memories)
-    return openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user",
-                   "content": f"Distil these events into one insight:\n{prompt}"}],
-    ).choices[0].message.content
+    return call_llm(f"Distil these events into one insight:\n{prompt}")
 
-engine = ReflectionEngine(store, summarizer=gpt_summarizer)
+engine = ReflectionEngine(store, summarizer=my_summarizer)
 ```
 
 ### Importance auto-assignment
@@ -1109,3 +1164,125 @@ I/O outside `tmp_path`.  Each test creates a fresh isolated store via
 HF Hub model load warnings are emitted to stdout through the runner;
 UUID extraction uses a regex (`_first_uuid()`) rather than assuming the
 output is only the UUID, making tests robust to logging noise.
+
+---
+
+## 17. Scheduled Maintenance
+
+Decay and reflection only matter if they run regularly.  The
+`ai_houkai.maintenance` subpackage orchestrates both on a schedule
+without any external dependency (no APScheduler, no celery).
+
+### Components
+
+```
+maintenance/
+├── durations.py   parse_duration("24h") → seconds; format_duration() back
+├── state.py       MaintenanceState — JSON file with last-run timestamps
+│                  and bounded run history; next_run_at() schedule math
+├── scheduler.py   MaintenanceScheduler — tick() + run_forever(stop_event)
+│                  TickResult — per-job ran/count/error + summary()
+└── daemon.py      PID-file helpers (get/write/remove/is_alive/stop)
+                   + spawn_detached() for `houkai maintenance start`
+```
+
+### Tick semantics
+
+`tick()` is the single unit of work and is **idempotent with respect to
+the schedule**: each job (decay, reflect) runs only if its configured
+interval (`decay_every`, default 24 h; `reflect_every`, default 7 d) has
+elapsed since the last successful run recorded in `MaintenanceState`.
+Callers may therefore invoke it as often as they like — from cron, from
+the foreground loop (`tick_interval`, default 5 min), from an MCP client
+via the `maintenance_tick` tool, or ad hoc.
+
+Errors in one job never block the other; they are captured in
+`TickResult.decay_error` / `reflect_error` and surfaced in `summary()`.
+
+### Three deployment modes
+
+| Mode | Command | Mechanism |
+|---|---|---|
+| cron one-shot | `houkai maintenance tick` | synchronous tick, exit |
+| foreground loop | `houkai maintenance run` | `run_forever()` until SIGINT/SIGTERM |
+| background daemon | `houkai maintenance start/status/stop` | `spawn_detached()` + PID file, logs to `~/.ai_houkai/maintenance.log` |
+
+Configuration lives in the `[maintenance]` section of
+`~/.config/ai_houkai/config.toml` (see README for the full key list);
+`reflect.apply` defaults to **false** so reflection observes without
+writing until explicitly enabled, and `reflect.summarizer` selects an
+LLM summarizer spec (§7) for the daemon's reflection runs.
+
+---
+
+## 18. Audit Journal
+
+Every mutation of the store is appended to a JSONL journal
+(`journal.log` next to the Chroma directory) by
+`ai_houkai/memory_system/journal.py`.
+
+### Entry format
+
+One compact JSON object per line:
+
+```json
+{"ts": 1748284800.123, "op": "supersede", "actor": "reflection",
+ "id": "72be7903-…", "before": {…}, "after": {…}, "meta": {"new_id": "…"}}
+```
+
+- **op** — `remember | forget | supersede | restore | link | unlink |
+  reflect | decay | import | export | undo`
+- **actor** — who performed it: `cli` / `mcp` / `reflection` / `decay` /
+  `import` / `lib`
+- **before / after** — full memory snapshots where applicable; these are
+  what make `undo` possible.
+
+### Design properties
+
+- **Best-effort writes** — a journal failure is logged, never raised; the
+  memory operation itself always wins.
+- **Crash-safe appends** — `O_APPEND` line writes are atomic on POSIX
+  (≤ PIPE_BUF); `read()` skips a truncated trailing line.
+- **Size-based rotation** — file size is checked every 256 appends;
+  beyond `rotate_mb` (64 MB) the log is gzipped to a timestamped archive,
+  and archives older than `keep_days` (90) are pruned.
+
+### Undo
+
+`MemoryStore.undo(entry)` reverses a single entry where possible
+(`remember` → forget, `forget` → re-add from the `before` snapshot,
+`supersede`/`restore`/`link`/`unlink` → inverse op).  It refuses rather
+than clobbers: e.g. undoing a `forget` fails if the id already exists
+again.  Every successful undo is itself journalled with `op="undo"`.
+
+---
+
+## 19. Portable Import / Export
+
+`MemoryStore.export()` / `import_()` move memories between stores via
+the **`.ahkai`** format: gzipped JSONL with a header object on line 1
+(format name, version, source store/collection, embedding model,
+options) followed by one memory per line.
+
+### Export
+
+- Streams in `created_at` ascending order, so two exports of the same
+  store are byte-identical modulo the header timestamp.
+- Embeddings are included by default (`include_vectors=True`) so the
+  importing side can skip re-running the model; `--no-vectors` shrinks
+  the file when portability matters more than speed.
+- Filterable by `types`, `tags`, `since`, `include_superseded`.
+
+### Import
+
+- **Conflict policies** on id collision: `skip` (default) ·
+  `overwrite` · `rename` (new UUID) · `error`.
+- **Model safety**: if the archive's embedding model differs from the
+  importing store's, the import raises unless
+  `regenerate_vectors=True`, which re-embeds text on the way in.
+- **dry_run** previews counts without writing; all real imports are
+  journalled with `actor="import"`.
+
+`houkai info dump.ahkai` prints the header without touching the store,
+and `houkai backup` snapshots the raw Chroma directory for
+disaster recovery (orthogonal to `.ahkai`, which is portable data).

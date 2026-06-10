@@ -75,6 +75,10 @@ class MaintenanceScheduler:
     reflect_apply
         If False (default), reflection runs in dry-run mode (no writes).
         If True, reflection summaries are written to the store.
+    summarizer
+        Optional ``Callable[[list[Memory]], str]`` forwarded to
+        ReflectionEngine (e.g. from ``build_summarizer("ollama:llama3.1")``).
+        None → the built-in extractive summarizer.
     """
 
     def __init__(
@@ -89,6 +93,7 @@ class MaintenanceScheduler:
         protect_types: tuple[str, ...] = ("procedural",),
         min_cluster_size: int = 3,
         reflect_apply: bool = False,
+        summarizer=None,
     ) -> None:
         self.store = store
         self.decay_every = decay_every
@@ -100,6 +105,7 @@ class MaintenanceScheduler:
         self.protect_types = protect_types
         self.min_cluster_size = min_cluster_size
         self.reflect_apply = reflect_apply
+        self.summarizer = summarizer
 
     def tick(self, now: float | None = None) -> TickResult:
         """Run any overdue jobs and persist the updated state.
@@ -140,6 +146,7 @@ class MaintenanceScheduler:
                     engine = ReflectionEngine(
                         self.store,
                         min_cluster_size=self.min_cluster_size,
+                        summarizer=self.summarizer,
                     )
                     created = engine.reflect(dry_run=not self.reflect_apply)
                     result.reflected = len(created)

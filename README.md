@@ -40,7 +40,8 @@ AI-Houkai/
 │   │   ├── store.py              # MemoryStore + Memory dataclass (+ export/import/undo)
 │   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
-│   │   └── reflection.py        # ReflectionEngine — episodic → semantic
+│   │   ├── reflection.py         # ReflectionEngine — episodic → semantic
+│   │   └── summarizers.py        # build_summarizer("ollama:…|openai:…|anthropic:…")
 │   ├── maintenance/
 │   │   ├── __init__.py
 │   │   ├── durations.py          # parse/format human duration strings
@@ -87,12 +88,21 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/
+├── tests/                        # 284 tests across 13 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests
 │   ├── test_decay.py             # DecayEngine unit tests
 │   ├── test_reflection.py        # ReflectionEngine unit tests
-│   └── test_dispatch.py          # cross-provider _dispatch_tool tests
+│   ├── test_dispatch.py          # cross-provider _dispatch_tool tests
+│   ├── test_hybrid.py            # hybrid retrieval scoring
+│   ├── test_links.py             # typed links / neighbors / subgraph
+│   ├── test_conflicts.py         # conflict detection + supersede/restore
+│   ├── test_cli.py               # houkai CLI round-trips
+│   ├── test_pack.py              # recall_pack token budgeting
+│   ├── test_journal.py           # audit journal tail/show/undo
+│   ├── test_export_import.py     # portable .ahkai archives
+│   ├── test_maintenance.py       # scheduler, daemon, durations, state
+│   └── test_summarizers.py       # LLM summarizer specs, fallback, wiring
 ├── pyproject.toml
 └── requirements.txt
 ```
@@ -285,6 +295,9 @@ houkai reflect --threshold 0.8 --min-cluster-size 3
 # Write reflection summaries (requires --apply)
 houkai reflect --apply --consolidate soft   # supersede source episodics
 houkai reflect --apply --consolidate hard   # hard-delete source episodics
+
+# Summarise clusters with an LLM instead of the extractive default
+houkai reflect --summarizer ollama:llama3.1 --apply
 ```
 
 ### Import / export / backup
@@ -685,17 +698,52 @@ engine.reflect(dry_run=True)         # preview
 engine.reflect(consolidate=True)     # create summaries + delete sources
 ```
 
-Plug in any summarizer — including an LLM:
+By default an extractive summarizer is used (no LLM — most-important
+text first, concatenated). To get real condensation, plug in an LLM
+summarizer via a `provider:model` spec:
 
 ```python
-def llm_summarizer(memories):
-    prompt = "\n".join(m.text for m in memories)
-    return openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": f"Summarise: {prompt}"}],
-    ).choices[0].message.content
+from ai_houkai.memory_system import MemoryStore, ReflectionEngine, build_summarizer
 
-engine = ReflectionEngine(store, summarizer=llm_summarizer)
+store  = MemoryStore()
+engine = ReflectionEngine(store, summarizer=build_summarizer("ollama:llama3.1"))
+```
+
+Supported specs:
+
+| Spec | Backend | Requires |
+|---|---|---|
+| `extractive` (default) | built-in, no LLM | — |
+| `ollama:llama3.1` | Ollama OpenAI-compat endpoint (stdlib HTTP, no SDK) | `OLLAMA_BASE_URL` (default `http://localhost:11434`) |
+| `openai:gpt-4o-mini` | OpenAI SDK | `pip install "ai-houkai[openai]"`, `OPENAI_API_KEY` |
+| `anthropic:claude-haiku-4-5` | Anthropic SDK | `pip install "ai-houkai[claude]"`, `ANTHROPIC_API_KEY` |
+
+LLM summarizers **fall back to extractive** (with a logged warning) if
+the call fails or returns empty — reflection degrades rather than
+crashes when running unattended.
+
+Configure once in `~/.config/ai_houkai/config.toml` and both
+`houkai reflect` and the maintenance daemon will use it
+(env override: `AI_HOUKAI_SUMMARIZER`):
+
+```toml
+[maintenance.reflect]
+summarizer = "ollama:llama3.1"
+```
+
+Or pass it ad hoc on the CLI:
+
+```bash
+houkai reflect --summarizer ollama:llama3.1 --apply
+```
+
+A custom callable still works for anything else:
+
+```python
+def my_summarizer(memories):
+    return call_llm("Summarise:\n" + "\n".join(m.text for m in memories))
+
+engine = ReflectionEngine(store, summarizer=my_summarizer)
 ```
 
 ## Scheduled Maintenance
@@ -761,6 +809,7 @@ protect_types = ["procedural"]   # never pruned
 [maintenance.reflect]
 min_cluster_size = 3
 apply            = false   # set true to write reflection summaries
+summarizer       = "ollama:llama3.1"   # optional; default extractive (no LLM)
 ```
 
 Supported duration units: `s` · `m` · `h` · `d` · `w`.

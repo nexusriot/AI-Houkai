@@ -16,7 +16,7 @@ Tools exposed (15):
     neighbors(memory_id, rel?, direction?, depth?)
     find_conflicts(memory_id?, threshold?)
     supersede(old_id, new_id)
-    maintenance_tick(force?)
+    maintenance_tick(reflect_apply?)
     journal_tail(n?, op?, since_seconds?)
     export(path, include_vectors?, include_superseded?, type?, tag?, since?)
     import(path, on_conflict?, regenerate_vectors?, dry_run?)
@@ -34,6 +34,7 @@ from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.store import ConflictError, HybridWeights
+from ai_houkai.memory_system.summarizers import build_summarizer
 
 CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
 COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
@@ -320,6 +321,7 @@ def maintenance_tick(
         protect_types=mcfg.protect_types,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=reflect_apply,
+        summarizer=build_summarizer(mcfg.summarizer),
     )
     result = sched.tick()
     return {

@@ -40,6 +40,7 @@ class MaintenanceConfig:
     # ReflectionEngine params
     min_cluster_size: int
     reflect_apply: bool             # False → reflect in dry-run (observe only)
+    summarizer: str | None          # e.g. "ollama:llama3.1"; None → extractive
 
 
 def _resolve_interval(value: object) -> int | None:
@@ -97,4 +98,6 @@ def load_maintenance() -> MaintenanceConfig:
         protect_types=tuple(decay_cfg.get("protect_types", ["procedural"])),
         min_cluster_size=int(reflect_cfg.get("min_cluster_size", 3)),
         reflect_apply=bool(reflect_cfg.get("apply", False)),
+        summarizer=os.environ.get("AI_HOUKAI_SUMMARIZER")
+            or reflect_cfg.get("summarizer") or None,
     )
