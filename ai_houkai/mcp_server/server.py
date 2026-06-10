@@ -16,7 +16,7 @@ Tools exposed (15):
     neighbors(memory_id, rel?, direction?, depth?)
     find_conflicts(memory_id?, threshold?)
     supersede(old_id, new_id)
-    maintenance_tick(force?)
+    maintenance_tick(reflect_apply?)
     journal_tail(n?, op?, since_seconds?)
     export(path, include_vectors?, include_superseded?, type?, tag?, since?)
     import(path, on_conflict?, regenerate_vectors?, dry_run?)
@@ -33,12 +33,22 @@ from mcp.server.fastmcp import FastMCP
 from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
+from ai_houkai.memory_system.importance import score_importance
 from ai_houkai.memory_system.store import ConflictError, HybridWeights
+from ai_houkai.memory_system.summarizers import build_summarizer
 
 CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
 COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
+AUTO_IMPORTANCE = os.environ.get("AI_HOUKAI_AUTO_IMPORTANCE", "").lower() in (
+    "1", "true", "yes", "on",
+)
 
-store = MemoryStore(path=CHROMA_PATH, collection=COLLECTION, actor="mcp")
+store = MemoryStore(
+    path=CHROMA_PATH,
+    collection=COLLECTION,
+    actor="mcp",
+    importance_fn=score_importance if AUTO_IMPORTANCE else None,
+)
 mcp   = FastMCP("AI-Houkai")
 
 
@@ -47,13 +57,15 @@ def remember(
     text: str,
     type: str = "semantic",
     tags: list[str] | None = None,
-    importance: float = 0.5,
+    importance: float | None = None,
     source: str | None = None,
     on_conflict: str | None = None,
     polarity: int = 0,
 ) -> dict[str, Any]:
     """Store a new memory.
     type: episodic | semantic | procedural | feedback.
+    importance: 0..1; omit for the default (0.5, or a heuristic score when
+    the server runs with AI_HOUKAI_AUTO_IMPORTANCE=1).
     on_conflict: ignore | warn | supersede | raise (default: store policy).
     polarity: -1 (negative) | 0 (neutral) | +1 (positive).
     """
@@ -78,7 +90,7 @@ def remember(
                 for c in e.conflicts
             ],
         }
-    return {"id": mem.id, "stored": True}
+    return {"id": mem.id, "stored": True, "importance": mem.importance}
 
 
 @mcp.tool()
@@ -320,6 +332,7 @@ def maintenance_tick(
         protect_types=mcfg.protect_types,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=reflect_apply,
+        summarizer=build_summarizer(mcfg.summarizer),
     )
     result = sched.tick()
     return {

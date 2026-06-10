@@ -358,6 +358,7 @@ class MemoryStore:
         conflict_threshold: float = 0.80,
         contradiction_fn: ConflictFn | None = None,
         hybrid_weights: HybridWeights | None = None,
+        importance_fn: "Callable[[str, str, list[str]], float] | None" = None,
         actor: str = "lib",
         journal_enabled: bool = True,
         journal_path: str | None = None,
@@ -380,6 +381,7 @@ class MemoryStore:
         self._conflict_threshold = conflict_threshold
         self._contradiction_fn   = contradiction_fn
         self._hybrid_weights     = hybrid_weights
+        self._importance_fn      = importance_fn
 
         self._actor           = actor
         self._journal_enabled = journal_enabled
@@ -419,13 +421,20 @@ class MemoryStore:
         text: str,
         type: MemoryType = "semantic",
         tags: Iterable[str] = (),
-        importance: float = 0.5,
+        importance: float | None = None,
         source: str | None = None,
         *,
         polarity: int = 0,
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
     ) -> Memory:
+        # importance=None → auto-score when an importance_fn is configured,
+        # else keep the historical 0.5 default.
+        if importance is None:
+            if self._importance_fn is not None:
+                importance = self._importance_fn(text, type, list(tags))
+            else:
+                importance = 0.5
         mem = Memory(
             id=str(uuid.uuid4()),
             text=text.strip(),

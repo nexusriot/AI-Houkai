@@ -17,6 +17,8 @@ from .store import (
 )
 from .decay import DecayEngine
 from .reflection import ReflectionEngine
+from .summarizers import build_summarizer
+from .importance import score_importance
 from .journal import Journal, JournalEntry
 
 __all__ = [
@@ -39,4 +41,6 @@ __all__ = [
     "PackResult",
     "PackedMemory",
     "ReflectionEngine",
+    "build_summarizer",
+    "score_importance",
 ]

@@ -1,3 +1,6 @@
+# Development requirements — covers everything (mirrors "ai-houkai[dev]" + tui).
+# For end-user installs prefer the extras: pip install "ai-houkai[cli|tui|all]".
+
 # core
 chromadb>=0.5.0
 sentence-transformers>=2.7.0
@@ -5,12 +8,20 @@ sentence-transformers>=2.7.0
 # MCP server
 mcp>=1.2.0
 
-# Claude agent example
+# Claude agent example + anthropic: summarizer
 anthropic>=0.40.0
 
-# OpenAI agent example
+# OpenAI agent example + openai: summarizer
 # Ollama agent example (uses the same openai client via Ollama's OAI-compat endpoint)
 openai>=1.50.0
 
+# houkai CLI
+typer>=0.12
+rich>=13.7
+
+# houkai tui memory browser
+textual>=0.50
+
 # tests
 pytest>=8.0.0
+pytest-asyncio>=0.24

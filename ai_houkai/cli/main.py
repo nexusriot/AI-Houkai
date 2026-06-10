@@ -22,6 +22,9 @@ from ai_houkai.cli.commands.decay import prune
 from ai_houkai.cli.commands.reflect import reflect
 from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
 from ai_houkai.cli.commands.stats import stats
+from ai_houkai.cli.commands.ingest import ingest
+from ai_houkai.cli.commands.collections import collections_app
+from ai_houkai.cli.commands.tui_cmd import tui
 from ai_houkai.cli.commands.maintenance import maintenance_app
 from ai_houkai.cli.commands.journal import journal_app
 
@@ -99,8 +102,11 @@ def _register() -> None:
     app.command("info")(info_cmd)
     app.command("backup")(backup)
     app.command("stats")(stats)
+    app.command("ingest")(ingest)
+    app.command("tui")(tui)
     app.add_typer(maintenance_app, name="maintenance")
     app.add_typer(journal_app, name="journal")
+    app.add_typer(collections_app, name="collections")
 
 
 _register()

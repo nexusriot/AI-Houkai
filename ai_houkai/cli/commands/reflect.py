@@ -5,13 +5,21 @@ from __future__ import annotations
 import typer
 
 from ai_houkai.cli import output as out
+from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system.reflection import ReflectionEngine
+from ai_houkai.memory_system.summarizers import build_summarizer
 
 def reflect(
     ctx: typer.Context,
     threshold: float = typer.Option(0.75, "--threshold"),
     min_cluster_size: int = typer.Option(3, "--min-cluster-size"),
     consolidate: str = typer.Option("none", "--consolidate", help="none|soft|hard"),
+    summarizer: str = typer.Option(
+        None, "--summarizer",
+        help="provider:model (extractive|ollama:M|openai:M|anthropic:M); "
+             "default from [maintenance.reflect].summarizer in config.toml. "
+             "LLM summarizers are also called for the dry-run preview.",
+    ),
     apply: bool = typer.Option(False, "--apply", help="Actually write (default is dry-run)"),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
@@ -19,10 +27,19 @@ def reflect(
 
 
     store = ctx.obj["store"]
+    spec = summarizer if summarizer is not None else load_maintenance().summarizer
+    try:
+        summarize = build_summarizer(spec)
+    except (ValueError, ImportError) as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+    if spec:
+        typer.echo(f"Summarizer: {spec}")
     engine = ReflectionEngine(
         store,
         similarity_threshold=threshold,
         min_cluster_size=min_cluster_size,
+        summarizer=summarize,
     )
 
     consolidate_arg: bool | str

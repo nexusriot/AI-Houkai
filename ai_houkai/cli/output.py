@@ -13,20 +13,9 @@ from ai_houkai.memory_system.store import Memory
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+from rich.panel import Panel
 
 _USE_RICH = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-
-
-def _lazy_rich():
-    try:
-        from rich.console import Console
-        from rich.table import Table
-        return Console(), Table
-    except ImportError:
-        return None, None
-
-
-import os
 
 # Re-check at call time (can be overridden after import)
 def _is_tty() -> bool:
@@ -160,32 +149,26 @@ def print_memories_json(rows: list[tuple[Memory, float | None]]) -> None:
 
 
 def print_memory_detail(mem: Memory) -> None:
-    try:
-        from rich.console import Console
-        from rich.panel import Panel
-        from rich.table import Table
-        console = Console()
+    console = Console()
 
-        meta = Table.grid(padding=(0, 2))
-        meta.add_row("[bold]id[/]",           mem.id)
-        meta.add_row("[bold]type[/]",         mem.type)
-        meta.add_row("[bold]importance[/]",   f"{mem.importance:.2f}  {fmt_importance(mem.importance)}")
-        meta.add_row("[bold]tags[/]",         ", ".join(mem.tags) or "—")
-        meta.add_row("[bold]created[/]",      fmt_age(mem.created_at))
-        meta.add_row("[bold]last_accessed[/]",fmt_age(mem.last_accessed))
-        meta.add_row("[bold]access_count[/]", str(mem.access_count))
-        meta.add_row("[bold]source[/]",       mem.source or "—")
-        meta.add_row("[bold]polarity[/]",     str(mem.polarity))
-        if mem.superseded_by:
-            meta.add_row("[bold red]superseded_by[/]", mem.superseded_by[:8])
-        if mem.links:
-            links_str = "\n".join(f"  {l.rel} → {l.to[:8]}" for l in mem.links)
-            meta.add_row("[bold]links[/]", links_str)
+    meta = Table.grid(padding=(0, 2))
+    meta.add_row("[bold]id[/]",           mem.id)
+    meta.add_row("[bold]type[/]",         mem.type)
+    meta.add_row("[bold]importance[/]",   f"{mem.importance:.2f}  {fmt_importance(mem.importance)}")
+    meta.add_row("[bold]tags[/]",         ", ".join(mem.tags) or "—")
+    meta.add_row("[bold]created[/]",      fmt_age(mem.created_at))
+    meta.add_row("[bold]last_accessed[/]",fmt_age(mem.last_accessed))
+    meta.add_row("[bold]access_count[/]", str(mem.access_count))
+    meta.add_row("[bold]source[/]",       mem.source or "—")
+    meta.add_row("[bold]polarity[/]",     str(mem.polarity))
+    if mem.superseded_by:
+        meta.add_row("[bold red]superseded_by[/]", mem.superseded_by[:8])
+    if mem.links:
+        links_str = "\n".join(f"  {l.rel} → {l.to[:8]}" for l in mem.links)
+        meta.add_row("[bold]links[/]", links_str)
 
-        console.print(Panel(mem.text, title=f"[cyan]{mem.id[:8]}[/]", border_style="cyan"))
-        console.print(meta)
-    except ImportError:
-        print(json.dumps(_mem_to_dict(mem), indent=2))
+    console.print(Panel(mem.text, title=f"[cyan]{mem.id[:8]}[/]", border_style="cyan"))
+    console.print(meta)
 
 
 def _mem_to_dict(mem: Memory) -> dict[str, Any]:

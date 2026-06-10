@@ -32,6 +32,7 @@ from ai_houkai.maintenance.daemon import (
 from ai_houkai.maintenance.durations import format_duration
 from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.maintenance.state import MaintenanceState
+from ai_houkai.memory_system.summarizers import build_summarizer
 
 maintenance_app = typer.Typer(
     name="maintenance",
@@ -41,6 +42,11 @@ maintenance_app = typer.Typer(
 
 
 def _make_scheduler(store, mcfg) -> MaintenanceScheduler:
+    try:
+        summarizer = build_summarizer(mcfg.summarizer)
+    except (ValueError, ImportError) as e:
+        typer.echo(f"Error in [maintenance.reflect].summarizer: {e}", err=True)
+        raise typer.Exit(1)
     return MaintenanceScheduler(
         store=store,
         decay_every=mcfg.decay_every,
@@ -52,6 +58,7 @@ def _make_scheduler(store, mcfg) -> MaintenanceScheduler:
         protect_types=mcfg.protect_types,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=mcfg.reflect_apply,
+        summarizer=summarizer,
     )
 
 
@@ -196,3 +203,4 @@ def status_cmd(ctx: typer.Context) -> None:
     typer.echo(f"  State file:     {mcfg.state_path}")
     typer.echo(f"  Log file:       {mcfg.log_path}")
     typer.echo(f"  reflect_apply:  {mcfg.reflect_apply}")
+    typer.echo(f"  summarizer:     {mcfg.summarizer or 'extractive (built-in)'}")
