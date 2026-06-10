@@ -25,6 +25,11 @@ env/
 .chroma/
 *.chroma/
 
+# go binaries
+go/bin/
+
+
+
 # Testing & coverage
 .pytest_cache/
 .coverage
