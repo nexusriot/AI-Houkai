@@ -16,6 +16,11 @@ type Config struct {
 	MinScore    float32
 	Reflect     bool
 	Consolidate bool
+
+	// Summarizer is forwarded to the reflection engine (e.g. from
+	// reflect.BuildSummarizer("ollama:llama3.1")). Nil → the built-in
+	// extractive summarizer.
+	Summarizer reflectpkg.Summarizer
 }
 
 func DefaultConfig() Config {
@@ -54,7 +59,7 @@ func runTick(ctx context.Context, store decay.Storable, reflStore reflectpkg.Sto
 	}
 
 	if cfg.Reflect {
-		re := reflectpkg.New(reflStore, 0, 0, nil)
+		re := reflectpkg.New(reflStore, 0, 0, cfg.Summarizer)
 		created, err := re.Reflect(ctx, false, cfg.Consolidate)
 		if err != nil {
 			log.Printf("maintenance reflect: %v", err)

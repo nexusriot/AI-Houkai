@@ -26,8 +26,9 @@ exists to:
 - **Run on small boxes.** Targets amd64 and arm64 (Raspberry Pi, uConsole,
   cheap VPS) without compiler toolchains.
 
-Embeddings are delegated to either a local **Ollama** instance or **OpenAI** —
-the Go binary itself does no model inference.
+Embeddings are delegated to a local **Ollama** instance, **OpenAI**, or
+**DigitalOcean Serverless Inference** — the Go binary itself does no model
+inference.
 
 ---
 
@@ -85,8 +86,9 @@ houkai install                          # patches ~/.claude/settings.json
 houkai install --project                # → ./.claude/settings.json
 ```
 
-After restarting Claude Code, eleven `mcp__ai-houkai__*` tools become
-available.
+After restarting Claude Code, fifteen `mcp__ai-houkai__*` tools become
+available. Cursor and OpenCode are supported too — see
+[Other MCP clients](#other-mcp-clients).
 
 #### Manual registration
 
@@ -123,18 +125,18 @@ Notes:
   inside the project root with a project-local `AI_HOUKAI_PATH` (e.g.
   `"$PWD/.ai_houkai"` resolved to absolute) and a distinct collection.
 - Extra env vars (`AI_HOUKAI_EMBED_PROVIDER`, `AI_HOUKAI_OLLAMA_URL`,
-  `AI_HOUKAI_OLLAMA_MODEL`, `OPENAI_API_KEY`, `AI_HOUKAI_CONFIG`) can be
+  `AI_HOUKAI_OLLAMA_MODEL`, `OPENAI_API_KEY`, `AI_HOUKAI_CONFIG`,
+  `AI_HOUKAI_AUTO_IMPORTANCE`, `AI_HOUKAI_SUMMARIZER`) can be
   added to the same `env` map if you want to override the resolved config
   per-MCP-instance. See [config resolution](#configuration) for the full
   list.
 - Restart Claude Code (or run `/mcp` and re-add the server) for it to pick
   up the change. To verify the binary works in isolation, run
   `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ai-houkai-mcp`
-  — you should see the eleven tool definitions on stdout.
+  — you should see the fifteen tool definitions on stdout.
 
 To print the exact block the installer would write without touching any
-file, run `houkai install --settings /dev/null` then copy from the script,
-or read [`internal/installer/claude_code.go`](internal/installer/claude_code.go).
+file, run `houkai install --print`.
 
 ---
 
@@ -143,9 +145,12 @@ or read [`internal/installer/claude_code.go`](internal/installer/claude_code.go)
 `houkai --help` lists all subcommands. Most-used:
 
 ```
-remember <text>        Store a new memory
+remember <text>        Store a new memory (--auto-importance to score heuristically)
 recall <query>         Semantic / hybrid search
+pack <query>           Token-budgeted context block ready to inject into a prompt
+ingest [files...]      Chunk files (or stdin) into memories
 list                   Browse recent memories
+tui                    Interactive Bubble Tea browser (search, detail, link walking)
 show <id>              Full record (8-char prefix OK)
 edit <id>              Open in $EDITOR
 forget <id>            Delete
@@ -155,17 +160,97 @@ neighbors / graph      Traverse the graph
 conflicts              Detect contradictions/duplicates
 supersede / restore    Soft-delete + revive
 prune                  Decay-based pruning (dry-run by default)
-reflect                Cluster episodics into semantic memories
+reflect                Cluster episodics into semantic memories (--summarizer provider:model)
+collections            List / create / delete / copy store namespaces
 export / import        Portable .ahkai round-trip (gzipped JSONL)
 info <file>            Inspect an .ahkai header without touching the store
 journal tail/show/undo Browse and reverse audit-journal entries
 backup                 Snapshot the chromem-go directory
 stats                  Aggregate counters
 config                 Show resolved config + search order
-install                Register MCP server in Claude Code
+install                Register MCP server (claude-code | cursor | opencode)
 ```
 
 All commands accept `--store`, `--collection`, and `--format auto|json|tsv`.
+
+### Context packing
+
+```bash
+# assemble the most relevant memories into a ~800-token block
+houkai pack "deploy process"
+
+# tighter budget, no header, JSON metadata
+houkai pack "testing rules" -b 300 --header "" -f json
+```
+
+`pack` ranks with hybrid scoring, then greedily packs results until the token
+budget (~4 chars/token estimate) is reached. The block goes to stdout (pipe it
+into a prompt); a `[N memories · used/budget tokens]` summary goes to stderr.
+The same feature is exposed to agents as the `recall_pack` MCP tool.
+
+### Bulk ingestion
+
+```bash
+# chunk markdown notes into memories (headings stay glued to their paragraph)
+houkai ingest notes.md --type semantic -g ops --auto-importance --yes
+
+# preview the chunk plan without writing
+houkai ingest notes.md --dry-run
+
+# from stdin
+xclip -o | houkai ingest --yes
+```
+
+### Auto-importance
+
+`remember`/`ingest` can score importance heuristically (standing instructions
+≈0.9, decisions ≈0.75, completions ≈0.6, hedges ≈0.35) instead of a flat
+default:
+
+```bash
+houkai remember "Never push directly to main" --auto-importance
+```
+
+or set `default_importance = "auto"` in `config.toml`
+(`AI_HOUKAI_AUTO_IMPORTANCE=1` does the same for the MCP server).
+
+### LLM summarizers for reflection
+
+`reflect` condenses clusters with an extractive summarizer by default; an LLM
+can write the summary instead:
+
+```bash
+houkai reflect --summarizer ollama:llama3.1 --apply
+houkai reflect --summarizer anthropic:claude-haiku-4-5
+```
+
+or set `summarizer = "ollama:llama3.1"` in `config.toml`
+(env: `AI_HOUKAI_SUMMARIZER`). LLM failures fall back to the extractive
+summarizer, so unattended maintenance never crashes. `openai:` uses
+`OPENAI_API_KEY`, `anthropic:` uses `ANTHROPIC_API_KEY`, `ollama:` honors
+`OLLAMA_BASE_URL`.
+
+### Collections
+
+```bash
+houkai collections list
+houkai collections create scratch
+houkai collections copy ai_houkai scratch   # embeddings copied, no re-embed
+houkai collections delete scratch --yes
+```
+
+### Other MCP clients
+
+```bash
+houkai install cursor             # ~/.cursor/mcp.json (collection "cursor")
+houkai install cursor --project   # ./.cursor/mcp.json
+houkai install cursor --rule      # print a .cursor/rules/*.mdc snippet
+
+houkai install opencode           # ~/.config/opencode/opencode.json
+houkai install opencode --agents  # print an AGENTS.md snippet
+
+houkai install <client> --verify  # smoke-test binary + registration
+```
 
 ---
 
@@ -453,7 +538,8 @@ Resolution order (later wins):
 
 ```toml
 collection         = "ai_houkai"
-default_importance = 0.5
+default_importance = 0.5             # or "auto" → heuristic importance scorer
+summarizer         = ""              # reflection summarizer, e.g. "ollama:llama3.1"
 embed_provider     = "ollama"        # "ollama" | "openai" | "digitalocean"
 embed_dim          = 384             # 384/768/1024/1536 — must match the model
 ollama_url         = "http://localhost:11434"
@@ -506,13 +592,15 @@ internal/
   memory/           MemoryStore, hybrid scoring, BM25, conflicts, links,
                     audit journal, portable .ahkai export/import, undo
   vector/           Backend interface + chromem-go implementation
-  embed/            Embedder interface + Ollama + OpenAI clients
+  embed/            Embedder interface + Ollama/OpenAI/DigitalOcean clients
   decay/            Time-based pruning engine
   reflect/          Episodic → semantic clustering
   maintenance/      Background daemon (prune + reflect on a ticker)
-  mcpserver/        14 MCP tool definitions
+  ingest/           Deterministic chunking for bulk ingestion
+  tui/              Bubble Tea memory browser (navigator + view-models)
+  mcpserver/        15 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
-  installer/        settings.json patcher for Claude Code
+  installer/        config patchers for Claude Code, Cursor, OpenCode
   version/          ldflags-injected build info
 scripts/            build.sh, build-deb.sh
 packaging/          conffile defaults, systemd unit, postinst hints
@@ -553,10 +641,10 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The MCP tool surface is now at parity: **14 tools** in both ports —
-`remember`, `recall`, `forget`, `list_recent`, `stats`, `link`, `unlink`,
-`neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`,
-`export`, `import`.
+The MCP tool surface is now at parity: **15 tools** in both ports —
+`remember`, `recall`, `recall_pack`, `forget`, `list_recent`, `stats`, `link`,
+`unlink`, `neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`,
+`journal_tail`, `export`, `import`.
 
 The audit journal is enabled by default in both ports and uses the same
 JSONL line format, so a journal written by one binary can be read by the

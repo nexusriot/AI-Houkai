@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -14,7 +15,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 14 tools.
+// New wires up the MCP server with all 15 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -22,6 +23,7 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 
 	addRemember(s, store)
 	addRecall(s, store)
+	addRecallPack(s, store)
 	addForget(s, store)
 	addListRecent(s, store)
 	addStats(s, store, path, collection)
@@ -35,6 +37,24 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addExport(s, store)
 	addImport(s, store)
 
+	return s
+}
+
+// summarizerSpec is the reflection summarizer spec ("provider:model") used
+// by maintenance_tick. Empty → built-in extractive summarizer.
+var summarizerSpec string
+
+// SetSummarizerSpec configures the reflection summarizer used by the
+// maintenance_tick tool (e.g. "ollama:llama3.1"). Invalid specs fall back to
+// the extractive summarizer with a logged warning.
+func SetSummarizerSpec(spec string) { summarizerSpec = spec }
+
+func buildSummarizer() reflectpkg.Summarizer {
+	s, err := reflectpkg.BuildSummarizer(summarizerSpec, true)
+	if err != nil {
+		log.Printf("ai-houkai: bad summarizer spec %q (%v) — using extractive.", summarizerSpec, err)
+		return nil // reflect.New falls back to the default summarizer
+	}
 	return s
 }
 
@@ -54,7 +74,7 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("text", mcp.Required(), mcp.Description("Memory content")),
 		mcp.WithString("type", mcp.Description("episodic|semantic|procedural|feedback (default: episodic)")),
 		mcp.WithArray("tags", mcp.Description("Topic labels")),
-		mcp.WithNumber("importance", mcp.Description("0.0–1.0 (default: 0.5)")),
+		mcp.WithNumber("importance", mcp.Description("0.0–1.0; omit for the default (0.5, or a heuristic score when the server runs with AI_HOUKAI_AUTO_IMPORTANCE=1)")),
 		mcp.WithString("source", mcp.Description("Provenance label")),
 		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede|raise")),
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
@@ -65,9 +85,10 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 			return errResult(err), nil
 		}
 		opts := memory.RememberOpts{
-			Type:       memory.MemoryType(req.GetString("type", string(memory.Episodic))),
-			Tags:       req.GetStringSlice("tags", nil),
-			Importance: float32(req.GetFloat("importance", 0.5)),
+			Type: memory.MemoryType(req.GetString("type", string(memory.Episodic))),
+			Tags: req.GetStringSlice("tags", nil),
+			// 0 = unset → store default or configured ImportanceFn.
+			Importance: float32(req.GetFloat("importance", 0)),
 			Source:     req.GetString("source", ""),
 			Polarity:   req.GetInt("polarity", 0),
 		}
@@ -81,7 +102,7 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 		if !stored {
 			return jsonText(map[string]any{"stored": false, "conflicts": conflicts}), nil
 		}
-		return jsonText(map[string]any{"id": m.ID, "stored": true}), nil
+		return jsonText(map[string]any{"id": m.ID, "stored": true, "importance": m.Importance}), nil
 	})
 }
 
@@ -139,6 +160,61 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			}
 		}
 		return jsonText(out), nil
+	})
+}
+
+func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("recall_pack",
+		mcp.WithDescription("Assemble the most relevant memories into a token-budgeted context block. "+
+			"Ranks with hybrid scoring (cosine + BM25 + recency + importance) by default, then greedily "+
+			"packs results until token_budget is reached. Returns a ready-to-inject `text` block plus the "+
+			"packed items. token_budget is a soft ceiling (estimated at ~4 chars/token) covering the "+
+			"memory lines, not the header."),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Search query")),
+		mcp.WithNumber("token_budget", mcp.Description("Token budget for the packed block (default: 800)")),
+		mcp.WithString("type", mcp.Description("Filter by memory type")),
+		mcp.WithString("tag", mcp.Description("Filter by tag")),
+		mcp.WithNumber("min_importance", mcp.Description("Minimum importance threshold")),
+		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: hybrid)")),
+		mcp.WithNumber("max_items", mcp.Description("Ranked candidates to consider (default: 50)")),
+		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		query, err := req.RequireString("query")
+		if err != nil {
+			return errResult(err), nil
+		}
+		pack, err := store.RecallPack(ctx, query, memory.PackOpts{
+			TokenBudget:       req.GetInt("token_budget", 800),
+			Type:              memory.MemoryType(req.GetString("type", "")),
+			Tag:               req.GetString("tag", ""),
+			MinImportance:     float32(req.GetFloat("min_importance", 0)),
+			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeHybrid))),
+			MaxItems:          req.GetInt("max_items", 50),
+			IncludeSuperseded: req.GetBool("include_superseded", false),
+		})
+		if err != nil {
+			return errResult(err), nil
+		}
+		items := make([]map[string]any, len(pack.Items))
+		for i, p := range pack.Items {
+			items[i] = map[string]any{
+				"id":         p.Memory.ID,
+				"text":       p.Memory.Text,
+				"type":       string(p.Memory.Type),
+				"tags":       p.Memory.Tags,
+				"importance": p.Memory.Importance,
+				"score":      p.Score,
+				"tokens":     p.Tokens,
+			}
+		}
+		return jsonText(map[string]any{
+			"text":        pack.Text,
+			"used_tokens": pack.UsedTokens,
+			"budget":      pack.Budget,
+			"truncated":   pack.Truncated,
+			"items":       items,
+		}), nil
 	})
 }
 
@@ -348,7 +424,7 @@ func addMaintenanceTick(s *server.MCPServer, store *memory.MemoryStore) {
 		result := map[string]any{"pruned": len(pruned)}
 
 		if doReflect {
-			re := reflectpkg.New(store, 0, 0, nil)
+			re := reflectpkg.New(store, 0, 0, buildSummarizer())
 			created, err := re.Reflect(ctx, false, consolidate)
 			if err != nil {
 				return errResult(fmt.Errorf("reflect: %w", err)), nil
@@ -455,13 +531,13 @@ func addImport(s *server.MCPServer, store *memory.MemoryStore) {
 		}
 		_ = fmt.Sprintf // keep fmt referenced
 		return jsonText(map[string]any{
-			"ok":                    true,
-			"imported":              summary.Imported,
-			"skipped":               summary.Skipped,
-			"overwritten":           summary.Overwritten,
-			"renamed":               summary.Renamed,
-			"errors":                summary.Errors,
-			"vectors_regenerated":   summary.VectorsRegenerated,
+			"ok":                  true,
+			"imported":            summary.Imported,
+			"skipped":             summary.Skipped,
+			"overwritten":         summary.Overwritten,
+			"renamed":             summary.Renamed,
+			"errors":              summary.Errors,
+			"vectors_regenerated": summary.VectorsRegenerated,
 		}), nil
 	})
 }

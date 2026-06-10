@@ -138,6 +138,70 @@ func (b *ChromemBackend) Close() error {
 	return nil // chromem-go PersistentDB flushes on each write
 }
 
+// ListCollections returns every collection name with its document count.
+func (b *ChromemBackend) ListCollections() map[string]int {
+	out := map[string]int{}
+	for name, col := range b.db.ListCollections() {
+		out[name] = col.Count()
+	}
+	return out
+}
+
+// HasCollection reports whether a collection exists.
+func (b *ChromemBackend) HasCollection(name string) bool {
+	_, ok := b.db.ListCollections()[name]
+	return ok
+}
+
+// CreateCollection creates an empty collection.
+func (b *ChromemBackend) CreateCollection(name string) error {
+	_, err := b.db.CreateCollection(name, map[string]string{}, noopEmbedFn)
+	return err
+}
+
+// DeleteCollection removes a collection and every document in it.
+func (b *ChromemBackend) DeleteCollection(name string) error {
+	return b.db.DeleteCollection(name)
+}
+
+// CopyCollection copies all documents (embeddings included — no
+// re-embedding) from src to dst. dst is created if missing; existing dst
+// ids are overwritten. Returns the number of copied documents.
+func (b *ChromemBackend) CopyCollection(ctx context.Context, src, dst string) (int, error) {
+	srcCol := b.db.GetCollection(src, noopEmbedFn)
+	if srcCol == nil {
+		return 0, fmt.Errorf("collection %q not found", src)
+	}
+	n := srcCol.Count()
+	if n == 0 {
+		return 0, nil
+	}
+	// Retrieve every document via the zero-vector query trick (see All).
+	zeroVec := make([]float32, b.dim)
+	results, err := srcCol.QueryEmbedding(ctx, zeroVec, n, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	dstCol, err := b.db.GetOrCreateCollection(dst, map[string]string{}, noopEmbedFn)
+	if err != nil {
+		return 0, err
+	}
+	docs := make([]chromem.Document, len(results))
+	for i, r := range results {
+		docs[i] = chromem.Document{
+			ID:        r.ID,
+			Content:   r.Content,
+			Embedding: r.Embedding,
+			Metadata:  r.Metadata,
+		}
+	}
+	// AddDocuments upserts, so existing dst ids are overwritten.
+	if err := dstCol.AddDocuments(ctx, docs, 1); err != nil {
+		return 0, err
+	}
+	return len(docs), nil
+}
+
 // cosine similarity utility (also used by reflection engine via package access).
 func CosineSim(a, b []float32) float32 {
 	if len(a) != len(b) {

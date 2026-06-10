@@ -1,27 +1,57 @@
 package cli
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 )
 
+// ImportanceDefault is a default_importance config value: either a float or
+// the literal string "auto", which enables the heuristic importance scorer.
+type ImportanceDefault struct {
+	Value float32
+	Auto  bool
+}
+
+// UnmarshalTOML accepts `default_importance = 0.7` and
+// `default_importance = "auto"`.
+func (d *ImportanceDefault) UnmarshalTOML(v any) error {
+	switch x := v.(type) {
+	case string:
+		if x == "auto" {
+			d.Auto = true
+			d.Value = 0.5
+			return nil
+		}
+		return fmt.Errorf("default_importance must be a float or \"auto\", got %q", x)
+	case float64:
+		d.Value = float32(x)
+	case int64:
+		d.Value = float32(x)
+	default:
+		return fmt.Errorf("default_importance must be a float or \"auto\", got %T", v)
+	}
+	return nil
+}
+
 // Config holds resolved CLI configuration.
 type Config struct {
-	StorePath         string  `toml:"store_path"`
-	Collection        string  `toml:"collection"`
-	DefaultType       string  `toml:"default_type"`
-	DefaultImportance float32 `toml:"default_importance"`
-	Editor            string  `toml:"editor"`
-	EmbedProvider     string  `toml:"embed_provider"`
-	OllamaURL         string  `toml:"ollama_url"`
-	OllamaModel       string  `toml:"ollama_model"`
-	OpenAIKey         string  `toml:"openai_api_key"`
-	OpenAIModel       string  `toml:"openai_model"`
-	DOKey             string  `toml:"do_api_key"`
-	DOModel           string  `toml:"do_model"`
-	EmbedDim          int     `toml:"embed_dim"`
+	StorePath         string            `toml:"store_path"`
+	Collection        string            `toml:"collection"`
+	DefaultType       string            `toml:"default_type"`
+	DefaultImportance ImportanceDefault `toml:"default_importance"`
+	Summarizer        string            `toml:"summarizer"` // reflection summarizer spec, e.g. "ollama:llama3.1"
+	Editor            string            `toml:"editor"`
+	EmbedProvider     string            `toml:"embed_provider"`
+	OllamaURL         string            `toml:"ollama_url"`
+	OllamaModel       string            `toml:"ollama_model"`
+	OpenAIKey         string            `toml:"openai_api_key"`
+	OpenAIModel       string            `toml:"openai_model"`
+	DOKey             string            `toml:"do_api_key"`
+	DOModel           string            `toml:"do_model"`
+	EmbedDim          int               `toml:"embed_dim"`
 }
 
 func defaultConfig() Config {
@@ -30,7 +60,7 @@ func defaultConfig() Config {
 		StorePath:         filepath.Join(home, ".ai_houkai", ".chroma"),
 		Collection:        "ai_houkai",
 		DefaultType:       "episodic",
-		DefaultImportance: 0.5,
+		DefaultImportance: ImportanceDefault{Value: 0.5},
 		Editor:            "",
 		EmbedProvider:     "ollama",
 		OllamaURL:         "http://localhost:11434",
@@ -100,6 +130,9 @@ func ResolveConfig(storePath, collection string) Config {
 	}
 	if v := os.Getenv("AI_HOUKAI_DO_MODEL"); v != "" {
 		cfg.DOModel = v
+	}
+	if v := os.Getenv("AI_HOUKAI_SUMMARIZER"); v != "" {
+		cfg.Summarizer = v
 	}
 
 	// CLI flag overrides (empty string = not set).

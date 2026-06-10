@@ -100,3 +100,72 @@ func TestChromemRoundTrip(t *testing.T) {
 		t.Errorf("after delete: got n=%d, want 1", n)
 	}
 }
+
+func TestCollectionManagement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "store")
+	ctx := context.Background()
+
+	b, err := NewChromem(path, "main", 3)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	defer b.Close()
+
+	if err := b.Add(ctx, []Item{
+		{ID: "a", Content: "alpha", Embedding: []float32{1, 0, 0}, Metadata: map[string]string{"k": "v"}},
+		{ID: "b", Content: "beta", Embedding: []float32{0, 1, 0}, Metadata: map[string]string{}},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if !b.HasCollection("main") {
+		t.Error("main collection should exist")
+	}
+	if counts := b.ListCollections(); counts["main"] != 2 {
+		t.Errorf("ListCollections = %v", counts)
+	}
+
+	if err := b.CreateCollection("extra"); err != nil {
+		t.Fatalf("CreateCollection: %v", err)
+	}
+	if !b.HasCollection("extra") {
+		t.Error("extra collection missing after create")
+	}
+
+	copied, err := b.CopyCollection(ctx, "main", "dst")
+	if err != nil {
+		t.Fatalf("CopyCollection: %v", err)
+	}
+	if copied != 2 {
+		t.Errorf("copied = %d, want 2", copied)
+	}
+	if counts := b.ListCollections(); counts["dst"] != 2 {
+		t.Errorf("dst count = %d, want 2", counts["dst"])
+	}
+
+	// Copy preserves content, metadata, and embeddings.
+	dstBackend, err := NewChromem(path, "dst", 3)
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	items, err := dstBackend.Get(ctx, []string{"a"})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("Get from dst: %v (%d items)", err, len(items))
+	}
+	if items[0].Content != "alpha" || items[0].Metadata["k"] != "v" || len(items[0].Embedding) == 0 {
+		t.Errorf("copied item mismatch: %+v", items[0])
+	}
+
+	if err := b.DeleteCollection("extra"); err != nil {
+		t.Fatalf("DeleteCollection: %v", err)
+	}
+	if b.HasCollection("extra") {
+		t.Error("extra collection still present after delete")
+	}
+
+	// Copying a missing collection errors.
+	if _, err := b.CopyCollection(ctx, "nope", "x"); err == nil {
+		t.Error("expected error for missing src collection")
+	}
+}

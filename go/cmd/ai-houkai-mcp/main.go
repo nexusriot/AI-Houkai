@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/nexusriot/ai-houkai/internal/cli"
@@ -55,7 +56,10 @@ func main() {
 	}
 
 	storeCfg := memory.DefaultStoreConfig(cfg.StorePath, cfg.Collection)
-	storeCfg.DefaultImportance = cfg.DefaultImportance
+	storeCfg.DefaultImportance = cfg.DefaultImportance.Value
+	if cfg.DefaultImportance.Auto || envBool("AI_HOUKAI_AUTO_IMPORTANCE") {
+		storeCfg.ImportanceFn = memory.ScoreImportance
+	}
 	storeCfg.Actor = "mcp"
 	switch cfg.EmbedProvider {
 	case embed.ProviderOpenAI:
@@ -68,7 +72,17 @@ func main() {
 	store := memory.NewMemoryStore(backend, embedder, storeCfg)
 
 	s := mcpserver.New(store, cfg.StorePath, cfg.Collection)
+	mcpserver.SetSummarizerSpec(cfg.Summarizer)
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("MCP server: %v", err)
 	}
+}
+
+// envBool reports whether an env var holds a truthy value.
+func envBool(name string) bool {
+	switch strings.ToLower(os.Getenv(name)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }

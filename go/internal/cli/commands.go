@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/decay"
-	"github.com/nexusriot/ai-houkai/internal/installer"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
 	"github.com/spf13/cobra"
@@ -23,6 +22,7 @@ func newRememberCmd() *cobra.Command {
 	var tags []string
 	var importance float32
 	var memType, source string
+	var autoImportance bool
 
 	cmd := &cobra.Command{
 		Use:   "remember <text>",
@@ -45,17 +45,29 @@ func newRememberCmd() *cobra.Command {
 				return fmt.Errorf("text is required")
 			}
 			store := storeFromCtx(cmd.Context())
+			cfg := cfgFromCtx(cmd.Context())
+
+			// Explicit -i wins; --auto-importance (or default_importance =
+			// "auto" in config) scores heuristically; else config default.
+			imp := importance
+			if !cmd.Flags().Changed("importance") {
+				if autoImportance || cfg.DefaultImportance.Auto {
+					imp = memory.ScoreImportance(text, memory.MemoryType(memType), tags)
+				} else {
+					imp = cfg.DefaultImportance.Value
+				}
+			}
 			opts := memory.RememberOpts{
 				Type:       memory.MemoryType(memType),
 				Tags:       tags,
-				Importance: importance,
+				Importance: imp,
 				Source:     source,
 			}
 			m, _, _, err := store.Remember(cmd.Context(), text, opts)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("stored %s\n", m.ID)
+			fmt.Printf("stored %s (importance %.2f)\n", m.ID, m.Importance)
 			return nil
 		},
 	}
@@ -63,6 +75,8 @@ func newRememberCmd() *cobra.Command {
 	cmd.Flags().Float32VarP(&importance, "importance", "i", 0.5, "Importance 0.0–1.0")
 	cmd.Flags().StringVar(&memType, "type", "episodic", "Memory type")
 	cmd.Flags().StringVar(&source, "source", "", "Provenance label")
+	cmd.Flags().BoolVar(&autoImportance, "auto-importance", false,
+		"Score importance heuristically from the text (also: default_importance = \"auto\" in config.toml)")
 	return cmd
 }
 
@@ -485,12 +499,24 @@ func newReflectCmd() *cobra.Command {
 	var apply, consolidate bool
 	var threshold float32
 	var minCluster int
+	var summarizer string
 	cmd := &cobra.Command{
 		Use:   "reflect",
 		Short: "Cluster episodic memories into semantic reflections (dry-run by default)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			store := storeFromCtx(cmd.Context())
-			engine := reflectpkg.New(store, threshold, minCluster, nil)
+			spec := summarizer
+			if !cmd.Flags().Changed("summarizer") {
+				spec = cfgFromCtx(cmd.Context()).Summarizer
+			}
+			summarize, err := reflectpkg.BuildSummarizer(spec, true)
+			if err != nil {
+				return err
+			}
+			if spec != "" {
+				fmt.Printf("Summarizer: %s\n", spec)
+			}
+			engine := reflectpkg.New(store, threshold, minCluster, summarize)
 			created, err := engine.Reflect(cmd.Context(), !apply, consolidate && apply)
 			if err != nil {
 				return err
@@ -516,6 +542,9 @@ func newReflectCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&consolidate, "consolidate", false, "Delete source episodics after reflecting")
 	cmd.Flags().Float32Var(&threshold, "threshold", 0.75, "Clustering similarity threshold")
 	cmd.Flags().IntVar(&minCluster, "min-cluster", 2, "Minimum cluster size")
+	cmd.Flags().StringVar(&summarizer, "summarizer", "",
+		"provider:model (extractive|ollama:M|openai:M|anthropic:M); default from `summarizer` in config.toml. "+
+			"LLM summarizers are also called for the dry-run preview.")
 	return cmd
 }
 
@@ -810,46 +839,6 @@ func newStatsCmd() *cobra.Command {
 			return nil
 		},
 	}
-}
-
-func newInstallCmd() *cobra.Command {
-	var settingsPath, memPath, collection, binaryPath string
-	var project bool
-	cmd := &cobra.Command{
-		Use:   "install",
-		Short: "Register ai-houkai-mcp in Claude Code settings.json",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			inst := installer.DefaultInstaller()
-			if memPath != "" {
-				inst.MemoryPath = memPath
-			}
-			if collection != "" {
-				inst.Collection = collection
-			}
-			if binaryPath != "" {
-				inst.BinaryPath = binaryPath
-			}
-			if project {
-				inst.SettingsPath = ".claude/settings.json"
-			}
-			if settingsPath != "" {
-				inst.SettingsPath = settingsPath
-			}
-			path, err := inst.Install()
-			if err != nil {
-				return err
-			}
-			fmt.Printf("installed to %s\n", path)
-			fmt.Println(installer.ClaudeMDSnippet())
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&settingsPath, "settings", "", "Custom settings.json path")
-	cmd.Flags().StringVar(&memPath, "memory-path", "", "Memory store path")
-	cmd.Flags().StringVar(&collection, "collection", "", "Collection name")
-	cmd.Flags().StringVar(&binaryPath, "binary", "", "Path to ai-houkai-mcp binary")
-	cmd.Flags().BoolVar(&project, "project", false, "Install project-scoped (.claude/settings.json)")
-	return cmd
 }
 
 func newConfigCmd() *cobra.Command {

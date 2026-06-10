@@ -34,6 +34,10 @@ type StoreConfig struct {
 	DefaultImportance float32
 	DecayRate         float32 // used for recency in hybrid scoring
 
+	// ImportanceFn, when set, auto-scores memories remembered without an
+	// explicit importance (e.g. ScoreImportance). Nil → DefaultImportance.
+	ImportanceFn func(text string, memType MemoryType, tags []string) float32
+
 	// Audit-journal options.
 	Actor           string // "cli" | "mcp" | "lib" | "reflection" | "decay" | "import"
 	JournalEnabled  bool   // default: true
@@ -123,8 +127,14 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	if opts.Type == "" {
 		opts.Type = Episodic
 	}
+	// Importance 0 means "unset" → auto-score when an ImportanceFn is
+	// configured, else keep the configured default.
 	if opts.Importance == 0 {
-		opts.Importance = s.cfg.DefaultImportance
+		if s.cfg.ImportanceFn != nil {
+			opts.Importance = s.cfg.ImportanceFn(text, opts.Type, opts.Tags)
+		} else {
+			opts.Importance = s.cfg.DefaultImportance
+		}
 	}
 
 	now := float64(time.Now().Unix())

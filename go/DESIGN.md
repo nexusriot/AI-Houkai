@@ -15,8 +15,9 @@ see [README.md](README.md); for the original Python design see
    keep working.
 3. **Distro-native deployment** — ship as a Debian package with conffile,
    systemd unit, and Ollama setup hint in the postinst.
-4. **Embedder is pluggable.** Inference is delegated to Ollama (default) or
-   OpenAI. The binary never links a model.
+4. **Embedder is pluggable.** Inference is delegated to Ollama (default),
+   OpenAI, or DigitalOcean Serverless Inference. The binary never links a
+   model.
 
 ## Component layout
 
@@ -26,10 +27,15 @@ cmd/ai-houkai-mcp ──┐
 cmd/houkai ─────────┘                      └─► vector.Backend  ──► memory.MemoryStore
                                                                         │
                                                                         ├─► decay.Engine
-                                                                        ├─► reflect.Engine
+                                                                        ├─► reflect.Engine   (+ summarizers)
                                                                         ├─► maintenance.Daemon
-                                                                        └─► mcpserver.New  (MCP tools)
+                                                                        ├─► tui.Model        (Bubble Tea browser)
+                                                                        └─► mcpserver.New    (MCP tools)
 ```
+
+Side packages: `internal/ingest` (pure chunking functions for
+`houkai ingest`) and `internal/installer` (MCP-client config patchers) have
+no store dependency at all.
 
 The two `cmd/` entry points are deliberately thin: each builds the same
 `MemoryStore` object then attaches it to a front-end (MCP server or cobra
@@ -43,9 +49,22 @@ CLI).
   payloads — these emit and consume Python's serialisation shape verbatim.
 - `MemoryStore`: the only stateful object. Backed by a `vector.Backend` plus
   an `embed.Embedder`. All public operations are methods on it:
-  `Remember`, `Recall`, `Forget`, `ListRecent`, `GetByID`, `UpdateMemory`,
-  `Link`, `Unlink`, `Neighbors`, `Subgraph`, `FindConflicts`, `Supersede`,
-  `Restore`, `Stats`, `AllRaw`, `Export`, `Import`, `Undo`.
+  `Remember`, `Recall`, `RecallPack`, `Forget`, `ListRecent`, `GetByID`,
+  `UpdateMemory`, `Link`, `Unlink`, `Neighbors`, `Subgraph`, `FindConflicts`,
+  `Supersede`, `Restore`, `Stats`, `AllRaw`, `Export`, `Import`, `Undo`.
+- `RecallPack` (`pack.go`): ranks via `Recall` (hybrid by default), then
+  greedily packs `- (type) text` lines into a token budget. Token cost
+  defaults to a ~4-chars/token estimate (`EstimateTokens`); callers can
+  supply an exact `TokenCounter`. A candidate that doesn't fit sets
+  `Truncated` but the loop keeps going — a smaller, lower-ranked item may
+  still fit. The header is not counted against the budget.
+- `ScoreImportance` (`importance.go`): heuristic importance scorer — regex
+  tiers (0.90 instructions/corrections/preferences, 0.75 decisions, 0.60
+  completions, 0.35 hedges; strongest tier wins) plus modifiers (+0.10
+  procedural/feedback type, −0.15 question, −0.10 under-20-chars), clamped
+  to [0.05, 0.98]. Deterministic by design. Wired in via
+  `StoreConfig.ImportanceFn`, which `Remember` consults when
+  `opts.Importance == 0`.
 - `MetadataToMemory` / `MemoryToMetadata`: chromem-go only stores
   `map[string]string`, so every numeric / list / nested field is
   stringified at the boundary and parsed back on read. Links are stored as
@@ -139,6 +158,12 @@ pre-computed vectors. Two quirks worth knowing:
 Swapping backends (sqlite-vec, qdrant, etc.) means implementing the 8 methods
 and changing one constructor call in `cmd/*/main.go`.
 
+Beyond the interface, `ChromemBackend` exposes collection-management
+extras consumed by `houkai collections` (the CLI type-asserts to the
+concrete type): `ListCollections`, `HasCollection`, `CreateCollection`,
+`DeleteCollection`, and `CopyCollection` (which moves documents with their
+embeddings — no re-embedding — via the same zero-vector retrieval trick).
+
 ### `internal/embed` — embedders
 
 `Embedder` is two methods (`Dim` + `Embed`). Three implementations ship:
@@ -178,8 +203,43 @@ just concatenates with `|` separators and truncates at 512 chars). Each new
 semantic memory is linked back to its sources via `derived_from`; with
 `consolidate=true` the sources are deleted.
 
-Plugging in an LLM summariser is a one-function swap — `Engine.Summarizer`
-is a public field.
+LLM summarizers live in `summarizers.go`:
+`BuildSummarizer("provider:model", fallback)` returns a `Summarizer` for
+`extractive` (the built-in default), `ollama:` (OpenAI-compatible
+`/v1/chat/completions`, `OLLAMA_BASE_URL`), `openai:` (`OPENAI_API_KEY`,
+`OPENAI_BASE_URL`), or `anthropic:` (`/v1/messages`, `ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL`) — all via plain `net/http`, no SDKs. With
+`fallback=true` (the usual case) LLM failures and empty outputs degrade to
+the extractive summarizer with a logged warning, so unattended maintenance
+never crashes. The spec comes from the `summarizer` config key /
+`AI_HOUKAI_SUMMARIZER` env / `houkai reflect --summarizer`.
+
+### `internal/ingest` — bulk-ingestion chunking
+
+`ChunkText(text, maxChars, minChars)` is deterministic and dependency-free:
+split on blank lines, glue markdown headings to the paragraph that follows
+(so a stored memory keeps its context), re-pack paragraphs longer than
+`maxChars` on sentence boundaries (a single oversized sentence is kept whole
+— splitting mid-sentence would destroy the embedding's meaning), drop chunks
+shorter than `minChars`. Go's RE2 has no lookbehind, so sentence boundaries
+are located with `FindAllStringIndex` and re-assembled manually. Embedding
+and storage happen at the caller (`houkai ingest`, one `Remember` per chunk,
+actor `import`, source `ingest:<filename>`).
+
+### `internal/tui` — interactive browser
+
+Bubble Tea port of the Python Textual TUI. Split in two files on the same
+boundary as Python's `tui/data.py` vs `tui/app.py`:
+
+- `data.go` — pure view-models, no bubbletea import, fully unit-testable:
+  `Row`, `View` (kind/title/rows/id8→Memory map), `DetailText`, and
+  `Navigator`, a breadcrumb stack of views (`OpenRecent` resets the stack,
+  `OpenSearch`/`OpenNeighbors` push, `Back` pops but never below the root).
+- `app.go` — the `tea.Model`: `bubbles/table` list + `bubbles/viewport`
+  detail pane side by side, `bubbles/textinput` search bar. Keys: `/`
+  search, `n` neighbors, `b` back, `r` recent, `q` quit. Store calls are
+  synchronous (embedding a search query blocks the UI briefly — same
+  trade-off as the Python version).
 
 ### `internal/maintenance` — background daemon
 
@@ -192,12 +252,12 @@ optional `--daemon` flag.
 
 ### `internal/mcpserver` — MCP surface
 
-Wraps `mark3labs/mcp-go`. Fourteen tools:
+Wraps `mark3labs/mcp-go`. Fifteen tools:
 
 ```
-remember        recall          forget          list_recent     stats
-link            unlink          neighbors       find_conflicts  supersede
-maintenance_tick  journal_tail  export          import
+remember        recall          recall_pack     forget          list_recent
+stats           link            unlink          neighbors       find_conflicts
+supersede       maintenance_tick  journal_tail  export          import
 ```
 
 Every handler converts inputs via `req.GetString/GetFloat/...`, calls the
@@ -209,16 +269,27 @@ The tool surface is at parity with the Python version. `export` / `import`
 take a server-local file path — there's no streaming over MCP yet, and
 binary payloads (the gzipped bytes) are kept off the JSON wire.
 
+`remember` treats a missing `importance` as 0 = unset, so the store's
+`ImportanceFn` (enabled via `default_importance = "auto"` or
+`AI_HOUKAI_AUTO_IMPORTANCE=1`) can auto-score it; the response echoes the
+resolved `importance`. `maintenance_tick`'s reflection step uses the
+summarizer spec injected at startup via `SetSummarizerSpec` (from the
+`summarizer` config key).
+
 ### `internal/cli` — CLI front-end
 
-`cobra` root + subcommands (25 leaves including `journal {tail,show,undo}`
-and the new `info` inspector). The root's `PersistentPreRunE` is where the
-real work happens: it resolves config, instantiates the embedder + backend +
-store (with `Actor="cli"` and a qualified `EmbeddingModel` like
-`openai:text-embedding-3-small` for the export header), and stuffs them
-into the command's context via three typed keys (`storeKey`, `cfgKey`,
-`fmtKey`). Subcommands pull them back out with `storeFromCtx` /
-`cfgFromCtx` / `fmtFromCtx`. This keeps each command's `RunE` short and
+`cobra` root + subcommands (~35 leaves including the `journal {tail,show,undo}`,
+`collections {list,create,delete,copy}`, and
+`install {claude-code,cursor,opencode}` groups, plus `pack`, `ingest`, and
+`tui`). The root's `PersistentPreRunE` is where the real work happens: it
+resolves config, instantiates the embedder + backend + store (with
+`Actor="cli"`, a qualified `EmbeddingModel` like
+`openai:text-embedding-3-small` for the export header, and `ImportanceFn`
+when `default_importance = "auto"`), and stuffs them into the command's
+context via four typed keys (`storeKey`, `cfgKey`, `fmtKey`, `backendKey` —
+the last giving `collections` access to the concrete `ChromemBackend`).
+Subcommands pull them back out with `storeFromCtx` / `cfgFromCtx` /
+`fmtFromCtx` / `backendFromCtx`. This keeps each command's `RunE` short and
 free of construction boilerplate.
 
 Output goes through `output.go`:
@@ -226,13 +297,28 @@ Output goes through `output.go`:
 - `--format tsv` → tab-separated
 - `--format auto` → lipgloss-styled human output if stdout is a TTY, else TSV
 
-### `internal/installer` — Claude Code wiring
+### `internal/installer` — MCP client wiring
 
-`ClaudeCodeInstaller.Install()` merges (does not overwrite) an `mcpServers`
-entry into `~/.claude/settings.json` (or `.claude/settings.json` with
-`--project`). The block points at `ai-houkai-mcp` on PATH and sets
-`AI_HOUKAI_PATH` / `AI_HOUKAI_COLLECTION` env vars. Verification is a
-membership check on the merged map.
+Three installers share the helpers in `common.go` (JSON load/merge/write,
+binary resolution, the client-agnostic `MemoryGuide` instruction text):
+
+- `ClaudeCodeInstaller` — merges an `mcpServers` entry into
+  `~/.claude/settings.json` (or `.claude/settings.json` with `--project`).
+- `CursorInstaller` — same `mcpServers` schema, but in `~/.cursor/mcp.json`
+  (project: `.cursor/mcp.json`), default collection `cursor`. Also emits a
+  `.cursor/rules/*.mdc` snippet (`CursorRuleSnippet`, `alwaysApply: true`).
+- `OpenCodeInstaller` — OpenCode's own `mcp` schema (`type: "local"`,
+  `command` *array*, `environment` map, `enabled` flag, top-level `$schema`)
+  in `~/.config/opencode/opencode.json` (project: `opencode.json`), default
+  collection `opencode`. Also emits an AGENTS.md snippet.
+
+All merge rather than overwrite (existing keys and sibling servers are
+preserved; unparseable files are replaced). Each block points at
+`ai-houkai-mcp` on PATH and sets `AI_HOUKAI_PATH` / `AI_HOUKAI_COLLECTION`
+env vars. Verification (`--verify`) checks the binary is reachable plus a
+membership check on the merged map. Exposed as
+`houkai install {claude-code|cursor|opencode}`; bare `houkai install` keeps
+its historical Claude Code meaning.
 
 ## Config resolution
 
@@ -247,6 +333,13 @@ defaults → /etc/ai-houkai/config.toml
 Implemented in [`internal/cli/config.go`](internal/cli/config.go). Missing
 files are silently skipped; unparseable TOML errors are also swallowed
 (matches Python behaviour — config should never break a working binary).
+
+`default_importance` accepts a float or the literal string `"auto"` via a
+custom `toml.Unmarshaler` (`ImportanceDefault{Value, Auto}`); `"auto"`
+switches the store to the heuristic scorer. `summarizer` holds the
+reflection summarizer spec (env override: `AI_HOUKAI_SUMMARIZER`). Note the
+key is flat here, unlike Python's `[maintenance.reflect].summarizer` table —
+the Go config has no maintenance section.
 
 The same resolver is used by both `houkai` and `ai-houkai-mcp` so the two
 binaries see identical settings.
@@ -297,21 +390,32 @@ install or Homebrew tap distribution:
 
 ## Testing strategy
 
-Currently sparse. The intended shape is:
+~20 test files / 100+ test functions across 9 packages, all offline
+(`go test ./...` needs no network and no Ollama):
 
-- `memory/bm25_test.go` — known-answer queries on a small corpus
+- `memory/store_test.go` — Remember→Recall→Supersede→Restore round-trips
+  against a real chromem-go store in a tmpdir, using `stubEmbedder` (FNV
+  hash → deterministic L2-normalised vector)
+- `memory/bm25_test.go`, `memory/hybrid_test.go` — scoring known-answers
 - `memory/conflict_test.go` — negation/duplicate cases
-- `memory/store_test.go` — Remember→Recall→Supersede→Restore round-trip
-  against a real chromem-go store in a tmpdir, with a stub Embedder that
-  hashes text to a deterministic float vector
-- `memory/export_import_test.go` — `.ahkai` round-trip, conflict policies,
-  journal rotation, undo for `remember`
-- `decay/engine_test.go` — protected types, threshold edge cases
-- `reflect/engine_test.go` — cluster boundary at threshold ± ε
-- `cli/config_test.go` — resolution-order precedence
-
-A `Stub` embedder (deterministic hash → fixed-dim vector) is the missing
-piece that would make all of the above table-driven and offline.
+- `memory/links_test.go` — graph ops
+- `memory/export_import_test.go` — `.ahkai` round-trip, conflict policies
+- `memory/pack_test.go` — token budgets, truncation, rank-order
+  preservation, custom token counters
+- `memory/importance_test.go` — scoring tiers, modifiers, clamping, store
+  wiring
+- `ingest/ingest_test.go` — chunking: headings, sentence re-packing, CRLF,
+  min-chars filtering
+- `reflect/engine_test.go` — cluster boundaries;
+  `reflect/summarizers_test.go` — spec parsing, all three providers against
+  `httptest` servers, fallback-on-error/empty
+- `decay/engine_test.go` — protected types, thresholds
+- `vector/chromem_test.go` — backend round-trip + collection management
+- `installer/*_test.go` — merge-don't-overwrite for all three clients
+- `tui/data_test.go` — view-models and Navigator stack (no terminal needed)
+- `cli/config_test.go` — resolution-order precedence, `"auto"` importance,
+  summarizer env override
+- `embed/openai_test.go` — request/response shapes
 
 ## Non-goals
 

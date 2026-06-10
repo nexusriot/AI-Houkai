@@ -119,8 +119,38 @@ default_importance = 0.7
 	if cfg.EmbedDim != 1024 {
 		t.Errorf("embed_dim from file: got %d", cfg.EmbedDim)
 	}
-	if cfg.DefaultImportance != 0.7 {
+	if cfg.DefaultImportance.Value != 0.7 || cfg.DefaultImportance.Auto {
 		t.Errorf("default_importance from file: got %v", cfg.DefaultImportance)
+	}
+}
+
+func TestDefaultImportanceAuto(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgFile := filepath.Join(tmpHome, "config.toml")
+	body := `
+default_importance = "auto"
+summarizer = "ollama:llama3.1"
+`
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("write cfg: %v", err)
+	}
+	withEnv(t, map[string]string{
+		"HOME":                 tmpHome,
+		"AI_HOUKAI_CONFIG":     cfgFile,
+		"AI_HOUKAI_SUMMARIZER": "",
+	})
+	cfg := ResolveConfig("", "")
+	if !cfg.DefaultImportance.Auto {
+		t.Errorf("default_importance auto not detected: %+v", cfg.DefaultImportance)
+	}
+	if cfg.Summarizer != "ollama:llama3.1" {
+		t.Errorf("summarizer = %q", cfg.Summarizer)
+	}
+
+	// Env var overrides the config file.
+	withEnv(t, map[string]string{"AI_HOUKAI_SUMMARIZER": "openai:gpt-4o-mini"})
+	if got := ResolveConfig("", "").Summarizer; got != "openai:gpt-4o-mini" {
+		t.Errorf("env summarizer = %q", got)
 	}
 }
 

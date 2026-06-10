@@ -17,6 +17,7 @@ type ctxKey string
 const storeKey ctxKey = "store"
 const cfgKey ctxKey = "cfg"
 const fmtKey ctxKey = "fmt"
+const backendKey ctxKey = "backend"
 
 // storeFromCtx retrieves the MemoryStore from context.
 func storeFromCtx(ctx context.Context) *memory.MemoryStore {
@@ -25,6 +26,10 @@ func storeFromCtx(ctx context.Context) *memory.MemoryStore {
 
 func cfgFromCtx(ctx context.Context) Config {
 	return ctx.Value(cfgKey).(Config)
+}
+
+func backendFromCtx(ctx context.Context) *vector.ChromemBackend {
+	return ctx.Value(backendKey).(*vector.ChromemBackend)
 }
 
 func fmtFromCtx(ctx context.Context) OutputFormat {
@@ -69,19 +74,20 @@ func NewRootCmd() *cobra.Command {
 			}
 
 			storeCfg := memory.DefaultStoreConfig(cfg.StorePath, cfg.Collection)
-			storeCfg.DefaultImportance = cfg.DefaultImportance
+			storeCfg.DefaultImportance = cfg.DefaultImportance.Value
+			if cfg.DefaultImportance.Auto {
+				storeCfg.ImportanceFn = memory.ScoreImportance
+			}
 			storeCfg.Actor = "cli"
 			storeCfg.EmbeddingModel = embedModelName(cfg)
 			store := memory.NewMemoryStore(backend, embedder, storeCfg)
 
 			// Inject into context.
-			cmd.SetContext(context.WithValue(
-				context.WithValue(
-					context.WithValue(cmd.Context(), storeKey, store),
-					cfgKey, cfg,
-				),
-				fmtKey, OutputFormat(format),
-			))
+			ctx := context.WithValue(cmd.Context(), storeKey, store)
+			ctx = context.WithValue(ctx, cfgKey, cfg)
+			ctx = context.WithValue(ctx, fmtKey, OutputFormat(format))
+			ctx = context.WithValue(ctx, backendKey, backend)
+			cmd.SetContext(ctx)
 			return nil
 		},
 	}
@@ -93,6 +99,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(
 		newRememberCmd(),
 		newRecallCmd(),
+		newPackCmd(),
 		newListCmd(),
 		newShowCmd(),
 		newForgetCmd(),
@@ -113,6 +120,9 @@ func NewRootCmd() *cobra.Command {
 		newInfoCmd(),
 		newBackupCmd(),
 		newStatsCmd(),
+		newIngestCmd(),
+		newCollectionsCmd(),
+		newTuiCmd(),
 		newJournalCmd(),
 		newInstallCmd(),
 		newConfigCmd(),
