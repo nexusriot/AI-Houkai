@@ -68,8 +68,9 @@ class MaintenanceScheduler:
         Seconds the run_forever loop sleeps between ticks.
     state_path
         Path to the JSON state file (tracks last-run timestamps and totals).
-    decay_rate, min_score, protect_types
-        Forwarded to DecayEngine.
+    decay_rate, min_score, protect_types, frequency_weight
+        Forwarded to DecayEngine. ``frequency_weight`` > 0 makes
+        frequently-recalled memories resist decay (0 = off).
     min_cluster_size
         Forwarded to ReflectionEngine.
     reflect_apply
@@ -91,6 +92,7 @@ class MaintenanceScheduler:
         decay_rate: float = 0.1,
         min_score: float = 0.05,
         protect_types: tuple[str, ...] = ("procedural",),
+        frequency_weight: float = 0.0,
         min_cluster_size: int = 3,
         reflect_apply: bool = False,
         summarizer=None,
@@ -103,6 +105,7 @@ class MaintenanceScheduler:
         self.decay_rate = decay_rate
         self.min_score = min_score
         self.protect_types = protect_types
+        self.frequency_weight = frequency_weight
         self.min_cluster_size = min_cluster_size
         self.reflect_apply = reflect_apply
         self.summarizer = summarizer
@@ -128,6 +131,7 @@ class MaintenanceScheduler:
                         decay_rate=self.decay_rate,
                         min_score=self.min_score,
                         protect_types=self.protect_types,
+                        frequency_weight=self.frequency_weight,
                     )
                     pruned = engine.prune(now=t)
                     result.decayed = len(pruned)

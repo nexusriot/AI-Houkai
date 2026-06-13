@@ -105,7 +105,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 330 tests across 16 files
+├── tests/                        # 338 tests across 16 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -316,6 +316,9 @@ houkai restore old-id
 # Preview what the decay engine would prune (dry-run by default)
 houkai prune
 houkai prune --decay-rate 0.05 --min-score 0.1
+
+# Reinforcement: let frequently-recalled memories resist decay (0 = off)
+houkai prune --frequency-weight 0.2
 
 # Actually delete (requires --apply)
 houkai prune --apply --yes
@@ -740,20 +743,24 @@ OpenCodeInstaller(memory_path="~/.ai_houkai", settings_path="opencode.json").ins
 
 ## Decay
 
-Memories fade over time based on age and importance.
+Memories fade over time based on age and importance, and — optionally — how
+often they are recalled.
 
 ```
-score = importance × exp(−λ × days_since_last_access)
+score = importance × exp(−λ × days_since_last_access) × (1 + frequency_weight × ln(1 + access_count))
 ```
 
 Default `λ = 0.1` → half-life ≈ 7 days for a 0.5-importance memory.
-`procedural` memories are protected and never pruned.
+`procedural` memories are protected and never pruned. `frequency_weight`
+defaults to `0.0` (recency-only); raise it so frequently-recalled memories
+resist decay.
 
 ```python
 from ai_houkai.memory_system import MemoryStore, DecayEngine
 
 store  = MemoryStore()
-engine = DecayEngine(store, decay_rate=0.1, min_score=0.05)
+engine = DecayEngine(store, decay_rate=0.1, min_score=0.05,
+                     frequency_weight=0.0)   # >0 → recall reinforcement
 
 engine.prune(dry_run=True)   # preview
 engine.prune()               # delete stale memories
@@ -879,9 +886,10 @@ reflect_every = "7d"      # or "off" to disable reflection
 tick_interval = "5m"      # how often the loop wakes to check schedules
 
 [maintenance.decay]
-decay_rate    = 0.1
-min_score     = 0.05
-protect_types = ["procedural"]   # never pruned
+decay_rate       = 0.1
+min_score        = 0.05
+protect_types    = ["procedural"]   # never pruned
+frequency_weight = 0.0   # >0 → frequently-recalled memories resist decay
 
 [maintenance.reflect]
 min_cluster_size = 3

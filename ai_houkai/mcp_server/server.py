@@ -330,6 +330,7 @@ def maintenance_tick(
         decay_rate=mcfg.decay_rate,
         min_score=mcfg.min_score,
         protect_types=mcfg.protect_types,
+        frequency_weight=mcfg.frequency_weight,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=reflect_apply,
         summarizer=build_summarizer(mcfg.summarizer),

@@ -37,6 +37,7 @@ class MaintenanceConfig:
     decay_rate: float
     min_score: float
     protect_types: tuple[str, ...]
+    frequency_weight: float         # recall-reinforcement strength (0 = off)
     # ReflectionEngine params
     min_cluster_size: int
     reflect_apply: bool             # False → reflect in dry-run (observe only)
@@ -105,6 +106,7 @@ def load_maintenance() -> MaintenanceConfig:
         decay_rate=float(decay_cfg.get("decay_rate", 0.1)),
         min_score=float(decay_cfg.get("min_score", 0.05)),
         protect_types=tuple(decay_cfg.get("protect_types", ["procedural"])),
+        frequency_weight=float(decay_cfg.get("frequency_weight", 0.0)),
         min_cluster_size=int(reflect_cfg.get("min_cluster_size", 3)),
         reflect_apply=bool(reflect_cfg.get("apply", False)),
         summarizer=os.environ.get("AI_HOUKAI_SUMMARIZER")

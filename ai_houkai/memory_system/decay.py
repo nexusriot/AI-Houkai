@@ -41,6 +41,7 @@ class DecayEngine:
         decay_rate: float = 0.1,
         min_score: float = 0.05,
         protect_types: tuple[str, ...] = ("procedural",),
+        frequency_weight: float = 0.0,
     ) -> None:
         """
         Parameters
@@ -56,18 +57,37 @@ class DecayEngine:
         protect_types
             Memory types never pruned regardless of score.
             Defaults to ("procedural",) — runbooks should not be forgotten.
+        frequency_weight
+            Reinforcement: how strongly a memory's recall count resists decay.
+            The score is multiplied by ``1 + frequency_weight × ln(1 + access_count)``,
+            so a frequently-recalled memory ages out more slowly than an
+            untouched one of equal importance and age. ``0.0`` (the default)
+            disables reinforcement — scores match the recency-only behaviour.
+            ``0.3`` roughly doubles the effective score of a memory recalled
+            ~20 times.
         """
         self.store = store
         self.decay_rate = decay_rate
         self.min_score = min_score
         self.protect_types = protect_types
+        self.frequency_weight = frequency_weight
 
 
     def score(self, memory: "Memory", now: float | None = None) -> float:
-        """Return the current decay score (0..importance) for a single memory."""
+        """Return the current decay score for a single memory.
+
+        ``importance × exp(-decay_rate × days) × reinforcement`` where the
+        reinforcement factor is ``1 + frequency_weight × ln(1 + access_count)``
+        (``1.0`` when ``frequency_weight == 0``). With reinforcement enabled the
+        score can exceed ``importance``; ``min_score`` is interpreted against
+        the reinforced value.
+        """
         t = now if now is not None else time.time()
         days = max(0.0, (t - memory.last_accessed) / 86_400.0)
-        return memory.importance * math.exp(-self.decay_rate * days)
+        base = memory.importance * math.exp(-self.decay_rate * days)
+        if self.frequency_weight:
+            base *= 1.0 + self.frequency_weight * math.log1p(max(0, memory.access_count))
+        return base
 
     def score_all(
         self, now: float | None = None

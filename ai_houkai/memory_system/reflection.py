@@ -180,11 +180,19 @@ class ReflectionEngine:
         raw   = res.get("embeddings")
         embs  = [] if raw is None else raw  # numpy arrays are truthy-ambiguous
 
-        mems = [
-            Memory.from_record(i, d, m)
-            for i, d, m in zip(ids, docs, metas)
-        ]
-        return mems, [list(e) for e in embs]
+        # Skip episodics that were already consolidated (superseded by an
+        # earlier reflection). Otherwise every run re-clusters the same
+        # sources: with consolidate=False it emits duplicate summaries, and
+        # with consolidate=soft it re-supersedes them under a fresh summary.
+        mems: list[Memory] = []
+        kept_embs: list[list[float]] = []
+        for i, d, m, e in zip(ids, docs, metas, embs):
+            mem = Memory.from_record(i, d, m)
+            if mem.superseded_by:
+                continue
+            mems.append(mem)
+            kept_embs.append(list(e))
+        return mems, kept_embs
 
     def _cluster(
         self,

@@ -34,6 +34,10 @@ def conflicts(
         return
 
     typer.echo(f"Found {len(found)} conflict(s):\n")
+    # Memories deleted or superseded in an earlier pair must not be touched
+    # again when they reappear in a later pair — supersede()/forget() on a
+    # missing id raises and would abort the whole scan.
+    resolved: set[str] = set()
     for i, c in enumerate(found, 1):
         typer.echo(
             f"[{i}] {c.kind.upper()}  sim={c.similarity:.3f}  reason={c.reason}\n"
@@ -41,6 +45,9 @@ def conflicts(
             f"  B [{out.short_id(c.b.id)}] {c.b.text[:70]}\n"
         )
         if resolve == "interactive":
+            if c.a.id in resolved or c.b.id in resolved:
+                typer.echo("  Skipped (a memory in this pair was already resolved).")
+                continue
             action = typer.prompt(
                 "  Action: (k)eep both / (s)upersede A by B / (S)upersede B by A / "
                 "(d)elete A / (D)elete B / (skip)",
@@ -48,15 +55,19 @@ def conflicts(
             )
             if action == "s":
                 store.supersede(c.a.id, c.b.id)
+                resolved.add(c.a.id)
                 typer.echo("  A superseded by B.")
             elif action == "S":
                 store.supersede(c.b.id, c.a.id)
+                resolved.add(c.b.id)
                 typer.echo("  B superseded by A.")
             elif action == "d":
                 store.forget(c.a.id)
+                resolved.add(c.a.id)
                 typer.echo("  Deleted A.")
             elif action == "D":
                 store.forget(c.b.id)
+                resolved.add(c.b.id)
                 typer.echo("  Deleted B.")
             else:
                 typer.echo("  Skipped.")
