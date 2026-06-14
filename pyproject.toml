@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.7.5"
+version         = "0.7.9"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -63,6 +63,11 @@ dev = [
 # Start the MCP server: ai-houkai-mcp
 # Env vars: AI_HOUKAI_PATH, AI_HOUKAI_COLLECTION
 ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
+
+# Start the HTTP/REST API server: ai-houkai-serve
+# Env vars: AI_HOUKAI_PATH, AI_HOUKAI_COLLECTION, AI_HOUKAI_HTTP_HOST,
+#           AI_HOUKAI_HTTP_PORT, AI_HOUKAI_HTTP_TOKEN
+ai-houkai-serve = "ai_houkai.http_server.server:run"
 
 # Register the MCP server with Claude Code (~/.claude/settings.json)
 ai-houkai-install-claude-code = "ai_houkai.installers.claude_code:_main"

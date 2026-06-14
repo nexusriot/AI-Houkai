@@ -6,8 +6,8 @@ Run with:
 
 Tools exposed (15):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
-    recall(query, k?, type?, tag?, min_importance?, mode?, overfetch?)
-    recall_pack(query, token_budget?, type?, tag?, min_importance?, mode?, max_items?)
+    recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?)
+    recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?)
     forget(memory_id)
     list_recent(limit?, include_superseded?)
     stats()
@@ -36,6 +36,7 @@ from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.importance import score_importance
 from ai_houkai.memory_system.store import ConflictError, HybridWeights
 from ai_houkai.memory_system.summarizers import build_summarizer
+from ai_houkai.timeparse import parse_timestamp
 
 CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
 COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
@@ -100,12 +101,18 @@ def recall(
     type: str | None = None,
     tag: str | None = None,
     min_importance: float | None = None,
+    source: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
     mode: str = "semantic",
     overfetch: int = 4,
     include_superseded: bool = False,
 ) -> list[dict[str, Any]]:
     """Semantic (or hybrid) search across stored memories.
     mode: "semantic" (default) | "hybrid" (cosine + BM25 + recency + importance).
+    source: keep only memories with this exact provenance string.
+    since/until: bound created_at — epoch seconds, an ISO-8601 date/datetime,
+    or a relative span like "7d" / "24h" (since="7d" → last 7 days).
     """
     hits = store.recall(
         query=query,
@@ -113,6 +120,9 @@ def recall(
         type=type,            # type: ignore[arg-type]
         tag=tag,
         min_importance=min_importance,
+        source=source,
+        since=parse_timestamp(since),
+        until=parse_timestamp(until),
         mode=mode,            # type: ignore[arg-type]
         overfetch=overfetch,
         include_superseded=include_superseded,
@@ -139,6 +149,9 @@ def recall_pack(
     type: str | None = None,
     tag: str | None = None,
     min_importance: float | None = None,
+    source: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
     mode: str = "hybrid",
     max_items: int = 50,
     include_superseded: bool = False,
@@ -149,6 +162,7 @@ def recall_pack(
     then greedily packs results until token_budget is reached. Returns a ready-to-
     inject `text` block plus the packed items. token_budget is a soft ceiling
     (estimated at ~4 chars/token) covering the memory lines, not the header.
+    source/since/until filter candidates exactly as in `recall`.
     """
     pack = store.recall_pack(
         query=query,
@@ -156,6 +170,9 @@ def recall_pack(
         type=type,             # type: ignore[arg-type]
         tag=tag,
         min_importance=min_importance,
+        source=source,
+        since=parse_timestamp(since),
+        until=parse_timestamp(until),
         mode=mode,             # type: ignore[arg-type]
         max_items=max_items,
         include_superseded=include_superseded,

@@ -29,7 +29,9 @@ and periodic reflection that condenses experience into knowledge.
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
+| **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
 | **MCP server** | 15 tools for any MCP client (Claude Code, Claude Desktop) |
+| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links), optional bearer-token auth |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -241,6 +243,11 @@ git log --oneline -20 | houkai ingest --tag git --auto-importance --yes
 houkai recall "parallel execution" -k 5
 houkai recall "deploy" --mode hybrid --format json
 
+# Filter by provenance and creation time (ISO date, epoch, or a relative span)
+houkai recall "auth" --source git --since 7d           # last week, from git ingests
+houkai recall "decision" --since 2026-01-01 --until 2026-03-31
+houkai pack  "deploy" --source runbook --since 30d --budget 500
+
 # Pack the most relevant memories into a token-budgeted context block.
 # The block prints to stdout (pipe it into a prompt); a summary goes to stderr.
 houkai pack "how do we deploy and test" --budget 800
@@ -441,6 +448,48 @@ default_type        = "semantic"
 default_importance  = 0.5        # or "auto" — heuristic scoring per memory
 editor              = "nvim"
 ```
+
+---
+
+## HTTP / REST API
+
+For web apps, shell scripts, n8n flows or any non-MCP agent, `houkai serve`
+exposes the same store over a small JSON HTTP API. It is **standard-library
+only** — no extra dependency beyond the core memory layer.
+
+```bash
+houkai serve --port 8077                 # uses the --store / --collection in effect
+# or, dependency-free console script driven by env vars:
+AI_HOUKAI_HTTP_PORT=8077 ai-houkai-serve
+```
+
+Endpoints (all JSON in / JSON out):
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | liveness + memory count (always open) |
+| `GET /stats` | store statistics |
+| `GET /memories?limit=&include_superseded=` | recent memories |
+| `POST /memories` | store a memory (`remember`) |
+| `GET /memories/{id}` | fetch one |
+| `DELETE /memories/{id}` | forget one |
+| `GET /memories/{id}/neighbors?rel=&direction=&depth=` | linked memories |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until` filters |
+| `POST /recall_pack` | token-budgeted context block |
+| `POST /links` · `POST /unlink` | manage the link graph |
+| `POST /supersede` · `POST /conflicts` | curation |
+
+```bash
+curl -s localhost:8077/health
+curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
+curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
+curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
+```
+
+**Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
+request must carry `Authorization: Bearer <secret>`; `/health` stays open for
+liveness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
+(or `AI_HOUKAI_HTTP_HOST`) only behind a trusted network or reverse proxy.
 
 ---
 

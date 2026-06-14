@@ -5,6 +5,7 @@ from typing import Optional
 import typer
 
 from ai_houkai.cli import output as out
+from ai_houkai.timeparse import parse_timestamp
 
 
 def recall(
@@ -14,18 +15,29 @@ def recall(
     type: Optional[str] = typer.Option(None, "-t", "--type"),
     tag: Optional[str] = typer.Option(None, "-g", "--tag"),
     min_importance: Optional[float] = typer.Option(None, "--min-importance"),
+    source: Optional[str] = typer.Option(None, "--source", help="Filter by exact provenance string"),
+    since: Optional[str] = typer.Option(None, "--since", help="Only memories created at/after (ISO date, epoch, or '7d')"),
+    until: Optional[str] = typer.Option(None, "--until", help="Only memories created at/before (ISO date, epoch, or '7d')"),
     mode: str = typer.Option("semantic", "--mode", help="semantic|hybrid"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
     fmt: str = typer.Option("auto", "--format", "-f", help="auto|rich|tsv|json"),
 ) -> None:
     """Semantic search across memories."""
     store = ctx.obj["store"]
+    try:
+        since_ts = parse_timestamp(since)
+        until_ts = parse_timestamp(until)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
     results = store.recall(
         query=query,
         k=k,
         type=type,
         tag=tag,
         min_importance=min_importance,
+        source=source,
+        since=since_ts,
+        until=until_ts,
         mode=mode,
         include_superseded=include_superseded,
     )

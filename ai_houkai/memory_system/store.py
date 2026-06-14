@@ -344,6 +344,42 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(len(text) / 4))
 
 
+def _build_where(
+    type: str | None = None,
+    min_importance: float | None = None,
+    source: str | None = None,
+    since: float | None = None,
+    until: float | None = None,
+) -> dict[str, Any] | None:
+    """Assemble a ChromaDB ``where`` clause from metadata filters.
+
+    Chroma rejects a multi-key clause (``{"a": 1, "b": 2}``) and a multi-
+    operator expression (``{"created_at": {"$gte": x, "$lte": y}}``); every
+    leaf must hold exactly one operator, and conjunctions must be expressed
+    with an explicit ``$and``.  This helper produces a single-condition clause
+    when only one filter is set and an ``$and`` of single-operator leaves
+    otherwise — including the ``since``/``until`` range, which becomes two
+    separate ``created_at`` leaves.
+    """
+    conditions: list[dict[str, Any]] = []
+    if type:
+        conditions.append({"type": type})
+    if min_importance is not None:
+        conditions.append({"importance": {"$gte": min_importance}})
+    if source:
+        conditions.append({"source": source})
+    if since is not None:
+        conditions.append({"created_at": {"$gte": since}})
+    if until is not None:
+        conditions.append({"created_at": {"$lte": until}})
+
+    if not conditions:
+        return None
+    if len(conditions) == 1:
+        return conditions[0]
+    return {"$and": conditions}
+
+
 class MemoryStore:
     """Long-term memory backed by ChromaDB with linking, conflict detection,
     and hybrid retrieval."""
@@ -491,12 +527,22 @@ class MemoryStore:
         tag: str | None = None,
         min_importance: float | None = None,
         *,
+        source: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "semantic",
         weights: HybridWeights | None = None,
         overfetch: int = 4,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
     ) -> list[tuple[Memory, float]]:
+        """Semantic (or hybrid) search with optional metadata filters.
+
+        ``type``/``min_importance``/``source`` match exactly (``source`` is the
+        provenance string set at :meth:`remember` time); ``since``/``until`` are
+        Unix timestamps bounding ``created_at`` (inclusive). ``tag`` is matched
+        post-query against the memory's tag list.
+        """
         count = self.collection.count()
         if k <= 0 or count == 0:
             return []
@@ -504,16 +550,12 @@ class MemoryStore:
         n_fetch = k if (mode == "semantic" and include_superseded) else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
 
-        where: dict[str, Any] = {}
-        if type:
-            where["type"] = type
-        if min_importance is not None:
-            where["importance"] = {"$gte": min_importance}
+        where = _build_where(type, min_importance, source, since, until)
 
         res = self.collection.query(
             query_texts=[query],
             n_results=n_fetch,
-            where=where or None,
+            where=where,
         )
 
         if mode == "hybrid":
@@ -538,6 +580,9 @@ class MemoryStore:
         type: MemoryType | None = None,
         tag: str | None = None,
         min_importance: float | None = None,
+        source: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "hybrid",
         weights: HybridWeights | None = None,
         expand: ExpandSpec | None = None,
@@ -565,6 +610,9 @@ class MemoryStore:
             type=type,
             tag=tag,
             min_importance=min_importance,
+            source=source,
+            since=since,
+            until=until,
             mode=mode,
             weights=weights,
             expand=expand,
