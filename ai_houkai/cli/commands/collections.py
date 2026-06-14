@@ -9,7 +9,12 @@ Commands
 
 from __future__ import annotations
 
+import json
+import sys
+
 import typer
+from rich.console import Console
+from rich.table import Table
 
 from ai_houkai.cli import output as out
 from ai_houkai.memory_system.store import _get_embed_fn
@@ -43,9 +48,6 @@ def list_cmd(
     fmt: str = typer.Option("auto", "--format", "-f", help="auto|json"),
 ) -> None:
     """List all collections in the store with their memory counts."""
-    import json
-    import sys
-
     client = _client(ctx)
     active = ctx.obj["config"].collection
     rows = [
@@ -64,19 +66,13 @@ def list_cmd(
         for r in rows:
             print(f"{r['name']}\t{r['count']}\t{'*' if r['active'] else ''}")
         return
-    try:
-        from rich.console import Console
-        from rich.table import Table
-
-        t = Table(show_header=True, header_style="bold cyan")
-        t.add_column("COLLECTION")
-        t.add_column("MEMORIES", justify="right")
-        t.add_column("", justify="center")
-        for r in rows:
-            t.add_row(r["name"], str(r["count"]), "*" if r["active"] else "")
-        Console().print(t)
-    except ImportError:
-        print(json.dumps(rows, indent=2))
+    t = Table(show_header=True, header_style="bold cyan")
+    t.add_column("COLLECTION")
+    t.add_column("MEMORIES", justify="right")
+    t.add_column("", justify="center")
+    for r in rows:
+        t.add_row(r["name"], str(r["count"]), "*" if r["active"] else "")
+    Console().print(t)
 
 
 @collections_app.command("create")

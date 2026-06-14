@@ -30,8 +30,8 @@ The handler is intentionally framework-free: a single regex routing table maps
 from __future__ import annotations
 
 import json
-import re
 import os
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
