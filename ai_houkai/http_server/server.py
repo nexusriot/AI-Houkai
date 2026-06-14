@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -442,7 +443,6 @@ def run() -> None:
       AI_HOUKAI_HTTP_PORT    bind port                (default 8077)
       AI_HOUKAI_HTTP_TOKEN   optional bearer token
     """
-    import os
 
     serve(
         host=os.environ.get("AI_HOUKAI_HTTP_HOST", "127.0.0.1"),

@@ -5,6 +5,8 @@ from typing import Optional
 
 import typer
 
+from ai_houkai.http_server import serve as run_server
+
 
 def serve(
     ctx: typer.Context,
@@ -25,10 +27,6 @@ def serve(
       curl -s 'localhost:8077/recall?query=auth&k=3&since=7d'
       curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
     """
-    # Imported lazily so the rest of the CLI works even if anything in the
-    # HTTP layer is unavailable.
-    from ai_houkai.http_server import serve as run_server
-
     store = ctx.obj["store"]
     # Attribute journal writes to the HTTP front-end while it owns the store.
     store._actor = "http"

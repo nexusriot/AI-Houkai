@@ -132,7 +132,6 @@ class TestHttpServer:
 class TestHttpAuth:
     @pytest.fixture()
     def auth_server(self, store):
-        from ai_houkai.http_server import make_server
         httpd = make_server(host="127.0.0.1", port=0, store=store,
                             auth_token="s3cret")
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
