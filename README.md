@@ -29,7 +29,9 @@ and periodic reflection that condenses experience into knowledge.
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
+| **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
 | **MCP server** | 15 tools for any MCP client (Claude Code, Claude Desktop) |
+| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links), optional bearer-token auth |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -105,7 +107,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 330 tests across 16 files
+├── tests/                        # 338 tests across 16 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -241,6 +243,11 @@ git log --oneline -20 | houkai ingest --tag git --auto-importance --yes
 houkai recall "parallel execution" -k 5
 houkai recall "deploy" --mode hybrid --format json
 
+# Filter by provenance and creation time (ISO date, epoch, or a relative span)
+houkai recall "auth" --source git --since 7d           # last week, from git ingests
+houkai recall "decision" --since 2026-01-01 --until 2026-03-31
+houkai pack  "deploy" --source runbook --since 30d --budget 500
+
 # Pack the most relevant memories into a token-budgeted context block.
 # The block prints to stdout (pipe it into a prompt); a summary goes to stderr.
 houkai pack "how do we deploy and test" --budget 800
@@ -316,6 +323,9 @@ houkai restore old-id
 # Preview what the decay engine would prune (dry-run by default)
 houkai prune
 houkai prune --decay-rate 0.05 --min-score 0.1
+
+# Reinforcement: let frequently-recalled memories resist decay (0 = off)
+houkai prune --frequency-weight 0.2
 
 # Actually delete (requires --apply)
 houkai prune --apply --yes
@@ -438,6 +448,48 @@ default_type        = "semantic"
 default_importance  = 0.5        # or "auto" — heuristic scoring per memory
 editor              = "nvim"
 ```
+
+---
+
+## HTTP / REST API
+
+For web apps, shell scripts, n8n flows or any non-MCP agent, `houkai serve`
+exposes the same store over a small JSON HTTP API. It is **standard-library
+only** — no extra dependency beyond the core memory layer.
+
+```bash
+houkai serve --port 8077                 # uses the --store / --collection in effect
+# or, dependency-free console script driven by env vars:
+AI_HOUKAI_HTTP_PORT=8077 ai-houkai-serve
+```
+
+Endpoints (all JSON in / JSON out):
+
+| Method & path | Purpose |
+|---|---|
+| `GET /health` | liveness + memory count (always open) |
+| `GET /stats` | store statistics |
+| `GET /memories?limit=&include_superseded=` | recent memories |
+| `POST /memories` | store a memory (`remember`) |
+| `GET /memories/{id}` | fetch one |
+| `DELETE /memories/{id}` | forget one |
+| `GET /memories/{id}/neighbors?rel=&direction=&depth=` | linked memories |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until` filters |
+| `POST /recall_pack` | token-budgeted context block |
+| `POST /links` · `POST /unlink` | manage the link graph |
+| `POST /supersede` · `POST /conflicts` | curation |
+
+```bash
+curl -s localhost:8077/health
+curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
+curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
+curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
+```
+
+**Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
+request must carry `Authorization: Bearer <secret>`; `/health` stays open for
+liveness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
+(or `AI_HOUKAI_HTTP_HOST`) only behind a trusted network or reverse proxy.
 
 ---
 
@@ -740,20 +792,24 @@ OpenCodeInstaller(memory_path="~/.ai_houkai", settings_path="opencode.json").ins
 
 ## Decay
 
-Memories fade over time based on age and importance.
+Memories fade over time based on age and importance, and — optionally — how
+often they are recalled.
 
 ```
-score = importance × exp(−λ × days_since_last_access)
+score = importance × exp(−λ × days_since_last_access) × (1 + frequency_weight × ln(1 + access_count))
 ```
 
 Default `λ = 0.1` → half-life ≈ 7 days for a 0.5-importance memory.
-`procedural` memories are protected and never pruned.
+`procedural` memories are protected and never pruned. `frequency_weight`
+defaults to `0.0` (recency-only); raise it so frequently-recalled memories
+resist decay.
 
 ```python
 from ai_houkai.memory_system import MemoryStore, DecayEngine
 
 store  = MemoryStore()
-engine = DecayEngine(store, decay_rate=0.1, min_score=0.05)
+engine = DecayEngine(store, decay_rate=0.1, min_score=0.05,
+                     frequency_weight=0.0)   # >0 → recall reinforcement
 
 engine.prune(dry_run=True)   # preview
 engine.prune()               # delete stale memories
@@ -879,9 +935,10 @@ reflect_every = "7d"      # or "off" to disable reflection
 tick_interval = "5m"      # how often the loop wakes to check schedules
 
 [maintenance.decay]
-decay_rate    = 0.1
-min_score     = 0.05
-protect_types = ["procedural"]   # never pruned
+decay_rate       = 0.1
+min_score        = 0.05
+protect_types    = ["procedural"]   # never pruned
+frequency_weight = 0.0   # >0 → frequently-recalled memories resist decay
 
 [maintenance.reflect]
 min_cluster_size = 3

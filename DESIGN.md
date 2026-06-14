@@ -26,6 +26,7 @@
 17. [Scheduled Maintenance](#17-scheduled-maintenance)
 18. [Audit Journal](#18-audit-journal)
 19. [Portable Import / Export](#19-portable-import--export)
+20. [HTTP / REST API](#20-http--rest-api)
 
 ---
 
@@ -346,7 +347,8 @@ data-model impact and is purely additive on the read path.
 ### Formula
 
 ```
-score(m) = importance × exp(−λ × days_since_last_access)
+score(m) = importance × exp(−λ × days_since_last_access) × reinforcement
+reinforcement = 1 + frequency_weight × ln(1 + access_count)
 ```
 
 | Parameter | Default | Effect |
@@ -354,8 +356,22 @@ score(m) = importance × exp(−λ × days_since_last_access)
 | `decay_rate` (λ) | `0.1` | Half-life ≈ 7 days for importance=0.5 |
 | `min_score` | `0.05` | Prune threshold |
 | `protect_types` | `("procedural",)` | Types immune to pruning |
+| `frequency_weight` | `0.0` | Recall reinforcement strength (0 = off) |
 
-Score examples with λ=0.1:
+### Recall reinforcement
+
+`access_count` (incremented on every `recall()` hit) feeds back into the
+score: a frequently-recalled memory ages out more slowly than an untouched
+one of equal importance and age. With the default `frequency_weight = 0.0`
+the reinforcement factor is exactly `1.0`, so scoring matches the
+recency-only behaviour and nothing changes. As `frequency_weight` rises,
+often-used memories resist pruning — e.g. `0.2` lets a memory recalled ~10
+times survive a prune that drops its never-reread twin. Note the score can
+then exceed `importance`; `min_score` is compared against the reinforced
+value. Configurable via `[maintenance.decay].frequency_weight`,
+`houkai prune --frequency-weight`, and the `MaintenanceScheduler`.
+
+Score examples with λ=0.1 (no reinforcement, `frequency_weight=0`):
 
 | importance | age | score | verdict |
 |---|---|---|---|
@@ -380,7 +396,8 @@ Score examples with λ=0.1:
 from ai_houkai.memory_system import MemoryStore, DecayEngine
 
 engine = DecayEngine(store, decay_rate=0.1, min_score=0.05,
-                     protect_types=("procedural",))
+                     protect_types=("procedural",),
+                     frequency_weight=0.0)   # >0 → frequent recalls resist decay
 
 score     = engine.score(mem)            # single memory
 pairs     = engine.score_all()           # all, sorted desc
@@ -814,15 +831,15 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 330 tests across 16 files
+### 338 tests across 16 files
 
 | File | Tests | What it covers |
 |---|---|---|
 | `test_memory.py` | 22 | `MemoryStore`: remember, forget, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
-| `test_decay.py` | 15 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store) |
-| `test_reflection.py` | 19 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), default summarizer |
+| `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
+| `test_reflection.py` | 20 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips already-superseded sources, default summarizer |
 | `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
-| `test_cli.py` | 13 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack |
+| `test_cli.py` | 15 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed (id/links preserved), interactive conflict resolution |
 | `test_hybrid.py` | 24 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion |
 | `test_conflicts.py` | 31 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
 | `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
@@ -979,9 +996,35 @@ store.recall(query, k, overfetch=6)                      # larger cosine pool
 store.recall(query, k,
              expand=ExpandSpec(rels=("refines","example_of"),
                                depth=1, cap=5, score=0.70))
+
+# Metadata filters — provenance + creation-time window
+store.recall(query, k, source="git", since=ts_a, until=ts_b)
 ```
 
 Default `mode="semantic"` is unchanged — zero risk for existing callers.
+
+#### Metadata filters
+
+`recall` (and `recall_pack`) accept `source`, `since` and `until` alongside
+the existing `type` / `tag` / `min_importance`. `source` matches the exact
+provenance string set at `remember` time; `since`/`until` are Unix timestamps
+bounding `created_at` (inclusive). `type`, `min_importance`, `source`, `since`
+and `until` push down into Chroma's `where` clause; `tag` is still matched
+post-query against the comma-joined tag list.
+
+ChromaDB ≥ 1.x rejects a multi-key `where` (`{"a":1,"b":2}`) and a
+multi-operator leaf (`{"created_at":{"$gte":x,"$lte":y}}`) — each leaf must
+carry exactly one operator, with conjunctions expressed via an explicit
+`$and`. `store._build_where()` centralises this: it returns `None` for no
+filters, a flat single-condition clause for one, and an `$and` of
+single-operator leaves otherwise (the `since`/`until` range becoming two
+separate `created_at` leaves). This also fixed a latent bug where combining
+`type` with `min_importance` previously emitted a rejected two-key clause.
+
+The user-facing layers parse human time inputs through
+`ai_houkai/timeparse.py::parse_timestamp`, which accepts epoch seconds, an
+ISO-8601 date/datetime (naive values read as UTC, trailing `Z` honoured), or a
+relative span like `"7d"` / `"24h"` (→ now minus that span).
 
 ---
 
@@ -1119,7 +1162,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
 | `show` | `show.py` | `store._get_by_id()` |
 | `forget` | `forget.py` | `store.forget()` |
-| `edit` | `edit.py` | forget + remember (re-embeds if text changed) |
+| `edit` | `edit.py` | `collection.update()` in place (re-embeds via `documents=` when text changed; id + links preserved) |
 | `tag` | `edit.py` | `collection.update()` metadata-only |
 | `bump` | `edit.py` | `collection.update()` metadata-only |
 | `link` | `link.py` | `store.link()` |
@@ -1165,8 +1208,9 @@ raises `ValueError` on ambiguous or missing prefixes.
   engine conventions — and require an explicit `--apply` flag to write.
 - `tag` and `bump` update only ChromaDB metadata; the embedding vector
   is unchanged, keeping the semantic index consistent.
-- `edit` re-embeds the text (delete + re-add) only when the text field
-  changes; metadata-only edits go through `collection.update()`.
+- `edit` updates the record in place via `collection.update()`, keeping
+  the same id and all links. Passing `documents=` re-embeds the text when
+  it changed; metadata-only edits omit it and leave the vector untouched.
 
 ### Config file
 
@@ -1311,3 +1355,60 @@ options) followed by one memory per line.
 `houkai info dump.ahkai` prints the header without touching the store,
 and `houkai backup` snapshots the raw Chroma directory for
 disaster recovery (orthogonal to `.ahkai`, which is portable data).
+
+---
+
+## 20. HTTP / REST API
+
+`ai_houkai/http_server/` exposes the same `MemoryStore` over a small JSON
+HTTP API, for clients that cannot speak MCP — web apps, shell scripts,
+automation tools, non-MCP agents. It is **standard-library only**
+(`http.server.ThreadingHTTPServer`), so it adds no dependency beyond the
+core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
+`urllib` Ollama summarizer in §7).
+
+### Surface
+
+| Method & path | Store call |
+|---|---|
+| `GET /health` | `count()` — always reachable (liveness, skips auth) |
+| `GET /stats` | path / collection / count |
+| `GET /memories` | `list_recent(limit, include_superseded)` |
+| `POST /memories` | `remember(...)` → 201, or 409 on `ConflictError` |
+| `GET /memories/{id}` | `_get_by_id` → 404 if absent |
+| `DELETE /memories/{id}` | `forget` → 404 if absent |
+| `GET /memories/{id}/neighbors` | `neighbors(rel, direction, depth)` |
+| `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until` |
+| `POST /recall_pack` | `recall_pack(...)` |
+| `POST /links` · `POST /unlink` | `link` / `unlink` |
+| `POST /supersede` · `POST /conflicts` | `supersede` / `find_conflicts` |
+
+### Design
+
+- **Framework-free routing.** A single `_ROUTES` table of
+  `(method, compiled_regex, handler, needs_body)` rows. Each handler is a
+  plain function `(store, match, query, body) -> (status, payload)`. One
+  `_dispatch` method serves every verb (`do_GET = do_POST = … = _dispatch`).
+  A path that matches a row but not the verb returns `405`; no match is `404`.
+- **Errors.** Handlers raise `HttpError(status, message)` for expected
+  failures (400 bad input, 404 missing, 413 oversized body); any other
+  exception is caught and rendered as `500 {"error": "<Type>: <msg>"}` so a
+  single bad request never takes the server down. Request bodies are capped at
+  4 MiB and parsed as a JSON object.
+- **Auth.** Optional bearer token (`auth_token` arg / `AI_HOUKAI_HTTP_TOKEN`).
+  When set, every route except `/health` requires
+  `Authorization: Bearer <token>`, else `401`. Binds `127.0.0.1` by default;
+  exposing `0.0.0.0` is left to a deliberate `--host` / env override behind a
+  trusted network or reverse proxy.
+- **Attribution.** The server sets the store's actor to `"http"`, so journal
+  entries from API writes are distinguishable from `cli` / `mcp` / `lib`.
+
+### Entry points
+
+- `houkai serve [--host --port --token]` — reuses the CLI-selected store.
+- `ai-houkai-serve` console script → `http_server.server:run`, configured
+  purely by env (`AI_HOUKAI_PATH`, `AI_HOUKAI_COLLECTION`,
+  `AI_HOUKAI_HTTP_HOST`, `AI_HOUKAI_HTTP_PORT`, `AI_HOUKAI_HTTP_TOKEN`) so it
+  needs no CLI extras — symmetric with `ai-houkai-mcp`.
+- `make_server(...)` / `serve(...)` / `build_handler(...)` for embedding the
+  API in another process or test (tests drive a real server on port 0).

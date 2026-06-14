@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import json
+import stat
+import sys
 
 import pytest
 from typer.testing import CliRunner
@@ -224,3 +226,85 @@ def test_remember_from_stdin(tmp_path):
     assert result.exit_code == 0
     mem_id = _first_uuid(result.output)
     assert len(mem_id) == _UUID_LEN, f"UUID not found in output: {result.output!r}"
+
+
+def _make_fake_editor(tmp_path, new_text: str) -> str:
+    """Write an executable 'editor' that rewrites the body after '---'."""
+    script = tmp_path / "fake_editor.py"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "path = sys.argv[1]\n"
+        "with open(path) as f:\n"
+        "    content = f.read()\n"
+        "head, sep, _ = content.partition('---')\n"
+        f"new_text = {new_text!r}\n"
+        "with open(path, 'w') as f:\n"
+        "    f.write(head + sep + '\\n' + new_text + '\\n')\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IRWXU)
+    return str(script)
+
+
+def test_edit_text_change_preserves_id_and_links(tmp_path, monkeypatch):
+    """Editing a memory's text re-embeds it in place: the id is unchanged and
+    both its own links and incoming links survive (regression — the old
+    forget()+remember() path minted a new id and orphaned the links)."""
+    store_path = str(tmp_path / "chroma")
+
+    a_id = _first_uuid(_invoke(["remember", "Original text about cats"], store_path).output)
+    b_id = _first_uuid(_invoke(["remember", "An unrelated note about dogs"], store_path).output)
+
+    # A -> B (A's own outgoing link) and B -> A (an incoming reference to A).
+    assert _invoke(["link", a_id, b_id, "--rel", "related"], store_path).exit_code == 0
+    assert _invoke(["link", b_id, a_id, "--rel", "refines"], store_path).exit_code == 0
+
+    editor = _make_fake_editor(tmp_path, "Updated text about cats and kittens")
+    monkeypatch.setenv("EDITOR", editor)
+
+    res = _invoke(["edit", a_id], store_path)
+    assert res.exit_code == 0, res.output
+
+    store = MemoryStore(path=store_path, collection="cli_test")
+    try:
+        a = store._get_by_id(a_id)
+        b = store._get_by_id(b_id)
+
+        assert a is not None, "edit must not change the memory id"
+        assert a.text == "Updated text about cats and kittens"
+        # A's own outgoing link is intact.
+        assert any(l.to == b_id and l.rel == "related" for l in a.links)
+        # B's incoming link still points at a memory that exists (not orphaned).
+        assert any(l.to == a_id and l.rel == "refines" for l in b.links)
+        assert store._get_by_id(b.links[0].to) is not None
+    finally:
+        store.client.close()
+
+
+def test_conflicts_interactive_skips_resolved_memories(tmp_path):
+    """Interactive conflict resolution must not crash when a memory resolved in
+    one pair reappears in a later pair (regression — the old code called
+    supersede/forget on the missing id and raised KeyError mid-scan)."""
+    store_path = str(tmp_path / "chroma")
+
+    # Three mutually-similar memories => find_conflicts yields three pairs,
+    # each sharing members, so a resolved memory recurs in a later pair.
+    for text in (
+        "The database uses Postgres for storage.",
+        "Our primary database is Postgres.",
+        "We run Postgres as the database backend.",
+    ):
+        _invoke(["remember", text], store_path)
+
+    # Pair 1: delete A. The remaining pairs are answered with supersede — one of
+    # them references the just-deleted memory and is skipped instead of crashing.
+    res = runner.invoke(
+        app,
+        ["--store", store_path, "--collection", "cli_test",
+         "conflicts", "--threshold", "0.3", "--resolve", "interactive"],
+        input="d\ns\ns\n",
+    )
+
+    assert res.exception is None, f"interactive resolve crashed: {res.exception!r}"
+    assert res.exit_code == 0, res.output
+    assert "already resolved" in res.output

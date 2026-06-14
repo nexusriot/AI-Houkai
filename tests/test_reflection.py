@@ -142,6 +142,30 @@ class TestReflect:
         assert len(episodic_all) >= 1
         assert all(m.superseded_by != "" for m in episodic_all)
 
+    def test_second_reflect_skips_superseded_sources(self, store: MemoryStore):
+        """A second consolidating reflect must not re-cluster sources that an
+        earlier reflection already superseded — doing so would emit a duplicate
+        summary and re-supersede them under a fresh id."""
+        self._seed_deployment_cluster(store)
+        engine = ReflectionEngine(store, similarity_threshold=0.70,
+                                  min_cluster_size=2)
+
+        first = engine.reflect(consolidate=True)
+        assert len(first) >= 1
+        episodics = [
+            m for m in store.list_recent(limit=100, include_superseded=True)
+            if m.type == "episodic"
+        ]
+        assert episodics and all(m.superseded_by for m in episodics)
+
+        # Second run: no active episodics left, so nothing to cluster.
+        second = engine.reflect(consolidate=True)
+        assert second == []
+
+        summaries = [m for m in store.list_recent(limit=100)
+                     if "reflection" in m.tags]
+        assert len(summaries) == 1, "a second reflect must not duplicate the summary"
+
     def test_consolidate_hard_removes_sources(self, store: MemoryStore):
         """consolidate='hard' hard-deletes sources (old behaviour)."""
         self._seed_deployment_cluster(store)

@@ -56,6 +56,7 @@ def _make_scheduler(store, mcfg) -> MaintenanceScheduler:
         decay_rate=mcfg.decay_rate,
         min_score=mcfg.min_score,
         protect_types=mcfg.protect_types,
+        frequency_weight=mcfg.frequency_weight,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=mcfg.reflect_apply,
         summarizer=summarizer,
@@ -204,3 +205,8 @@ def status_cmd(ctx: typer.Context) -> None:
     typer.echo(f"  Log file:       {mcfg.log_path}")
     typer.echo(f"  reflect_apply:  {mcfg.reflect_apply}")
     typer.echo(f"  summarizer:     {mcfg.summarizer or 'extractive (built-in)'}")
+    typer.echo(
+        f"  reinforcement:  "
+        + (f"on (frequency_weight={mcfg.frequency_weight})"
+           if mcfg.frequency_weight else "off")
+    )

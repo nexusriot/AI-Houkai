@@ -93,21 +93,25 @@ def edit(
 
     text_changed = new_text != mem.text
 
+    # Mutate in place, keeping the same id. Passing `documents` to Chroma's
+    # update re-embeds the text; everything else on the Memory (links,
+    # superseded_by, access_count, created_at, …) is preserved instead of
+    # being discarded by a forget()+remember() round-trip.
+    mem.text = new_text
+    mem.type = new_type
+    mem.importance = new_importance
+    mem.tags = new_tags
+    mem.source = new_source
+    mem.polarity = new_polarity
+
     if text_changed:
-        store.forget(full_id)
-        new_mem = store.remember(
-            text=new_text, type=new_type, tags=new_tags,
-            importance=new_importance, source=new_source, polarity=new_polarity,
+        store.collection.update(
+            ids=[full_id],
+            documents=[new_text],          # re-embed via the collection's EF
+            metadatas=[mem.to_metadata()],
         )
-        new_mem.created_at = mem.created_at
-        store.collection.update(ids=[new_mem.id], metadatas=[new_mem.to_metadata()])
-        typer.echo(f"Updated (re-embedded) → {out.short_id(new_mem.id)}")
+        typer.echo(f"Updated (re-embedded) → {out.short_id(full_id)}")
     else:
-        mem.type = new_type
-        mem.importance = new_importance
-        mem.tags = new_tags
-        mem.source = new_source
-        mem.polarity = new_polarity
         store.collection.update(ids=[full_id], metadatas=[mem.to_metadata()])
         typer.echo(f"Updated metadata for {out.short_id(full_id)}")
 

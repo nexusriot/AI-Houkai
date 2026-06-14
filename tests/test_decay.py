@@ -150,3 +150,89 @@ class TestPrune:
     def test_empty_store_returns_empty(self, store: MemoryStore):
         engine = DecayEngine(store)
         assert engine.prune() == []
+
+
+def _store_aged_count(
+    store: MemoryStore,
+    text: str,
+    importance: float,
+    days_old: float,
+    access_count: int,
+) -> Memory:
+    """Store a memory, backdate it, and set its recall (access) count."""
+    mem = store.remember(text, importance=importance)
+    mem.last_accessed = _days_ago(days_old)
+    mem.created_at    = _days_ago(days_old)
+    mem.access_count  = access_count
+    store.collection.update(ids=[mem.id], metadatas=[mem.to_metadata()])
+    return mem
+
+
+class TestReinforcement:
+    def test_default_weight_ignores_access_count(self, store: MemoryStore):
+        """frequency_weight=0 (default) → score is recency-only, regardless of
+        how often a memory was recalled."""
+        engine = DecayEngine(store, decay_rate=0.1)   # frequency_weight defaults to 0
+        now = time.time()
+        cold = Memory(id="a", text="x", type="semantic", importance=0.6,
+                      last_accessed=now - 5 * 86_400, access_count=0)
+        hot  = Memory(id="b", text="x", type="semantic", importance=0.6,
+                      last_accessed=now - 5 * 86_400, access_count=500)
+        assert engine.score(cold, now=now) == engine.score(hot, now=now)
+
+    def test_frequent_recall_raises_score(self, store: MemoryStore):
+        engine = DecayEngine(store, decay_rate=0.1, frequency_weight=0.2)
+        now = time.time()
+        cold = Memory(id="a", text="x", type="semantic", importance=0.6,
+                      last_accessed=now - 5 * 86_400, access_count=0)
+        hot  = Memory(id="b", text="x", type="semantic", importance=0.6,
+                      last_accessed=now - 5 * 86_400, access_count=50)
+        assert engine.score(hot, now=now) > engine.score(cold, now=now)
+        # access_count=0 → ln(1)=0 → no reinforcement, equals recency-only base.
+        base = 0.6 * math.exp(-0.1 * 5)
+        assert engine.score(cold, now=now) == pytest.approx(base, rel=1e-9)
+
+    def test_reinforcement_can_exceed_importance(self, store: MemoryStore):
+        engine = DecayEngine(store, frequency_weight=0.5)
+        fresh_hot = Memory(id="a", text="x", type="semantic",
+                           importance=0.5, access_count=100)
+        assert engine.score(fresh_hot) > 0.5
+
+    def test_reinforced_memory_survives_a_prune_that_drops_its_twin(self, store: MemoryStore):
+        """Two memories of equal importance and age: the frequently-recalled one
+        is kept, its untouched twin is pruned."""
+        now = 1_000_000_000.0
+        # base score at 25 days ≈ 0.5·exp(-2.5) ≈ 0.041 < min_score 0.05.
+        hot  = _store_aged_count(store, "looked up constantly",
+                                 importance=0.5, days_old=25, access_count=10)
+        cold = _store_aged_count(store, "written once, never reread",
+                                 importance=0.5, days_old=25, access_count=0)
+        # Backdate relative to the fixed `now` used below.
+        for m in (hot, cold):
+            m.last_accessed = now - 25 * 86_400
+            store.collection.update(ids=[m.id], metadatas=[m.to_metadata()])
+
+        engine = DecayEngine(store, decay_rate=0.1, min_score=0.05,
+                             frequency_weight=0.2)
+        removed = engine.prune(now=now)
+
+        removed_texts = {m.text for m in removed}
+        assert cold.text in removed_texts
+        assert hot.text not in removed_texts
+        assert store.count() == 1
+
+    def test_prune_without_reinforcement_drops_both(self, store: MemoryStore):
+        """Control: frequency_weight=0 prunes the frequently-recalled memory too."""
+        now = 1_000_000_000.0
+        hot  = _store_aged_count(store, "looked up constantly",
+                                 importance=0.5, days_old=25, access_count=10)
+        cold = _store_aged_count(store, "written once, never reread",
+                                 importance=0.5, days_old=25, access_count=0)
+        for m in (hot, cold):
+            m.last_accessed = now - 25 * 86_400
+            store.collection.update(ids=[m.id], metadatas=[m.to_metadata()])
+
+        engine = DecayEngine(store, decay_rate=0.1, min_score=0.05)  # weight 0
+        removed = engine.prune(now=now)
+        assert len(removed) == 2
+        assert store.count() == 0
