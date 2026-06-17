@@ -17,6 +17,10 @@ type Config struct {
 	Reflect     bool
 	Consolidate bool
 
+	// FrequencyWeight > 0 makes frequently-recalled memories resist decay
+	// (forwarded to decay.Engine; 0 = recency-only, the default).
+	FrequencyWeight float32
+
 	// Summarizer is forwarded to the reflection engine (e.g. from
 	// reflect.BuildSummarizer("ollama:llama3.1")). Nil → the built-in
 	// extractive summarizer.
@@ -50,7 +54,7 @@ func Start(ctx context.Context, store decay.Storable, reflStore reflectpkg.Stora
 }
 
 func runTick(ctx context.Context, store decay.Storable, reflStore reflectpkg.Storable, cfg Config) {
-	de := decay.New(store, cfg.DecayRate, cfg.MinScore, nil)
+	de := decay.New(store, cfg.DecayRate, cfg.MinScore, nil, cfg.FrequencyWeight)
 	pruned, err := de.Prune(ctx, false)
 	if err != nil {
 		log.Printf("maintenance prune: %v", err)

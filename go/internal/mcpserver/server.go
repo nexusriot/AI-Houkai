@@ -12,6 +12,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/decay"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
+	"github.com/nexusriot/ai-houkai/internal/timeparse"
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
@@ -56,6 +57,19 @@ func buildSummarizer() reflectpkg.Summarizer {
 		return nil // reflect.New falls back to the default summarizer
 	}
 	return s
+}
+
+// parseSinceUntil resolves the optional `since`/`until` recall filters, which
+// accept epoch seconds, an ISO-8601 date/datetime, or a relative span ("7d").
+// Returns 0 for an absent bound.
+func parseSinceUntil(req mcp.CallToolRequest) (since, until float64, err error) {
+	if since, _, err = timeparse.Parse(req.GetString("since", "")); err != nil {
+		return 0, 0, err
+	}
+	if until, _, err = timeparse.Parse(req.GetString("until", "")); err != nil {
+		return 0, 0, err
+	}
+	return since, until, nil
 }
 
 func jsonText(v any) *mcp.CallToolResult {
@@ -114,12 +128,19 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("type", mcp.Description("Filter by memory type")),
 		mcp.WithString("tag", mcp.Description("Filter by tag")),
 		mcp.WithNumber("min_importance", mcp.Description("Minimum importance threshold")),
+		mcp.WithString("source", mcp.Description("Keep only memories with this exact provenance string")),
+		mcp.WithString("since", mcp.Description("Bound created_at: epoch seconds, an ISO-8601 date/datetime, or a relative span like \"7d\" / \"24h\"")),
+		mcp.WithString("until", mcp.Description("Bound created_at (upper): epoch seconds, ISO-8601, or a relative span")),
 		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: semantic)")),
 		mcp.WithNumber("overfetch", mcp.Description("Overfetch multiplier for hybrid (default: 3)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
+		if err != nil {
+			return errResult(err), nil
+		}
+		since, until, err := parseSinceUntil(req)
 		if err != nil {
 			return errResult(err), nil
 		}
@@ -131,6 +152,9 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeSemantic))),
 			Overfetch:         req.GetInt("overfetch", 3),
 			IncludeSuperseded: req.GetBool("include_superseded", false),
+			Source:            req.GetString("source", ""),
+			Since:             since,
+			Until:             until,
 		}
 		results, err := store.Recall(ctx, query, k, opts)
 		if err != nil {
@@ -175,12 +199,19 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("type", mcp.Description("Filter by memory type")),
 		mcp.WithString("tag", mcp.Description("Filter by tag")),
 		mcp.WithNumber("min_importance", mcp.Description("Minimum importance threshold")),
+		mcp.WithString("source", mcp.Description("Keep only memories with this exact provenance string")),
+		mcp.WithString("since", mcp.Description("Bound created_at: epoch seconds, an ISO-8601 date/datetime, or a relative span like \"7d\" / \"24h\"")),
+		mcp.WithString("until", mcp.Description("Bound created_at (upper): epoch seconds, ISO-8601, or a relative span")),
 		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: hybrid)")),
 		mcp.WithNumber("max_items", mcp.Description("Ranked candidates to consider (default: 50)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
+		if err != nil {
+			return errResult(err), nil
+		}
+		since, until, err := parseSinceUntil(req)
 		if err != nil {
 			return errResult(err), nil
 		}
@@ -192,6 +223,9 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeHybrid))),
 			MaxItems:          req.GetInt("max_items", 50),
 			IncludeSuperseded: req.GetBool("include_superseded", false),
+			Source:            req.GetString("source", ""),
+			Since:             since,
+			Until:             until,
 		})
 		if err != nil {
 			return errResult(err), nil
@@ -406,16 +440,18 @@ func addMaintenanceTick(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithDescription("Run a maintenance pass: prune decayed memories and optionally reflect."),
 		mcp.WithNumber("decay_rate", mcp.Description("Decay rate λ (default: 0.1)")),
 		mcp.WithNumber("min_score", mcp.Description("Prune threshold (default: 0.05)")),
+		mcp.WithNumber("frequency_weight", mcp.Description("Reinforcement: how strongly recall count resists decay (default: 0 = off)")),
 		mcp.WithBoolean("reflect", mcp.Description("Also run reflection (default: false)")),
 		mcp.WithBoolean("consolidate", mcp.Description("Consolidate episodic memories after reflection")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		decayRate := float32(req.GetFloat("decay_rate", 0.1))
 		minScore := float32(req.GetFloat("min_score", 0.05))
+		frequencyWeight := float32(req.GetFloat("frequency_weight", 0))
 		doReflect := req.GetBool("reflect", false)
 		consolidate := req.GetBool("consolidate", false)
 
-		de := decay.New(store, decayRate, minScore, nil)
+		de := decay.New(store, decayRate, minScore, nil, frequencyWeight)
 		pruned, err := de.Prune(ctx, false)
 		if err != nil {
 			return errResult(fmt.Errorf("prune: %w", err)), nil

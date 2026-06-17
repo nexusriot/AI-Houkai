@@ -1,16 +1,18 @@
 # AI-Houkai (Go)
 
 Persistent long-term memory for AI agents — a Go port of the Python
-[ai-houkai](../README.md) project. Two static binaries, zero Python runtime,
+[ai-houkai](../README.md) project. Static binaries, zero Python runtime,
 embeddable on a fresh Debian/Ubuntu box with a single `.deb`.
 
-| Binary           | Purpose                                                |
-| ---------------- | ------------------------------------------------------ |
-| `ai-houkai-mcp`  | MCP server over stdio for Claude Code / Claude Desktop |
-| `houkai`         | CLI for direct terminal use of the memory store        |
+| Binary            | Purpose                                                |
+| ----------------- | ------------------------------------------------------ |
+| `ai-houkai-mcp`   | MCP server over stdio for Claude Code / Claude Desktop |
+| `ai-houkai-serve` | JSON HTTP/REST API server (env-configured)             |
+| `houkai`          | CLI for direct terminal use of the memory store        |
 
-Both binaries share the same configuration, on-disk format, and embedder
-plumbing — they are two front-ends over the same `MemoryStore`.
+All three binaries share the same configuration, on-disk format, and embedder
+plumbing — they are front-ends over the same `MemoryStore`. The HTTP API is also
+available as the `houkai serve` subcommand.
 
 ---
 
@@ -168,6 +170,7 @@ journal tail/show/undo Browse and reverse audit-journal entries
 backup                 Snapshot the chromem-go directory
 stats                  Aggregate counters
 config                 Show resolved config + search order
+serve                  JSON HTTP/REST API over the store (optional bearer auth)
 install                Register MCP server (claude-code | cursor | opencode)
 ```
 
@@ -291,6 +294,12 @@ houkai --format json recall "deploy" -k 3 | jq '.[].text'
 
 # only high-importance memories
 houkai recall "decisions" --min-importance 0.7
+
+# filter by provenance and a creation-time window
+# (--since/--until take an ISO date, an epoch, or a relative span like "7d")
+houkai recall "auth" --source git --since 7d
+houkai recall "decision" --since 2026-01-01 --until 2026-03-31
+houkai pack  "deploy" --source runbook --since 30d --budget 500
 ```
 
 ### Browsing and inspecting
@@ -372,6 +381,10 @@ houkai prune --apply
 # tune the decay
 houkai prune --decay-rate 0.05 --min-score 0.02 --apply
 
+# reinforcement: let frequently-recalled memories resist decay (0 = off).
+# score = importance × exp(−λ·days) × (1 + frequency_weight × ln(1 + access_count))
+houkai prune --frequency-weight 0.2
+
 # cluster episodic memories into semantic summaries (dry-run)
 houkai reflect
 
@@ -451,6 +464,49 @@ houkai stats
 # see what config the binary actually resolved (and from where)
 houkai config
 ```
+
+### HTTP / REST API
+
+For web apps, shell scripts, n8n flows or any non-MCP agent, `houkai serve`
+(or the env-configured `ai-houkai-serve` binary) exposes the same store over a
+small JSON HTTP API. It uses only the Go standard library — no extra runtime
+dependency beyond the core memory layer.
+
+```bash
+houkai serve --port 8077                 # uses the --store / --collection in effect
+# or, env-driven standalone binary (symmetric with ai-houkai-mcp):
+AI_HOUKAI_HTTP_PORT=8077 ai-houkai-serve
+```
+
+Endpoints (all JSON in / JSON out):
+
+| Method & path                                          | Purpose                                          |
+| ------------------------------------------------------ | ------------------------------------------------ |
+| `GET /health`                                          | liveness + memory count (always open)            |
+| `GET /stats`                                           | store statistics                                 |
+| `GET /memories?limit=&include_superseded=`             | recent memories                                  |
+| `POST /memories`                                       | store a memory (`remember`) → 201, or 409        |
+| `GET /memories/{id}`                                   | fetch one                                        |
+| `DELETE /memories/{id}`                                | forget one                                       |
+| `GET /memories/{id}/neighbors?rel=&direction=&depth=`  | linked memories                                  |
+| `GET\|POST /recall`                                    | search — supports `source`, `since`, `until`     |
+| `POST /recall_pack`                                    | token-budgeted context block                     |
+| `POST /links` · `POST /unlink`                         | manage the link graph                            |
+| `POST /supersede` · `POST /conflicts`                  | curation                                         |
+
+```bash
+curl -s localhost:8077/health
+curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
+curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
+curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
+```
+
+**Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
+request must carry `Authorization: Bearer <secret>`; `/health` stays open for
+liveness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
+(or `AI_HOUKAI_HTTP_HOST`) only behind a trusted network or reverse proxy.
+Request bodies are capped at 4 MiB, and any handler error is rendered as a JSON
+`{"error": …}` envelope so a single bad request never takes the server down.
 
 ### Multiple stores / projects
 

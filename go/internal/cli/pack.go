@@ -6,12 +6,13 @@ import (
 	"os"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
+	"github.com/nexusriot/ai-houkai/internal/timeparse"
 	"github.com/spf13/cobra"
 )
 
 func newPackCmd() *cobra.Command {
 	var budget, maxItems int
-	var memType, tag, mode, header, format string
+	var memType, tag, mode, header, format, source, since, until string
 	var minImp float32
 	var inclSup bool
 
@@ -26,6 +27,14 @@ prompt); a one-line summary goes to stderr.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
+			sinceTS, _, err := timeparse.Parse(since)
+			if err != nil {
+				return err
+			}
+			untilTS, _, err := timeparse.Parse(until)
+			if err != nil {
+				return err
+			}
 			result, err := store.RecallPack(cmd.Context(), args[0], memory.PackOpts{
 				TokenBudget:       budget,
 				Type:              memory.MemoryType(memType),
@@ -35,6 +44,9 @@ prompt); a one-line summary goes to stderr.`,
 				MaxItems:          maxItems,
 				IncludeSuperseded: inclSup,
 				Header:            &header,
+				Source:            source,
+				Since:             sinceTS,
+				Until:             untilTS,
 			})
 			if err != nil {
 				return err
@@ -97,5 +109,8 @@ prompt); a one-line summary goes to stderr.`,
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded memories")
 	cmd.Flags().StringVar(&header, "header", "## Relevant memory", "Block header (empty string to omit)")
 	cmd.Flags().StringVarP(&format, "output", "f", "text", "Output format: text|json")
+	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
+	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
+	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
 	return cmd
 }

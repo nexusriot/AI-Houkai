@@ -11,6 +11,7 @@ LDFLAGS  := -s -w \
 ## build: compile for the current host
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/ai-houkai-mcp ./cmd/ai-houkai-mcp
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/ai-houkai-serve ./cmd/ai-houkai-serve
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/houkai ./cmd/houkai
 
 ## release: cross-compile for linux/{amd64,arm64} and darwin/{amd64,arm64}
@@ -52,12 +53,14 @@ vet:
 ## install: install binaries system-wide (requires sudo)
 install: build
 	install -m 0755 $(BIN_DIR)/ai-houkai-mcp /usr/local/bin/
+	install -m 0755 $(BIN_DIR)/ai-houkai-serve /usr/local/bin/
 	install -m 0755 $(BIN_DIR)/houkai /usr/local/bin/
 
 ## install-user: install binaries to ~/.local/bin
 install-user: build
 	mkdir -p $(HOME)/.local/bin
 	install -m 0755 $(BIN_DIR)/ai-houkai-mcp $(HOME)/.local/bin/
+	install -m 0755 $(BIN_DIR)/ai-houkai-serve $(HOME)/.local/bin/
 	install -m 0755 $(BIN_DIR)/houkai $(HOME)/.local/bin/
 
 ## clean: remove build artefacts

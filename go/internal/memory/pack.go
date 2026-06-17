@@ -56,6 +56,11 @@ type PackOpts struct {
 	MaxItems          int              // ranked candidates to consider (default 50)
 	TokenCounter      func(string) int // default EstimateTokens
 	Header            *string          // nil → "## Relevant memory"; empty string → no header
+
+	// Source/Since/Until filter candidates exactly as in Recall.
+	Source string
+	Since  float64
+	Until  float64
 }
 
 const defaultPackHeader = "## Relevant memory"
@@ -96,6 +101,9 @@ func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpt
 		Weights:           opts.Weights,
 		IncludeSuperseded: opts.IncludeSuperseded,
 		Expand:            opts.Expand,
+		Source:            opts.Source,
+		Since:             opts.Since,
+		Until:             opts.Until,
 	})
 	if err != nil {
 		return PackResult{}, err

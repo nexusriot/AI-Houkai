@@ -15,6 +15,14 @@ type Engine struct {
 	DecayRate    float32
 	MinScore     float32
 	ProtectTypes []memory.MemoryType
+
+	// FrequencyWeight is the recall-reinforcement strength: the decay score is
+	// multiplied by 1 + FrequencyWeight × ln(1 + access_count), so a
+	// frequently-recalled memory ages out more slowly than an untouched one of
+	// equal importance and age. 0 (the default) disables reinforcement — scores
+	// match the recency-only behaviour. With it enabled the score can exceed
+	// importance; MinScore is interpreted against the reinforced value.
+	FrequencyWeight float32
 }
 
 // Storable is the subset of MemoryStore the Engine needs.
@@ -29,7 +37,7 @@ type actorScoped interface {
 	AsActor(name string) func()
 }
 
-func New(store Storable, decayRate, minScore float32, protectTypes []memory.MemoryType) *Engine {
+func New(store Storable, decayRate, minScore float32, protectTypes []memory.MemoryType, frequencyWeight float32) *Engine {
 	if decayRate == 0 {
 		decayRate = 0.1
 	}
@@ -40,10 +48,11 @@ func New(store Storable, decayRate, minScore float32, protectTypes []memory.Memo
 		protectTypes = []memory.MemoryType{memory.Procedural}
 	}
 	return &Engine{
-		store:        store,
-		DecayRate:    decayRate,
-		MinScore:     minScore,
-		ProtectTypes: protectTypes,
+		store:           store,
+		DecayRate:       decayRate,
+		MinScore:        minScore,
+		ProtectTypes:    protectTypes,
+		FrequencyWeight: frequencyWeight,
 	}
 }
 
@@ -55,7 +64,15 @@ func (e *Engine) Score(m memory.Memory) float32 {
 func (e *Engine) scoreAt(m memory.Memory, now time.Time) float32 {
 	lastAccess := time.Unix(int64(m.LastAccessed), 0)
 	days := float32(now.Sub(lastAccess).Hours() / 24)
-	return m.Importance * float32(math.Exp(float64(-e.DecayRate*days)))
+	base := m.Importance * float32(math.Exp(float64(-e.DecayRate*days)))
+	if e.FrequencyWeight != 0 {
+		count := m.AccessCount
+		if count < 0 {
+			count = 0
+		}
+		base *= 1 + e.FrequencyWeight*float32(math.Log1p(float64(count)))
+	}
+	return base
 }
 
 type ScoredMemory struct {

@@ -15,6 +15,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/decay"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
+	"github.com/nexusriot/ai-houkai/internal/timeparse"
 	"github.com/spf13/cobra"
 )
 
@@ -82,7 +83,7 @@ func newRememberCmd() *cobra.Command {
 
 func newRecallCmd() *cobra.Command {
 	var k int
-	var tag, memType, mode string
+	var tag, memType, mode, source, since, until string
 	var minImp float32
 	var inclSup bool
 
@@ -92,6 +93,14 @@ func newRecallCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
+			sinceTS, _, err := timeparse.Parse(since)
+			if err != nil {
+				return err
+			}
+			untilTS, _, err := timeparse.Parse(until)
+			if err != nil {
+				return err
+			}
 			opts := memory.RecallOpts{
 				Type:              memory.MemoryType(memType),
 				Tag:               tag,
@@ -99,6 +108,9 @@ func newRecallCmd() *cobra.Command {
 				Mode:              memory.RecallMode(mode),
 				Overfetch:         3,
 				IncludeSuperseded: inclSup,
+				Source:            source,
+				Since:             sinceTS,
+				Until:             untilTS,
 			}
 			results, err := store.Recall(cmd.Context(), args[0], k, opts)
 			if err != nil {
@@ -127,6 +139,9 @@ func newRecallCmd() *cobra.Command {
 	cmd.Flags().Float32Var(&minImp, "min-importance", 0, "Minimum importance")
 	cmd.Flags().StringVar(&mode, "mode", "semantic", "Scoring mode: semantic|hybrid")
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded memories")
+	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
+	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
+	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
 	return cmd
 }
 
@@ -461,13 +476,17 @@ func newRestoreCmd() *cobra.Command {
 
 func newPruneCmd() *cobra.Command {
 	var apply bool
-	var decayRate, minScore float32
+	var decayRate, minScore, frequencyWeight float32
 	cmd := &cobra.Command{
 		Use:   "prune",
 		Short: "Remove stale memories via decay scoring (dry-run by default)",
+		Long: `Remove stale memories via decay scoring (dry-run by default).
+
+With --frequency-weight > 0, frequently-recalled memories age out more slowly
+than untouched ones of equal importance and age.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			store := storeFromCtx(cmd.Context())
-			engine := decay.New(store, decayRate, minScore, nil)
+			engine := decay.New(store, decayRate, minScore, nil, frequencyWeight)
 			candidates, err := engine.Prune(cmd.Context(), !apply)
 			if err != nil {
 				return err
@@ -492,6 +511,8 @@ func newPruneCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&apply, "apply", false, "Actually delete (default: dry-run)")
 	cmd.Flags().Float32Var(&decayRate, "decay-rate", 0.1, "Decay rate λ")
 	cmd.Flags().Float32Var(&minScore, "min-score", 0.05, "Prune threshold")
+	cmd.Flags().Float32Var(&frequencyWeight, "frequency-weight", 0.0,
+		"Reinforcement: how strongly recall count resists decay (0 = off)")
 	return cmd
 }
 

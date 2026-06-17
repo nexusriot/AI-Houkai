@@ -53,6 +53,11 @@ for target in "${TARGETS[@]}"; do
 
     GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
         go build -trimpath -ldflags "$LDFLAGS" \
+        -o "$out_dir/ai-houkai-serve${suffix}" \
+        ./cmd/ai-houkai-serve
+
+    GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 \
+        go build -trimpath -ldflags "$LDFLAGS" \
         -o "$out_dir/houkai${suffix}" \
         ./cmd/houkai
 

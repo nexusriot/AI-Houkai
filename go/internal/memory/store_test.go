@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/vector"
 )
@@ -103,6 +104,56 @@ func TestRecallTypeFilter(t *testing.T) {
 	}
 	if len(hits) != 1 || hits[0].ID != semID {
 		t.Errorf("want semantic memory only, got %+v", hits)
+	}
+}
+
+func TestRecallSourceFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	gitID, _, _, _ := mustRemember(t, store, "deploy via git", RememberOpts{Source: "git"})
+	_, _, _, _ = store.Remember(ctx, "deploy via runbook", RememberOpts{Source: "runbook"})
+
+	hits, err := store.Recall(ctx, "deploy", 5, RecallOpts{Source: "git"})
+	if err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+	if len(hits) != 1 || hits[0].ID != gitID {
+		t.Fatalf("source filter: want only git memory, got %+v", hits)
+	}
+	if hits[0].Source != "git" {
+		t.Errorf("source leaked: %q", hits[0].Source)
+	}
+}
+
+func TestRecallSinceUntilFilter(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	oldID, _, _, _ := mustRemember(t, store, "ancient deploy note", RememberOpts{})
+	newID, _, _, _ := mustRemember(t, store, "recent deploy note", RememberOpts{})
+
+	// Backdate the first memory to ~100 days ago.
+	old, err := store.GetByID(ctx, oldID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	cutoff := float64(time.Now().Add(-50 * 24 * time.Hour).Unix())
+	old.CreatedAt = float64(time.Now().Add(-100 * 24 * time.Hour).Unix())
+	if err := store.UpdateMemory(ctx, old, false); err != nil {
+		t.Fatalf("UpdateMemory: %v", err)
+	}
+
+	// since=cutoff keeps only the recent memory.
+	hits, _ := store.Recall(ctx, "deploy note", 10, RecallOpts{Since: cutoff})
+	if len(hits) != 1 || hits[0].ID != newID {
+		t.Fatalf("since filter: want only recent memory, got %+v", hits)
+	}
+
+	// until=cutoff keeps only the backdated memory.
+	hits, _ = store.Recall(ctx, "deploy note", 10, RecallOpts{Until: cutoff})
+	if len(hits) != 1 || hits[0].ID != oldID {
+		t.Fatalf("until filter: want only old memory, got %+v", hits)
 	}
 }
 

@@ -252,6 +252,15 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		if opts.Tag != "" && !containsTag(c.Memory, opts.Tag) {
 			continue
 		}
+		if opts.Source != "" && c.Source != opts.Source {
+			continue
+		}
+		if opts.Since > 0 && c.CreatedAt < opts.Since {
+			continue
+		}
+		if opts.Until > 0 && c.CreatedAt > opts.Until {
+			continue
+		}
 		filtered = append(filtered, c)
 	}
 
@@ -311,6 +320,12 @@ type RecallOpts struct {
 	Weights           HybridWeights
 	IncludeSuperseded bool
 	Expand            *ExpandSpec
+
+	// Source keeps only memories whose provenance string matches exactly.
+	Source string
+	// Since/Until bound created_at (Unix seconds, inclusive). 0 = unbounded.
+	Since float64
+	Until float64
 }
 
 // Forget deletes a memory by ID. Returns true if found and deleted.

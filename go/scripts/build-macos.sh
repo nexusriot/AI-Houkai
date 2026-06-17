@@ -60,8 +60,9 @@ for arch in "${ARCHS[@]}"; do
     install -d "$stage/bin"
     install -d "$stage/share/ai-houkai"
 
-    install -m 0755 "$bin_dir/ai-houkai-mcp" "$stage/bin/ai-houkai-mcp"
-    install -m 0755 "$bin_dir/houkai"        "$stage/bin/houkai"
+    install -m 0755 "$bin_dir/ai-houkai-mcp"   "$stage/bin/ai-houkai-mcp"
+    install -m 0755 "$bin_dir/ai-houkai-serve" "$stage/bin/ai-houkai-serve"
+    install -m 0755 "$bin_dir/houkai"          "$stage/bin/houkai"
     install -m 0644 "$REPO_ROOT/packaging/etc/ai-houkai/config.toml" \
         "$stage/share/ai-houkai/config.toml.example"
 

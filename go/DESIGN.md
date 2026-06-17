@@ -22,24 +22,27 @@ see [README.md](README.md); for the original Python design see
 ## Component layout
 
 ```
-cmd/ai-houkai-mcp ──┐
-                    ├─► cli.ResolveConfig ──► embed.Embedder
-cmd/houkai ─────────┘                      └─► vector.Backend  ──► memory.MemoryStore
+cmd/ai-houkai-mcp ───┐
+cmd/ai-houkai-serve ─┤── cli.ResolveConfig ──► embed.Embedder
+cmd/houkai ──────────┘                      └─► vector.Backend  ──► memory.MemoryStore
                                                                         │
                                                                         ├─► decay.Engine
                                                                         ├─► reflect.Engine   (+ summarizers)
                                                                         ├─► maintenance.Daemon
                                                                         ├─► tui.Model        (Bubble Tea browser)
-                                                                        └─► mcpserver.New    (MCP tools)
+                                                                        ├─► mcpserver.New    (MCP tools)
+                                                                        └─► httpserver.New   (JSON HTTP/REST API)
 ```
 
 Side packages: `internal/ingest` (pure chunking functions for
-`houkai ingest`) and `internal/installer` (MCP-client config patchers) have
-no store dependency at all.
+`houkai ingest`), `internal/installer` (MCP-client config patchers) and
+`internal/timeparse` (lenient epoch/ISO/relative-span parsing shared by the
+CLI, MCP and HTTP front-ends) have no store dependency at all.
 
-The two `cmd/` entry points are deliberately thin: each builds the same
-`MemoryStore` object then attaches it to a front-end (MCP server or cobra
-CLI).
+The three `cmd/` entry points are deliberately thin: each builds the same
+`MemoryStore` object then attaches it to a front-end (MCP server, HTTP server,
+or cobra CLI). `houkai serve` reuses the CLI-selected store as a fourth path
+into `httpserver`.
 
 ### `internal/memory` — domain core
 
@@ -188,10 +191,17 @@ first thing that misbehaves.
 
 ### `internal/decay` — pruning
 
-`Engine.Score(m) = importance · exp(-λ · days_since_last_access)`. Memories
-below `MinScore` are deleted (`Prune`), unless their type is in
-`ProtectTypes` (default `[procedural]`). The engine takes a narrow
-`Storable` interface (`ListRecent` + `Forget`) so it's trivially testable.
+`Engine.Score(m) = importance · exp(-λ · days_since_last_access) ·
+reinforcement`, where `reinforcement = 1 + FrequencyWeight · ln(1 +
+access_count)`. With the default `FrequencyWeight = 0` the factor is exactly
+`1.0` (recency-only behaviour); raising it makes frequently-recalled memories
+age out more slowly than untouched ones of equal importance and age — the score
+can then exceed `importance`, and `MinScore` is compared against the reinforced
+value. Memories below `MinScore` are deleted (`Prune`), unless their type is in
+`ProtectTypes` (default `[procedural]`). The engine takes a narrow `Storable`
+interface (`ListRecent` + `Forget`) so it's trivially testable. Exposed via
+`houkai prune --frequency-weight`, the `maintenance_tick` MCP tool, and
+`maintenance.Config`.
 
 ### `internal/reflect` — reflection
 
@@ -267,7 +277,11 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 
 The tool surface is at parity with the Python version. `export` / `import`
 take a server-local file path — there's no streaming over MCP yet, and
-binary payloads (the gzipped bytes) are kept off the JSON wire.
+binary payloads (the gzipped bytes) are kept off the JSON wire. `recall` /
+`recall_pack` accept the `source` / `since` / `until` metadata filters
+(`since`/`until` parsed through `internal/timeparse`, so they take epoch
+seconds, an ISO date/datetime, or a relative span like `"7d"`), and
+`maintenance_tick` accepts `frequency_weight` for recall reinforcement.
 
 `remember` treats a missing `importance` as 0 = unset, so the store's
 `ImportanceFn` (enabled via `default_importance = "auto"` or
@@ -275,6 +289,26 @@ binary payloads (the gzipped bytes) are kept off the JSON wire.
 resolved `importance`. `maintenance_tick`'s reflection step uses the
 summarizer spec injected at startup via `SetSummarizerSpec` (from the
 `summarizer` config key).
+
+### `internal/httpserver` — JSON HTTP/REST API
+
+A standard-library front-end (`net/http` only — no router dependency) over the
+same `MemoryStore`, for clients that cannot speak MCP. `Server.Handler()`
+registers routes on a `http.ServeMux` using Go 1.22+ method+path patterns
+(`GET /memories/{id}`), so a path that matches a row but not the verb yields
+`405` and an unmatched path `404` for free. Each handler has the signature
+`func(*http.Request) (status int, payload any, error)`; the `wrap` adapter
+renders an `*httpError` with its status and any other error as a `500`, so a
+single bad request never takes the server down. A middleware layer adds optional
+bearer-token auth (every route except `/health`), `panic`→`500` recovery, and a
+buffering `captureWriter` that re-renders ServeMux's plain-text `404`/`405`
+pages as the same `{"error": …}` JSON envelope. Bodies are capped at 4 MiB.
+`since`/`until` query and body values flow through `internal/timeparse`.
+
+Exposed two ways, symmetric with the MCP server: `houkai serve` (reuses the
+CLI-selected store, sets actor `"http"`) and the env-configured
+`cmd/ai-houkai-serve` binary (`AI_HOUKAI_HTTP_{HOST,PORT,TOKEN}`). Binds
+`127.0.0.1` by default. Driven in tests by a real `httptest.Server`.
 
 ### `internal/cli` — CLI front-end
 
@@ -422,9 +456,6 @@ install or Homebrew tap distribution:
 - **No LLM inference inside the binary.** Embeddings only, via HTTP. Adding
   generation would mean dragging in an inference runtime, which contradicts
   goal #1.
-- **No HTTP API.** MCP-over-stdio + CLI cover both interactive and
-  programmatic use. An HTTP server would be a fourth front-end on the same
-  `MemoryStore` and is easy to add later — but isn't required today.
 - **No multi-user / multi-tenant store.** Single user per data directory.
   Use the `collection` knob to namespace within one user.
 - **No binary compatibility with the Python store.** Use the portable

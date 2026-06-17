@@ -121,6 +121,7 @@ func NewRootCmd() *cobra.Command {
 		newBackupCmd(),
 		newStatsCmd(),
 		newIngestCmd(),
+		newServeCmd(),
 		newCollectionsCmd(),
 		newTuiCmd(),
 		newJournalCmd(),

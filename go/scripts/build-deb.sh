@@ -90,8 +90,9 @@ for deb_arch in "${DEB_ARCHS[@]}"; do
     install -d "$pkg_root/etc/ai-houkai"
 
     # ---- binaries --------------------------------------------------------- #
-    install -m 0755 "$bin_dir/ai-houkai-mcp" "$pkg_root/usr/bin/ai-houkai-mcp"
-    install -m 0755 "$bin_dir/houkai"        "$pkg_root/usr/bin/houkai"
+    install -m 0755 "$bin_dir/ai-houkai-mcp"   "$pkg_root/usr/bin/ai-houkai-mcp"
+    install -m 0755 "$bin_dir/ai-houkai-serve" "$pkg_root/usr/bin/ai-houkai-serve"
+    install -m 0755 "$bin_dir/houkai"          "$pkg_root/usr/bin/houkai"
 
     # ---- default config (marked as conffile below) ----------------------- #
     install -m 0644 "$REPO_ROOT/packaging/etc/ai-houkai/config.toml" \
