@@ -400,6 +400,15 @@ def build_handler(
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # The stdlib default listen backlog is 5, so a burst of simultaneous
+    # connections gets reset by the kernel (ECONNRESET) before accept(). Raise
+    # it so concurrent clients are queued rather than dropped. daemon_threads
+    # lets the process exit promptly without joining in-flight workers.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def make_server(
     *,
     host: str = "127.0.0.1",
@@ -418,7 +427,7 @@ def make_server(
     if store is None:
         store = MemoryStore(path=path, collection=collection, actor="http")
     handler = build_handler(store, auth_token=auth_token)
-    return ThreadingHTTPServer((host, port), handler)
+    return _Server((host, port), handler)
 
 
 def serve(
