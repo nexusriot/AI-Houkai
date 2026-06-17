@@ -14,8 +14,11 @@ from rich.table import Table
 
 # Decay defaults mirror DecayEngine.__init__ so the health view is consistent
 # with the engine's behaviour when no custom engine has been constructed.
-_DEFAULT_DECAY_RATE = 0.1
-_DEFAULT_MIN_SCORE  = 0.05
+_DEFAULT_DECAY_RATE     = 0.1
+_DEFAULT_MIN_SCORE      = 0.05
+# DecayEngine.prune() never removes these types regardless of score, so they
+# must not be reported as "at risk" either.
+_DEFAULT_PROTECT_TYPES  = ("procedural",)
 
 _BUCKET_LABELS = ["0.0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"]
 
@@ -113,8 +116,12 @@ def _compute_health(
     for _, s in scored:
         hist[_bucket(s)] += 1
 
-    # At-risk: below prune threshold but not yet pruned (same condition as DecayEngine.prune)
-    at_risk = [m for m, s in scored if s < at_risk_threshold]
+    # At-risk: below prune threshold AND not a protected type — this matches
+    # DecayEngine.prune(), which skips protect_types regardless of score.
+    at_risk = [
+        m for m, s in scored
+        if s < at_risk_threshold and m.type not in _DEFAULT_PROTECT_TYPES
+    ]
 
     # Never recalled
     never_recalled = [m for m in active if m.access_count == 0]
