@@ -34,6 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
@@ -43,8 +44,6 @@ COLLECTION = "func"
 # process pays a one-off cost to load the sentence-transformers model.
 _CLI_TIMEOUT = 180
 
-
-# ── CLI helpers ───────────────────────────────────────────────────────────────
 
 def _have_cli() -> bool:
     return shutil.which("houkai") is not None and shutil.which("ai-houkai-serve") is not None
@@ -314,6 +313,82 @@ def test_http_concurrent_links_no_lost_updates(http_server):
         f"lost {n - len(hub_after['links'])} of {n} concurrent links — "
         "store access is not serialised"
     )
+
+
+def test_http_stress_concurrent_add_and_fetch(http_server):
+    """Stress: hammer the server with many concurrent writers *and* readers at
+    once, then concurrently fetch every item back.
+
+    Asserts the store stays consistent under load — every add lands exactly
+    once (unique id, server count matches), reads running alongside writes never
+    error, and each item is individually retrievable with its exact text. Guards
+    against lost writes, dropped connections and cross-item corruption.
+    """
+    base = http_server
+    n_items = 120
+    n_workers = 16
+
+    def _text(i: int) -> str:
+        return f"stress item {i} marker{i:05d}"
+
+    errors: list[str] = []
+    ids: dict[int, str] = {}
+    ids_lock = threading.Lock()
+
+    def add(i: int) -> None:
+        try:
+            status, mem = _http("POST", f"{base}/memories",
+                                {"text": _text(i), "type": "semantic",
+                                 "tags": ["stress"]})
+            if status != 201 or not mem.get("stored"):
+                errors.append(f"add {i}: status {status} {mem}")
+                return
+            with ids_lock:
+                ids[i] = mem["id"]
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"add {i}: {type(exc).__name__}: {exc}")
+
+    def read_noise(_: int) -> None:
+        # Readers running *concurrently* with the writers. /recall also bumps
+        # access_count (a read-modify-write), so this exercises the store lock
+        # under mixed read/write load. None of it may error.
+        try:
+            _http("GET", f"{base}/stats")
+            _http("POST", f"{base}/recall", {"query": "stress item", "k": 5})
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"read: {type(exc).__name__}: {exc}")
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [pool.submit(add, i) for i in range(n_items)]
+        futures += [pool.submit(read_noise, i) for i in range(n_items // 2)]
+        for f in as_completed(futures):
+            f.result()
+
+    assert not errors, errors[:10]
+    assert len(ids) == n_items, f"only {len(ids)} of {n_items} adds recorded an id"
+    assert len(set(ids.values())) == n_items, "duplicate ids returned across adds"
+
+    # Stored exactly once — the server's own count agrees.
+    _, stats = _http("GET", f"{base}/stats")
+    assert stats["count"] == n_items, stats
+
+    fetch_errors: list[str] = []
+
+    def fetch(item: tuple[int, str]) -> None:
+        i, mid = item
+        try:
+            status, got = _http("GET", f"{base}/memories/{mid}")
+            if status != 200:
+                fetch_errors.append(f"fetch {mid}: status {status}")
+            elif got.get("text") != _text(i):
+                fetch_errors.append(f"fetch {mid}: wrong text {got.get('text')!r}")
+        except Exception as exc:  # pragma: no cover
+            fetch_errors.append(f"fetch {mid}: {type(exc).__name__}: {exc}")
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(fetch, list(ids.items())))
+
+    assert not fetch_errors, fetch_errors[:10]
 
 
 if __name__ == "__main__":  # allow `python functional_tests/test_e2e.py`

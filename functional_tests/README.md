@@ -8,8 +8,10 @@ surface** as a black box:
   store, covering the full lifecycle: `remember → recall → pack → link →
   neighbors → export → import → supersede → list → prune → stats → journal`;
 - the **`ai-houkai-serve` HTTP server** — started as its own process and hit
-  over a real socket, including a **concurrency regression test** that fires 25
-  parallel `POST /links` and asserts none are lost.
+  over a real socket, including a **concurrency regression test** (25 parallel
+  `POST /links`, none lost) and a **stress test** (120 items added by 16
+  concurrent workers while readers run in parallel, then every item fetched back
+  concurrently).
 
 They also lock in two fixed bugs:
 
