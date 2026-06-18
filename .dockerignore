@@ -1,0 +1,14 @@
+# Keep the build context small and reproducible.
+.venv/
+.git/
+.chroma/
+dist/
+build/
+*.egg-info/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# The Go port is built separately and not needed for the Python tests.
+go/

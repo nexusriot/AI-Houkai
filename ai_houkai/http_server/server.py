@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -311,6 +312,14 @@ def build_handler(
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request-handler class bound to *store* and an optional token."""
 
+    # ThreadingHTTPServer dispatches each request on its own thread, but
+    # MemoryStore mutations (link/unlink/supersede and the access-count bump in
+    # _touch) are read-modify-write against ChromaDB and so race under
+    # concurrency — concurrent writers clobber each other's updates. Serialise
+    # all store access through one lock; ChromaDB already serialises internally,
+    # so the throughput cost is negligible.
+    store_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "AIHoukai-HTTP"
         protocol_version = "HTTP/1.1"
@@ -368,7 +377,8 @@ def build_handler(
                     continue
                 try:
                     body = self._read_body() if needs_body else {}
-                    status, payload = fn(store, match, query, body)
+                    with store_lock:
+                        status, payload = fn(store, match, query, body)
                     self._send(status, payload)
                 except HttpError as e:
                     self._send(e.status, {"error": e.message})
@@ -390,6 +400,15 @@ def build_handler(
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # The stdlib default listen backlog is 5, so a burst of simultaneous
+    # connections gets reset by the kernel (ECONNRESET) before accept(). Raise
+    # it so concurrent clients are queued rather than dropped. daemon_threads
+    # lets the process exit promptly without joining in-flight workers.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def make_server(
     *,
     host: str = "127.0.0.1",
@@ -408,7 +427,7 @@ def make_server(
     if store is None:
         store = MemoryStore(path=path, collection=collection, actor="http")
     handler = build_handler(store, auth_token=auth_token)
-    return ThreadingHTTPServer((host, port), handler)
+    return _Server((host, port), handler)
 
 
 def serve(

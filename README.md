@@ -199,6 +199,33 @@ print(pack.text)          # "## Relevant memory\n- (semantic) Python's GIL …"
 print(pack.used_tokens, "/", pack.budget, "truncated:", pack.truncated)
 ```
 
+### Async usage
+
+`AsyncMemoryStore` is a coroutine wrapper around `MemoryStore` for use inside an
+event loop. Every method offloads the blocking ChromaDB call to a dedicated
+**single-threaded** executor, so the event loop stays unblocked and concurrent
+callers are serialised onto one thread (ChromaDB's SQLite backend is not safe
+under concurrent writes).
+
+```python
+from ai_houkai.memory_system import AsyncMemoryStore
+
+async with AsyncMemoryStore(path=".chroma") as store:
+    mem  = await store.remember("Python favours duck typing.", type="semantic")
+    hits = await store.recall("typing", k=3)
+    pack = await store.recall_pack("typing", token_budget=600)
+```
+
+The constructor takes the same arguments as `MemoryStore`. Use `await store.aclose()`
+(or the `async with` block) to flush and shut the executor down; `store.close()`
+is the synchronous equivalent for non-async teardown. The underlying sync store
+is reachable as `store.sync`, and any not-yet-wrapped method can be offloaded via
+`await store.run(store.sync.<method>, ...)`.
+
+> **Note:** the constructor itself runs synchronously — building the store loads
+> the embedding model, so construct it before entering your hot path (or wrap the
+> construction in `asyncio.to_thread`) rather than on a latency-sensitive request.
+
 ---
 
 ## CLI — `houkai`
@@ -428,7 +455,21 @@ semantic search, `n` to walk the link graph from the selected memory
 ```bash
 houkai stats                 # rich table
 houkai stats --format json   # machine-readable
+
+# Detailed health report: decay-score histogram, at-risk / stale / never-recalled
+# counts, episodic clusters ripe for reflection, link density and top-recalled.
+houkai stats --health
+houkai stats --health --stale-days 14 --decay-rate 0.05
+houkai stats --health --format json   # health block nested under "health"
 ```
+
+The health view scores each active memory with the same exponential decay
+formula as the engine (`importance × exp(-decay_rate × days_idle)`). **At-risk**
+counts active, non-protected memories whose score has fallen below the prune
+threshold (`0.05`) — i.e. those `houkai prune` would remove. `procedural`
+memories are protected and never counted as at-risk, matching `DecayEngine`'s
+`protect_types`. `--decay-rate` and `--stale-days` only affect this report; they
+do not mutate the store.
 
 ### Output formats
 
@@ -490,6 +531,14 @@ curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
 request must carry `Authorization: Bearer <secret>`; `/health` stays open for
 liveness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
 (or `AI_HOUKAI_HTTP_HOST`) only behind a trusted network or reverse proxy.
+
+**Concurrency:** the server is multi-threaded but serialises all store access
+through a single lock, because `MemoryStore` writes (links, supersede, the
+access-count bump on every recall) are read-modify-write and would otherwise
+race under concurrent requests. ChromaDB already serialises internally, so the
+lock costs little; for true parallelism run multiple processes against separate
+stores. (`AsyncMemoryStore` gives the same guarantee in-process via a
+single-threaded executor.)
 
 ---
 

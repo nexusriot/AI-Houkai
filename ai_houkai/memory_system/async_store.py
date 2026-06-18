@@ -1,0 +1,331 @@
+"""AsyncMemoryStore — async wrapper around MemoryStore.
+
+All blocking ChromaDB operations run in a single-threaded
+``ThreadPoolExecutor`` so concurrent async callers are serialised and the
+store never sees races.  The executor is owned by the instance and shut down
+in ``close()`` / ``aclose()`` / ``async with``.
+
+Usage::
+
+    from ai_houkai.memory_system import AsyncMemoryStore
+
+    async with AsyncMemoryStore(path=".chroma") as store:
+        mem = await store.remember("Python favours duck typing.", type="semantic")
+        hits = await store.recall("typing", k=3)
+
+Or without async-context-manager::
+
+    store = AsyncMemoryStore(path=".chroma")
+    mem = await store.remember("hello")
+    await store.aclose()
+
+The underlying ``MemoryStore`` is accessible via ``store.sync`` for
+operations that have not yet been wrapped (pass-through via ``run()``)::
+
+    result = await store.run(store.sync.export, "/tmp/backup.ahkai")
+"""
+
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Iterable, Literal, TypeVar
+
+from .store import (
+    Conflict,
+    ConflictFn,
+    ExpandSpec,
+    ExportSummary,
+    Graph,
+    HybridWeights,
+    ImportSummary,
+    Memory,
+    MemoryStore,
+    MemoryType,
+    PackResult,
+)
+from .journal import JournalEntry
+
+_T = TypeVar("_T")
+
+
+class AsyncMemoryStore:
+    """Async wrapper around :class:`MemoryStore`.
+
+    Every public method is a coroutine that offloads the underlying
+    synchronous ChromaDB call to a dedicated single-threaded executor,
+    keeping the event loop unblocked.
+    """
+
+    def __init__(
+        self,
+        path: str = "./.chroma",
+        collection: str = "ai_houkai",
+        embedding_model: str = "all-MiniLM-L6-v2",
+        *,
+        conflict_policy: Literal["ignore", "warn", "supersede", "raise"] = "ignore",
+        conflict_threshold: float = 0.80,
+        contradiction_fn: ConflictFn | None = None,
+        hybrid_weights: HybridWeights | None = None,
+        importance_fn: "Callable[[str, str, list[str]], float] | None" = None,
+        actor: str = "lib",
+        journal_enabled: bool = True,
+        journal_path: str | None = None,
+        journal_rotate_mb: int = 64,
+        journal_keep_days: int = 90,
+    ) -> None:
+        self.sync = MemoryStore(
+            path=path,
+            collection=collection,
+            embedding_model=embedding_model,
+            conflict_policy=conflict_policy,
+            conflict_threshold=conflict_threshold,
+            contradiction_fn=contradiction_fn,
+            hybrid_weights=hybrid_weights,
+            importance_fn=importance_fn,
+            actor=actor,
+            journal_enabled=journal_enabled,
+            journal_path=journal_path,
+            journal_rotate_mb=journal_rotate_mb,
+            journal_keep_days=journal_keep_days,
+        )
+        # Single thread: ChromaDB (SQLite) is not thread-safe under writes.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="houkai")
+
+
+    async def aclose(self) -> None:
+        """Flush pending work and release resources."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.sync.client.close)
+        self._executor.shutdown(wait=True)
+
+    def close(self) -> None:
+        """Synchronous close — use in non-async teardown."""
+        self.sync.client.close()
+        self._executor.shutdown(wait=True)
+
+    async def __aenter__(self) -> "AsyncMemoryStore":
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.aclose()
+
+
+    async def run(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run any synchronous callable in the store's executor and await it.
+
+        Use this to call sync-only methods not yet wrapped below::
+
+            await store.run(store.sync.export, "/tmp/out.ahkai")
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: fn(*args, **kwargs),
+        )
+
+
+    async def remember(
+        self,
+        text: str,
+        type: MemoryType = "semantic",
+        tags: Iterable[str] = (),
+        importance: float | None = None,
+        source: str | None = None,
+        *,
+        polarity: int = 0,
+        on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
+        contradiction_fn: ConflictFn | None = None,
+    ) -> Memory:
+        return await self.run(
+            self.sync.remember,
+            text,
+            type,
+            tags,
+            importance,
+            source,
+            polarity=polarity,
+            on_conflict=on_conflict,
+            contradiction_fn=contradiction_fn,
+        )
+
+    async def forget(self, memory_id: str) -> bool:
+        return await self.run(self.sync.forget, memory_id)
+
+    async def recall(
+        self,
+        query: str,
+        k: int = 5,
+        type: MemoryType | None = None,
+        tag: str | None = None,
+        min_importance: float | None = None,
+        *,
+        source: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        mode: Literal["semantic", "hybrid"] = "semantic",
+        weights: HybridWeights | None = None,
+        overfetch: int = 4,
+        expand: ExpandSpec | None = None,
+        include_superseded: bool = False,
+    ) -> list[tuple[Memory, float]]:
+        return await self.run(
+            self.sync.recall,
+            query,
+            k,
+            type,
+            tag,
+            min_importance,
+            source=source,
+            since=since,
+            until=until,
+            mode=mode,
+            weights=weights,
+            overfetch=overfetch,
+            expand=expand,
+            include_superseded=include_superseded,
+        )
+
+    async def recall_pack(
+        self,
+        query: str,
+        *,
+        token_budget: int = 800,
+        type: MemoryType | None = None,
+        tag: str | None = None,
+        min_importance: float | None = None,
+        source: str | None = None,
+        since: float | None = None,
+        until: float | None = None,
+        mode: Literal["semantic", "hybrid"] = "hybrid",
+        weights: HybridWeights | None = None,
+        expand: ExpandSpec | None = None,
+        include_superseded: bool = False,
+        max_items: int = 50,
+        token_counter: Callable[[str], int] | None = None,
+        header: str = "## Relevant memory",
+    ) -> PackResult:
+        return await self.run(
+            self.sync.recall_pack,
+            query,
+            token_budget=token_budget,
+            type=type,
+            tag=tag,
+            min_importance=min_importance,
+            source=source,
+            since=since,
+            until=until,
+            mode=mode,
+            weights=weights,
+            expand=expand,
+            include_superseded=include_superseded,
+            max_items=max_items,
+            token_counter=token_counter,
+            header=header,
+        )
+
+    async def list_recent(
+        self,
+        limit: int = 20,
+        *,
+        include_superseded: bool = False,
+    ) -> list[Memory]:
+        return await self.run(
+            self.sync.list_recent,
+            limit,
+            include_superseded=include_superseded,
+        )
+
+    async def count(self) -> int:
+        return await self.run(self.sync.count)
+
+
+    async def link(self, src_id: str, dst_id: str, rel: str = "related") -> None:
+        await self.run(self.sync.link, src_id, dst_id, rel)
+
+    async def unlink(self, src_id: str, dst_id: str, rel: str | None = None) -> int:
+        return await self.run(self.sync.unlink, src_id, dst_id, rel)
+
+    async def neighbors(
+        self,
+        memory_id: str,
+        *,
+        rel: str | None = None,
+        direction: Literal["out", "in", "both"] = "both",
+        depth: int = 1,
+    ) -> list[tuple[Memory, str]]:
+        return await self.run(
+            self.sync.neighbors,
+            memory_id,
+            rel=rel,
+            direction=direction,
+            depth=depth,
+        )
+
+    async def subgraph(
+        self,
+        memory_ids: Iterable[str],
+        *,
+        depth: int = 1,
+    ) -> Graph:
+        return await self.run(self.sync.subgraph, memory_ids, depth=depth)
+
+
+    async def find_conflicts(
+        self,
+        memory_id: str | None = None,
+        *,
+        threshold: float | None = None,
+    ) -> list[Conflict]:
+        return await self.run(
+            self.sync.find_conflicts,
+            memory_id,
+            threshold=threshold,
+        )
+
+    async def supersede(self, old_id: str, new_id: str) -> None:
+        await self.run(self.sync.supersede, old_id, new_id)
+
+    async def restore(self, memory_id: str) -> bool:
+        return await self.run(self.sync.restore, memory_id)
+
+
+    async def export(
+        self,
+        path: str,
+        *,
+        include_vectors: bool = True,
+        include_superseded: bool = False,
+        types: Iterable[MemoryType] | None = None,
+        tags: Iterable[str] | None = None,
+        since: float | None = None,
+    ) -> ExportSummary:
+        return await self.run(
+            self.sync.export,
+            path,
+            include_vectors=include_vectors,
+            include_superseded=include_superseded,
+            types=types,
+            tags=tags,
+            since=since,
+        )
+
+    async def import_(
+        self,
+        path: str,
+        *,
+        on_conflict: Literal["skip", "overwrite", "rename", "error"] = "skip",
+        regenerate_vectors: bool = False,
+        dry_run: bool = False,
+    ) -> ImportSummary:
+        return await self.run(
+            self.sync.import_,
+            path,
+            on_conflict=on_conflict,
+            regenerate_vectors=regenerate_vectors,
+            dry_run=dry_run,
+        )
+
+
+    async def undo(self, entry: JournalEntry) -> bool:
+        return await self.run(self.sync.undo, entry)

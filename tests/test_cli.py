@@ -281,6 +281,70 @@ def test_edit_text_change_preserves_id_and_links(tmp_path, monkeypatch):
         store.client.close()
 
 
+def test_edit_preserves_markdown_headings_in_body(tmp_path, monkeypatch):
+    """A '#'-prefixed line in the memory body is content, not an editor comment:
+    editing must not strip markdown headings from the text (regression — the
+    old code filtered '#' lines across the whole file, including the body)."""
+    store_path = str(tmp_path / "chroma")
+    a_id = _first_uuid(_invoke(["remember", "Plain note to be replaced"], store_path).output)
+
+    new_text = "# Deploy guide\n\nRun make release.\n## Notes\nNever on a Friday."
+    editor = _make_fake_editor(tmp_path, new_text)
+    monkeypatch.setenv("EDITOR", editor)
+
+    res = _invoke(["edit", a_id], store_path)
+    assert res.exit_code == 0, res.output
+
+    store = MemoryStore(path=store_path, collection="cli_test")
+    try:
+        a = store._get_by_id(a_id)
+        assert a is not None
+        assert a.text == new_text          # nothing stripped
+        assert "# Deploy guide" in a.text
+        assert "## Notes" in a.text
+    finally:
+        store.client.close()
+
+
+def test_bump_accepts_negative_delta(tmp_path):
+    """`bump <id> -0.1` must parse as the delta argument, not be rejected as an
+    unknown option (regression — Click treated the leading '-' as a flag)."""
+    store_path = str(tmp_path / "chroma")
+    mem_id = _first_uuid(
+        _invoke(["remember", "Tweak my importance", "--importance", "0.5"], store_path).output
+    )
+    res = _invoke(["bump", mem_id[:8], "-0.1"], store_path)
+    assert res.exit_code == 0, res.output
+    assert "0.50 → 0.40" in res.output
+
+
+def test_journal_tail_exposes_raw_ts(tmp_path):
+    """`journal tail` must print the raw epoch ts so `journal show`/`undo` —
+    which take a float ts — are usable from its output (regression — tail only
+    rendered a formatted datetime, leaving no way to obtain the ts)."""
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "An auditable memory"], store_path)
+
+    store = MemoryStore(path=store_path, collection="cli_test")
+    try:
+        ts = next(e.ts for e in store.journal.read())
+    finally:
+        store.client.close()
+
+    # Wide terminal so rich doesn't truncate the ts column.
+    tail = runner.invoke(
+        app,
+        ["--store", store_path, "--collection", "cli_test", "journal", "tail"],
+        env={"COLUMNS": "200"},
+    )
+    assert tail.exit_code == 0, tail.output
+    assert f"{ts:.3f}" in tail.output      # raw epoch printed
+
+    show = _invoke(["journal", "show", f"{ts:.3f}"], store_path)
+    assert show.exit_code == 0, show.output
+    assert "remember" in show.output
+
+
 def test_conflicts_interactive_skips_resolved_memories(tmp_path):
     """Interactive conflict resolution must not crash when a memory resolved in
     one pair reappears in a later pair (regression — the old code called

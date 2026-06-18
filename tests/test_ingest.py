@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
 from typer.testing import CliRunner
 
+from ai_houkai.cli import output as out
 from ai_houkai.cli.main import app
 from ai_houkai.memory_system.ingest import chunk_text
 
 runner = CliRunner()
+
+
+def _piped_stdin(monkeypatch) -> None:
+    """Simulate stdin being a consumed pipe (not a terminal)."""
+    monkeypatch.setattr(out.sys, "stdin",
+                        type("S", (), {"isatty": lambda self: False})())
+
+
+def _input_must_not_run(*a):
+    raise AssertionError("input() must not be called when stdin is a pipe")
 
 
 def _invoke(args, store_path, collection="cli_test", input=None):
@@ -135,6 +147,44 @@ class TestIngestCommand:
             ["ingest", str(tmp_path / "nope.txt")], str(tmp_path / "chroma")
         )
         assert result.exit_code == 1
+
+
+class TestConfirmViaTty:
+    """out.confirm(use_tty=True): when input arrived on stdin (e.g. a piped
+    `ingest`), stdin is at EOF, so input() would raise EOFError and silently
+    abort. confirm must prompt on the controlling terminal instead, and fail
+    loudly (not silently) when there is no terminal. (Regression.)"""
+
+    def test_reads_yes_from_terminal_when_stdin_piped(self, monkeypatch):
+        _piped_stdin(monkeypatch)
+        monkeypatch.setattr(out, "open",
+                            lambda *a, **k: io.StringIO("y\n"), raising=False)
+        monkeypatch.setattr("builtins.input", _input_must_not_run)
+        assert out.confirm("Store?", use_tty=True) is True
+
+    def test_reads_no_from_terminal(self, monkeypatch):
+        _piped_stdin(monkeypatch)
+        monkeypatch.setattr(out, "open",
+                            lambda *a, **k: io.StringIO("n\n"), raising=False)
+        monkeypatch.setattr("builtins.input", _input_must_not_run)
+        assert out.confirm("Store?", use_tty=True) is False
+
+    def test_no_terminal_returns_false_without_crash(self, monkeypatch):
+        _piped_stdin(monkeypatch)
+
+        def no_tty(*a, **k):
+            raise OSError("no controlling terminal")
+
+        monkeypatch.setattr(out, "open", no_tty, raising=False)
+        # Must not raise; declines rather than silently EOF-aborting.
+        assert out.confirm("Store?", use_tty=True) is False
+
+    def test_yes_flag_short_circuits(self, monkeypatch):
+        def boom(*a, **k):
+            raise AssertionError("--yes must not touch the terminal")
+
+        monkeypatch.setattr(out, "open", boom, raising=False)
+        assert out.confirm("Store?", yes=True, use_tty=True) is True
 
 
 class TestCollectionsCommands:

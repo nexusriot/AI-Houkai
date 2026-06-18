@@ -96,9 +96,12 @@ def _openai_summarizer(model: str) -> Summarizer:
             "openai SDK is required for an 'openai:' summarizer — "
             'pip install "ai-houkai[openai]"'
         )
-    client = OpenAI()
 
     def summarize(memories: "list[Memory]") -> str:
+        # Built at call time so a missing/invalid key surfaces inside the
+        # _with_fallback guard (degrade to extractive) rather than crashing
+        # build_summarizer() — e.g. in the unattended maintenance daemon.
+        client = OpenAI()
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": render_prompt(memories)}],
@@ -114,9 +117,10 @@ def _anthropic_summarizer(model: str) -> Summarizer:
             "anthropic SDK is required for an 'anthropic:' summarizer — "
             'pip install "ai-houkai[claude]"'
         )
-    client = Anthropic()
 
     def summarize(memories: "list[Memory]") -> str:
+        # Built at call time — see _openai_summarizer for the rationale.
+        client = Anthropic()
         resp = client.messages.create(
             model=model,
             max_tokens=_MAX_TOKENS,
