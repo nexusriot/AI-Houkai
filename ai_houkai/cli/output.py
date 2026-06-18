@@ -188,9 +188,31 @@ def _mem_to_dict(mem: Memory) -> dict[str, Any]:
     }
 
 
-def confirm(prompt: str, *, yes: bool = False) -> bool:
+def confirm(prompt: str, *, yes: bool = False, use_tty: bool = False) -> bool:
     if yes:
         return True
+    # When the data came in on stdin (e.g. a piped `ingest`), stdin is at EOF,
+    # so input() would raise EOFError and we'd silently abort. Prompt on the
+    # controlling terminal instead; if there is none, tell the user to pass
+    # --yes rather than failing without explanation.
+    if use_tty and not sys.stdin.isatty():
+        try:
+            tty = open("/dev/tty")
+        except OSError:
+            print(
+                f"{prompt} — input was piped and no terminal is available "
+                "to confirm; re-run with --yes.",
+                file=sys.stderr,
+            )
+            return False
+        try:
+            print(f"{prompt} [y/N] ", end="", file=sys.stderr, flush=True)
+            answer = tty.readline().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        finally:
+            tty.close()
+        return answer in ("y", "yes")
     try:
         answer = input(f"{prompt} [y/N] ").strip().lower()
     except (EOFError, KeyboardInterrupt):

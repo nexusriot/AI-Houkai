@@ -547,7 +547,11 @@ class MemoryStore:
         if k <= 0 or count == 0:
             return []
 
-        n_fetch = k if (mode == "semantic" and include_superseded) else min(k * overfetch, count)
+        # The fast path (fetch exactly k) is only safe when no post-query
+        # filtering can drop rows: the `tag` filter in _semantic_filter always
+        # runs, so it needs the overfetch headroom too.
+        no_post_filter = mode == "semantic" and include_superseded and tag is None
+        n_fetch = k if no_post_filter else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
 
         where = _build_where(type, min_importance, source, since, until)

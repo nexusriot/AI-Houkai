@@ -44,7 +44,8 @@ def ingest(
 
     # (label, text) per input
     inputs: list[tuple[str, str]] = []
-    if not files or [str(f) for f in files] == ["-"]:
+    from_stdin = not files or [str(f) for f in files] == ["-"]
+    if from_stdin:
         body = sys.stdin.read()
         if not body.strip():
             typer.echo("Error: no input provided", err=True)
@@ -89,7 +90,7 @@ def ingest(
         typer.echo("Dry-run — nothing written.")
         return
 
-    if not out.confirm(f"Store {len(plan)} memories?", yes=yes):
+    if not out.confirm(f"Store {len(plan)} memories?", yes=yes, use_tty=from_stdin):
         typer.echo("Aborted.")
         return
 

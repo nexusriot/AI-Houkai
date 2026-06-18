@@ -92,7 +92,6 @@ class AsyncMemoryStore:
         # Single thread: ChromaDB (SQLite) is not thread-safe under writes.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="houkai")
 
-    # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def aclose(self) -> None:
         """Flush pending work and release resources."""
@@ -111,7 +110,6 @@ class AsyncMemoryStore:
     async def __aexit__(self, *_: Any) -> None:
         await self.aclose()
 
-    # ── generic offload helper ───────────────────────────────────────────────
 
     async def run(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run any synchronous callable in the store's executor and await it.
@@ -126,7 +124,6 @@ class AsyncMemoryStore:
             lambda: fn(*args, **kwargs),
         )
 
-    # ── core CRUD ────────────────────────────────────────────────────────────
 
     async def remember(
         self,
@@ -242,7 +239,6 @@ class AsyncMemoryStore:
     async def count(self) -> int:
         return await self.run(self.sync.count)
 
-    # ── links ────────────────────────────────────────────────────────────────
 
     async def link(self, src_id: str, dst_id: str, rel: str = "related") -> None:
         await self.run(self.sync.link, src_id, dst_id, rel)
@@ -274,7 +270,6 @@ class AsyncMemoryStore:
     ) -> Graph:
         return await self.run(self.sync.subgraph, memory_ids, depth=depth)
 
-    # ── conflict & lifecycle ─────────────────────────────────────────────────
 
     async def find_conflicts(
         self,
@@ -294,7 +289,6 @@ class AsyncMemoryStore:
     async def restore(self, memory_id: str) -> bool:
         return await self.run(self.sync.restore, memory_id)
 
-    # ── import / export ──────────────────────────────────────────────────────
 
     async def export(
         self,
@@ -332,7 +326,6 @@ class AsyncMemoryStore:
             dry_run=dry_run,
         )
 
-    # ── journal ──────────────────────────────────────────────────────────────
 
     async def undo(self, entry: JournalEntry) -> bool:
         return await self.run(self.sync.undo, entry)

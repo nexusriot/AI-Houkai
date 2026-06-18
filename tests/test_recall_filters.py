@@ -85,6 +85,24 @@ class TestRecallFilters:
         assert len(hits) == 1
         assert hits[0][0].type == "semantic"
 
+    def test_semantic_tag_with_include_superseded_not_underfetched(self, store):
+        """Regression: semantic recall took a fetch-exactly-k fast path when
+        include_superseded=True, ignoring that the `tag` filter still runs
+        post-query — so higher-ranked untagged hits crowded out the tagged
+        ones and recall returned fewer than k matches."""
+        # Six untagged near-exact matches outrank the two tagged memories.
+        for _ in range(6):
+            store.remember("alpha beta gamma", type="semantic")
+        keep1 = store.remember("alpha beta", type="semantic", tags=["keep"])
+        keep2 = store.remember("alpha beta delta", type="semantic", tags=["keep"])
+
+        hits = store.recall(
+            "alpha beta gamma", k=2, tag="keep",
+            mode="semantic", include_superseded=True,
+        )
+        got = {m.id for m, _ in hits}
+        assert got == {keep1.id, keep2.id}
+
     def test_pack_respects_source(self, store):
         store.remember("epsilon note", source="repo-a")
         store.remember("zeta note", source="repo-b")

@@ -6,6 +6,7 @@ Saved as JSON at ~/.ai_houkai/maintenance.state.json (configurable).
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,18 +21,31 @@ class MaintenanceState:
     total_reflected: int = 0               # cumulative summaries created
 
     def save(self, path: str | Path) -> None:
-        p = Path(path)
+        p = Path(path).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
+        # Write to a temp file in the same dir, then atomically rename, so a
+        # crash mid-write can never leave a truncated/corrupt state file.
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
             json.dump(asdict(self), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
 
     @classmethod
     def load(cls, path: str | Path) -> "MaintenanceState":
-        p = Path(path)
+        p = Path(path).expanduser()
         if not p.exists():
             return cls()
-        with open(p) as f:
-            data: dict[str, Any] = json.load(f)
+        # A corrupt/unreadable state file must not hard-stop the daemon: every
+        # tick begins by loading state, so fall back to a fresh state instead.
+        try:
+            with open(p) as f:
+                data: dict[str, Any] = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError):
+            return cls()
+        if not isinstance(data, dict):
+            return cls()
         known = {k for k in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in data.items() if k in known})
 

@@ -96,8 +96,6 @@ def stats(
         print(json.dumps(data, indent=2))
 
 
-# ── health computation ────────────────────────────────────────────────────────
-
 def _compute_health(
     active: list,
     *,
@@ -166,8 +164,6 @@ def _compute_health(
     }
 
 
-# ── rendering ────────────────────────────────────────────────────────────────
-
 def _render_basic(
     console,
     data: dict,
@@ -206,7 +202,6 @@ def _render_basic(
 def _render_health(console, h: dict) -> None:
     console.rule("[bold yellow]Health Report[/]")
 
-    # ── summary line ──────────────────────────────────────────────────────────
     n_total = sum(h["decay_histogram"].values())
     at_risk_pct = (h["at_risk_count"] / n_total * 100) if n_total else 0.0
     stale_pct   = (h["stale_count"]   / n_total * 100) if n_total else 0.0
@@ -229,7 +224,6 @@ def _render_health(console, h: dict) -> None:
         f"[bold]Episodic (ripe for reflection)[/]  {h['episodic_active_count']}"
     )
 
-    # ── decay histogram ───────────────────────────────────────────────────────
     t = Table(title="Decay score distribution", show_header=True, header_style="bold cyan")
     t.add_column("SCORE BAND")
     t.add_column("COUNT", justify="right")
@@ -243,7 +237,6 @@ def _render_health(console, h: dict) -> None:
         t.add_row(f"[{style}]{label}[/]", f"[{style}]{cnt}[/]", f"[{style}]{bar}[/]")
     console.print(t)
 
-    # ── top recalled ──────────────────────────────────────────────────────────
     if h["top_recalled"]:
         t2 = Table(title="Top recalled", show_header=True, header_style="bold cyan")
         t2.add_column("ID")

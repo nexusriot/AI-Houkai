@@ -33,13 +33,15 @@ def tail(
         return
 
     table = Table(title=f"Audit journal — {len(entries)} entries")
+    table.add_column("ts", style="dim")
     table.add_column("time", style="dim")
     table.add_column("op")
     table.add_column("actor", style="cyan")
     table.add_column("summary")
     for e in entries:
-        ts = datetime.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M:%S")
-        table.add_row(ts, e.op, e.actor, e.summary())
+        when = datetime.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M:%S")
+        # Raw epoch ts is what `journal show`/`undo` take as their argument.
+        table.add_row(f"{e.ts:.3f}", when, e.op, e.actor, e.summary())
     Console().print(table)
 
 

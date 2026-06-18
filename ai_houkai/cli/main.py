@@ -88,7 +88,9 @@ def _register() -> None:
     app.command("forget")(forget)
     app.command("edit")(edit)
     app.command("tag")(tag)
-    app.command("bump")(bump)
+    # ignore_unknown_options so a negative delta like `-0.1` is taken as the
+    # positional argument value instead of being parsed as an option flag.
+    app.command("bump", context_settings={"ignore_unknown_options": True})(bump)
     app.command("link")(link)
     app.command("unlink")(unlink)
     app.command("neighbors")(neighbors)

@@ -110,6 +110,38 @@ class TestMaintenanceState:
         MaintenanceState().save(path)
         assert path.exists()
 
+    def test_load_corrupt_file_returns_defaults(self, tmp_path):
+        # A truncated/garbled state file must not hard-stop the daemon —
+        # every tick begins by loading state (regression: json.load raised).
+        path = tmp_path / "state.json"
+        path.write_text("{ this is not valid json")
+        assert MaintenanceState.load(path) == MaintenanceState()
+
+    def test_load_empty_file_returns_defaults(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("")
+        assert MaintenanceState.load(path) == MaintenanceState()
+
+    def test_load_non_object_json_returns_defaults(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text("[1, 2, 3]")
+        assert MaintenanceState.load(path) == MaintenanceState()
+
+    def test_save_is_atomic_no_temp_left_behind(self, tmp_path):
+        path = tmp_path / "state.json"
+        MaintenanceState(total_decayed=7).save(path)
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != "state.json"]
+        assert leftovers == []          # temp file renamed, not left behind
+        assert MaintenanceState.load(path).total_decayed == 7
+
+    def test_save_load_expands_user(self, tmp_path, monkeypatch):
+        # "~/..." must expand, not create a literal '~' dir (regression).
+        monkeypatch.setenv("HOME", str(tmp_path))
+        MaintenanceState(total_reflected=3).save("~/.ai_houkai/state.json")
+        assert (tmp_path / ".ai_houkai" / "state.json").exists()
+        assert not (tmp_path / "~").exists()
+        assert MaintenanceState.load("~/.ai_houkai/state.json").total_reflected == 3
+
     def test_next_run_at_never_ran(self):
         s = MaintenanceState()
         now = time.time()

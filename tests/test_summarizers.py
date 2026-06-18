@@ -159,6 +159,46 @@ class TestFallback:
         )
         assert build_summarizer("ollama:m")(_mems()) == "summary text"
 
+    def test_openai_client_built_lazily_and_falls_back(self, monkeypatch):
+        # Regression: OpenAI() was constructed inside build_summarizer(), so a
+        # missing/invalid key crashed the build (and the unattended maintenance
+        # daemon) before _with_fallback could catch it. The client must be
+        # built at call time so the failure degrades to extractive instead.
+        built: list[bool] = []
+
+        class _BoomClient:
+            def __init__(self, **kw):
+                built.append(True)
+                raise RuntimeError("Missing credentials")
+
+        monkeypatch.setattr(summarizers, "OpenAI", _BoomClient)
+
+        summ = build_summarizer("openai:gpt-4o-mini")   # must NOT raise
+        assert built == []                              # not built at build time
+        assert summ(_mems()) == _default_summarizer(_mems())  # degrades at call
+        assert built == [True]                          # built once, at call time
+
+    def test_anthropic_client_built_lazily_and_falls_back(self, monkeypatch):
+        class _BoomClient:
+            def __init__(self, **kw):
+                raise RuntimeError("Missing credentials")
+
+        monkeypatch.setattr(summarizers, "Anthropic", _BoomClient)
+
+        summ = build_summarizer("anthropic:claude-haiku-4-5")   # must NOT raise
+        assert summ(_mems()) == _default_summarizer(_mems())
+
+    def test_construction_error_surfaces_at_call_without_fallback(self, monkeypatch):
+        class _BoomClient:
+            def __init__(self, **kw):
+                raise RuntimeError("Missing credentials")
+
+        monkeypatch.setattr(summarizers, "OpenAI", _BoomClient)
+
+        summ = build_summarizer("openai:gpt-4o-mini", fallback=False)  # build ok
+        with pytest.raises(RuntimeError, match="Missing credentials"):
+            summ(_mems())                               # raised lazily, at call
+
 
 
 class TestSdkProviders:

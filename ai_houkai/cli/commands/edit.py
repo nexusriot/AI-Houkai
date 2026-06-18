@@ -53,14 +53,14 @@ def edit(
     with open(tmp_path) as f:
         raw = f.read()
 
-    lines = [l for l in raw.splitlines() if not l.startswith("#")]
-    content = "\n".join(lines)
-
-    if "---" not in content:
+    if "---" not in raw:
         typer.echo("Error: missing '---' separator in edited file.", err=True)
         raise typer.Exit(1)
 
-    front, _, body = content.partition("---")
+    front, _, body = raw.partition("---")
+    # Strip '#' comment lines from the front matter ONLY — the body is the
+    # memory text and may legitimately contain markdown headings.
+    front = "\n".join(l for l in front.splitlines() if not l.startswith("#"))
     new_text = body.strip()
 
     new_type = mem.type

@@ -10,8 +10,6 @@ import pytest_asyncio
 from ai_houkai.memory_system import AsyncMemoryStore
 
 
-# ── fixture ──────────────────────────────────────────────────────────────────
-
 @pytest.fixture()
 def astore(tmp_path):
     s = AsyncMemoryStore(
@@ -21,13 +19,9 @@ def astore(tmp_path):
     s.close()
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
-
-# ── tests ────────────────────────────────────────────────────────────────────
 
 class TestAsyncRemember:
     def test_returns_memory(self, astore):
