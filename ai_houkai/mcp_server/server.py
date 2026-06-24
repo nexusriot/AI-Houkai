@@ -4,10 +4,11 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed (15):
+Tools exposed (16):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
     recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?)
-    recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?)
+    recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?, compress?, compress_threshold?, compress_min_group?)
+    auto_context(task, token_budget?, max_phrases?, mode?)
     forget(memory_id)
     list_recent(limit?, include_superseded?)
     stats()
@@ -34,7 +35,7 @@ from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.importance import score_importance
-from ai_houkai.memory_system.store import ConflictError, HybridWeights
+from ai_houkai.memory_system.store import ConflictError, HybridWeights, extract_key_phrases
 from ai_houkai.memory_system.summarizers import build_summarizer
 from ai_houkai.timeparse import parse_timestamp
 
@@ -155,14 +156,22 @@ def recall_pack(
     mode: str = "hybrid",
     max_items: int = 50,
     include_superseded: bool = False,
+    compress: bool = False,
+    compress_threshold: float = 0.30,
+    compress_min_group: int = 2,
 ) -> dict[str, Any]:
     """Assemble the most relevant memories into a token-budgeted context block.
 
-    Ranks with hybrid scoring (cosine + BM25 + recency + importance) by default,
-    then greedily packs results until token_budget is reached. Returns a ready-to-
-    inject `text` block plus the packed items. token_budget is a soft ceiling
-    (estimated at ~4 chars/token) covering the memory lines, not the header.
-    source/since/until filter candidates exactly as in `recall`.
+    Ranks with hybrid scoring (cosine + BM25 + recency + importance + polarity)
+    by default, then greedily packs results until token_budget is reached.
+    Returns a ready-to-inject `text` block plus the packed items.
+    token_budget is a soft ceiling (~4 chars/token) covering memory lines only.
+
+    compress=True: when candidates are dropped for exceeding the budget, similar
+    ones are clustered by token-Jaccard and folded into a single summary line
+    (marked "compressed") that may fit in the remaining space.
+    compress_threshold: Jaccard similarity threshold for grouping (default 0.30).
+    compress_min_group: minimum cluster size to produce a compressed line (default 2).
     """
     pack = store.recall_pack(
         query=query,
@@ -176,9 +185,66 @@ def recall_pack(
         mode=mode,             # type: ignore[arg-type]
         max_items=max_items,
         include_superseded=include_superseded,
+        compress=compress,
+        compress_threshold=compress_threshold,
+        compress_min_group=compress_min_group,
     )
     return {
         "text": pack.text,
+        "used_tokens": pack.used_tokens,
+        "budget": pack.budget,
+        "truncated": pack.truncated,
+        "items": [
+            {
+                "id": p.memory.id,
+                "text": p.memory.text,
+                "type": p.memory.type,
+                "tags": p.memory.tags,
+                "importance": p.memory.importance,
+                "score": round(p.score, 4),
+                "tokens": p.tokens,
+            }
+            for p in pack.items
+        ],
+        "compressed_groups": [
+            {
+                "ids": [m.id for m in cg.memories],
+                "text": cg.text,
+                "tokens": cg.tokens,
+                "count": len(cg.memories),
+            }
+            for cg in pack.compressed_groups
+        ],
+    }
+
+
+@mcp.tool()
+def auto_context(
+    task: str,
+    token_budget: int = 800,
+    max_phrases: int = 3,
+    mode: str = "hybrid",
+) -> dict[str, Any]:
+    """Build a ready-to-inject context block by fanning out over multiple recall angles.
+
+    Extracts up to max_phrases key bigram/keyword phrases from the task description,
+    recalls memories for each angle independently, deduplicates (keeping the highest
+    score per memory), then packs greedily within token_budget.
+
+    More thorough than a single recall_pack call for tasks with compound concepts
+    (e.g. "deploy the API to production" → also searches "deploy api", "api production").
+    Returns the same structure as recall_pack plus the queries that were used.
+    """
+    queries = [task] + extract_key_phrases(task, max_phrases)
+    pack = store.auto_context_pack(
+        task=task,
+        token_budget=token_budget,
+        max_phrases=max_phrases,
+        mode=mode,             # type: ignore[arg-type]
+    )
+    return {
+        "text": pack.text,
+        "queries": queries,
         "used_tokens": pack.used_tokens,
         "budget": pack.budget,
         "truncated": pack.truncated,

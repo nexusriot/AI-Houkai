@@ -225,3 +225,52 @@ class TestSupersede:
         all_mems = store.list_recent(limit=100, include_superseded=True)
         ids = {m.id for m in all_mems}
         assert old.id in ids and new.id in ids
+
+
+class TestPolarityConflict:
+    """Opposite-polarity memories should be detected as contradictions."""
+
+    def test_opposite_polarity_detected_as_contradiction(self, store: MemoryStore):
+        store.remember("Use ruff for linting", type="procedural",
+                       tags=["lint"], importance=0.8, polarity=1)
+        store.remember("Use ruff for linting", type="procedural",
+                       tags=["lint"], importance=0.8, polarity=-1)
+        conflicts = store.find_conflicts(threshold=0.90)
+        assert any(c.kind == "contradiction" and c.reason == "polarity_diff"
+                   for c in conflicts)
+
+    def test_polarity_diff_takes_priority_over_negation(self, store: MemoryStore):
+        # Even with negation words, polarity_diff should be the reason
+        store.remember("Always use ruff", type="procedural",
+                       tags=["lint"], polarity=1)
+        store.remember("Never use ruff", type="procedural",
+                       tags=["lint"], polarity=-1)
+        conflicts = store.find_conflicts(threshold=0.70)
+        # polarity_diff should be the stated reason (checked before negation_diff)
+        pd_conflicts = [c for c in conflicts if c.reason == "polarity_diff"]
+        assert len(pd_conflicts) >= 1
+
+    def test_same_polarity_not_contradiction(self, store: MemoryStore):
+        store.remember("Use ruff for linting", type="procedural",
+                       tags=["lint"], polarity=1)
+        store.remember("Run ruff to lint Python code", type="procedural",
+                       tags=["lint"], polarity=1)
+        conflicts = store.find_conflicts(threshold=0.70)
+        assert all(c.reason != "polarity_diff" for c in conflicts)
+
+    def test_neutral_polarity_not_contradiction(self, store: MemoryStore):
+        store.remember("Use ruff for linting", type="procedural",
+                       tags=["lint"], polarity=0)
+        store.remember("Use ruff for linting", type="procedural",
+                       tags=["lint"], polarity=-1)
+        conflicts = store.find_conflicts(threshold=0.90)
+        # polarity=0 means "not set" — should not trigger polarity_diff
+        assert all(c.reason != "polarity_diff" for c in conflicts)
+
+    def test_per_memory_check_detects_polarity_diff(self, store: MemoryStore):
+        pos = store.remember("This approach is great", type="semantic",
+                             tags=["design"], polarity=1)
+        store.remember("This approach is great", type="semantic",
+                       tags=["design"], polarity=-1)
+        conflicts = store.find_conflicts(memory_id=pos.id, threshold=0.90)
+        assert any(c.reason == "polarity_diff" for c in conflicts)

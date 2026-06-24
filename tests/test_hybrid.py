@@ -206,3 +206,67 @@ class TestExpandLinks:
         )
         ids = [m.id for m, _ in hits]
         assert child.id not in ids
+
+
+class TestPolarityScoring:
+    """Polarity (+1/-1) should shift hybrid and semantic scores."""
+
+    def test_positive_polarity_scores_higher_than_neutral(self, store: MemoryStore):
+        neutral  = store.remember("Use pytest for testing", type="procedural",
+                                  importance=0.5, polarity=0)
+        positive = store.remember("Use pytest for testing", type="procedural",
+                                  importance=0.5, polarity=1)
+        hits = {m.id: s for m, s in store.recall("pytest testing", k=5, mode="hybrid")}
+        assert hits.get(positive.id, 0) > hits.get(neutral.id, 0)
+
+    def test_negative_polarity_scores_lower_than_neutral(self, store: MemoryStore):
+        neutral  = store.remember("Run ruff linter", type="procedural",
+                                  importance=0.5, polarity=0)
+        negative = store.remember("Run ruff linter", type="procedural",
+                                  importance=0.5, polarity=-1)
+        hits = {m.id: s for m, s in store.recall("ruff linter", k=5, mode="hybrid")}
+        assert hits.get(neutral.id, 0) > hits.get(negative.id, 0)
+
+    def test_polarity_ordering_semantic_mode(self, store: MemoryStore):
+        neg = store.remember("Deploy to production", type="procedural",
+                             importance=0.5, polarity=-1)
+        pos = store.remember("Deploy to production", type="procedural",
+                             importance=0.5, polarity=1)
+        hits = store.recall("deploy production", k=5, mode="semantic")
+        ids = [m.id for m, _ in hits]
+        # positive polarity should outrank negative when text is identical
+        assert ids.index(pos.id) < ids.index(neg.id)
+
+    def test_zero_polarity_no_change(self, store: MemoryStore):
+        # Two identical memories with polarity=0 should score the same
+        m1 = store.remember("Use docker compose", type="procedural",
+                             importance=0.5, polarity=0)
+        m2 = store.remember("Use docker compose", type="procedural",
+                             importance=0.5, polarity=0)
+        hits = {m.id: s for m, s in store.recall("docker compose", k=5, mode="hybrid")}
+        if m1.id in hits and m2.id in hits:
+            assert abs(hits[m1.id] - hits[m2.id]) < 0.05  # negligible diff
+
+    def test_polarity_weight_zero_disables_boost(self, store: MemoryStore):
+        # Explicitly passing polarity_weight=0 should remove the polarity effect
+        neg = store.remember("Use pytest for testing", type="procedural",
+                             importance=0.5, polarity=-1)
+        pos = store.remember("Use pytest for testing", type="procedural",
+                             importance=0.5, polarity=1)
+        w = HybridWeights(cosine=0.55, lexical=0.25, recency=0.1, importance=0.1,
+                          polarity_weight=0.0)
+        hits = {m.id: s for m, s in store.recall(
+            "pytest testing", k=5, mode="hybrid", weights=w)}
+        if pos.id in hits and neg.id in hits:
+            # with polarity_weight=0 both identical texts should score the same
+            assert abs(hits[pos.id] - hits[neg.id]) < 0.05
+
+    def test_store_level_hybrid_weights_accepted(self, tmp_path):
+        # MemoryStore constructor accepts hybrid_weights and applies them store-wide
+        w = HybridWeights(cosine=0.6, lexical=0.2, recency=0.1, importance=0.1,
+                          polarity_weight=0.0)
+        from ai_houkai.memory_system import MemoryStore
+        store = MemoryStore(str(tmp_path), hybrid_weights=w)
+        m = store.remember("pytest testing isolates tests", type="procedural")
+        hits = store.recall("pytest", k=5, mode="hybrid")
+        assert any(x.id == m.id for x, _ in hits)

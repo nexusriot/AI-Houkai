@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.8.3"
+version         = "0.9.5"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"

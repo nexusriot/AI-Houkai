@@ -1,5 +1,6 @@
 from .store import (
     Conflict,
+    CompressedGroup,
     ConflictError,
     ConflictFn,
     ExpandSpec,
@@ -14,6 +15,7 @@ from .store import (
     MemoryType,
     PackedMemory,
     PackResult,
+    extract_key_phrases,
 )
 from .async_store import AsyncMemoryStore
 from .decay import DecayEngine
@@ -25,6 +27,7 @@ from .journal import Journal, JournalEntry
 __all__ = [
     "AsyncMemoryStore",
     "Conflict",
+    "CompressedGroup",
     "ConflictError",
     "ConflictFn",
     "DecayEngine",
@@ -44,5 +47,6 @@ __all__ = [
     "PackedMemory",
     "ReflectionEngine",
     "build_summarizer",
+    "extract_key_phrases",
     "score_importance",
 ]
