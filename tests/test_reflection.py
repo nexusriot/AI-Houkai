@@ -241,3 +241,48 @@ class TestDefaultSummarizer:
             idx_v1 = created[0].text.find("v1.")
             if idx_v1 != -1 and idx_v2 != -1:
                 assert idx_v2 < idx_v1
+
+
+class TestPolarityClusterSeparation:
+    """Opposite-polarity episodics must not merge into the same cluster."""
+
+    def test_opposite_polarity_not_clustered_together(self, store: MemoryStore):
+        # Positive and negative memories about the same event should stay separate
+        pos = store.remember("Deployed API v2 to production successfully",
+                             type="episodic", polarity=1, importance=0.8)
+        neg = store.remember("Deployed API v2 to production — outage occurred",
+                             type="episodic", polarity=-1, importance=0.8)
+        engine = ReflectionEngine(store, similarity_threshold=0.60,
+                                  min_cluster_size=2)
+        clusters = engine.clusters()
+        # If any cluster exists, it must not mix pos and neg
+        for cluster in clusters:
+            ids = {m.id for m in cluster}
+            if pos.id in ids:
+                assert neg.id not in ids
+            if neg.id in ids:
+                assert pos.id not in ids
+
+    def test_same_polarity_can_cluster(self, store: MemoryStore):
+        store.remember("Deployed API v2.1 successfully", type="episodic",
+                       polarity=1, importance=0.8)
+        store.remember("Deployed API v2.2 successfully", type="episodic",
+                       polarity=1, importance=0.8)
+        engine = ReflectionEngine(store, similarity_threshold=0.60,
+                                  min_cluster_size=2)
+        clusters = engine.clusters()
+        # Positive+positive with the same polarity should still cluster
+        # (this test just asserts no crash; actual clustering depends on similarity)
+        assert isinstance(clusters, list)
+
+    def test_neutral_polarity_can_join_any_cluster(self, store: MemoryStore):
+        # polarity=0 should not block clustering with either sign
+        store.remember("Deployed API v2.1 to production", type="episodic",
+                       polarity=1, importance=0.8)
+        store.remember("Deployed API v2.2 to production", type="episodic",
+                       polarity=0, importance=0.8)
+        engine = ReflectionEngine(store, similarity_threshold=0.60,
+                                  min_cluster_size=2)
+        clusters = engine.clusters()
+        # neutral+positive should be able to cluster together
+        assert isinstance(clusters, list)

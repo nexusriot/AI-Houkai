@@ -210,8 +210,14 @@ class ReflectionEngine:
                 continue
             cluster = [seed]
             used[seed] = True
+            seed_polarity = mems[seed].polarity
             for j in range(n):
                 if used[j]:
+                    continue
+                # Never merge memories with explicitly opposite polarities:
+                # a positive and a negative memory describe contradictory states.
+                j_polarity = mems[j].polarity
+                if seed_polarity != 0 and j_polarity != 0 and seed_polarity != j_polarity:
                     continue
                 if _cosine(embeddings[seed], embeddings[j]) >= self.similarity_threshold:
                     cluster.append(j)

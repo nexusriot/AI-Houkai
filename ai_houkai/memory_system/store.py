@@ -79,11 +79,12 @@ class Graph:
 @dataclass(frozen=True)
 class HybridWeights:
     """Blend weights for hybrid recall scoring."""
-    cosine:     float = 0.55
-    lexical:    float = 0.20
-    recency:    float = 0.15
-    importance: float = 0.10
-    decay_rate: float = 0.10   # λ — shared with DecayEngine
+    cosine:         float = 0.55
+    lexical:        float = 0.20
+    recency:        float = 0.15
+    importance:     float = 0.10
+    decay_rate:     float = 0.10   # λ — shared with DecayEngine
+    polarity_weight: float = 0.05  # additive bonus: +0.05 for polarity=+1, -0.05 for -1
 
     def __post_init__(self) -> None:
         total = self.cosine + self.lexical + self.recency + self.importance
@@ -109,14 +110,23 @@ class PackedMemory:
 
 
 @dataclass
+class CompressedGroup:
+    """Several similar low-ranked memories folded into one summary line."""
+    memories: "list[Memory]"
+    text:     str   # full formatted line: "- (compressed) [×N] ..."
+    tokens:   int
+
+
+@dataclass
 class PackResult:
     """Result of recall_pack — memories that fit a token budget plus a
     ready-to-inject context block."""
-    items:       list[PackedMemory]
-    text:        str        # formatted block (empty when no items fit)
-    used_tokens: int
-    budget:      int
-    truncated:   bool       # True if ranked candidates were dropped to fit
+    items:             list[PackedMemory]
+    text:              str        # formatted block (empty when no items fit)
+    used_tokens:       int
+    budget:            int
+    truncated:         bool       # True if ranked candidates were dropped to fit
+    compressed_groups: "list[CompressedGroup]" = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.items)
@@ -344,6 +354,84 @@ def _estimate_tokens(text: str) -> int:
     return max(1, round(len(text) / 4))
 
 
+_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "need", "must",
+    "to", "for", "of", "in", "on", "at", "by", "from", "with", "about",
+    "and", "or", "but", "if", "then", "so", "as", "that", "this", "these",
+    "those", "it", "its", "i", "my", "we", "our", "you", "your", "they",
+    "their", "what", "how", "when", "where", "who", "which", "why", "not",
+    "just", "now", "also", "than", "only", "any", "all", "each",
+})
+
+
+def extract_key_phrases(task: str, max_phrases: int = 3) -> list[str]:
+    """Extract up to *max_phrases* key phrases from *task* without any NLP library.
+
+    Filters stop words, then prefers bigrams (more specific) over single words.
+    Used by :meth:`MemoryStore.auto_context_pack` to fan out recall over multiple
+    query angles derived from the same task description.
+    """
+    words = [w for w in _tokenize(task) if w not in _STOP_WORDS and len(w) > 2]
+    phrases: list[str] = []
+    for i in range(len(words) - 1):
+        phrases.append(f"{words[i]} {words[i + 1]}")
+    phrases.extend(words)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in phrases:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique[:max_phrases]
+
+
+def _jaccard_sim(a: str, b: str) -> float:
+    ta = set(_tokenize(a))
+    tb = set(_tokenize(b))
+    union = ta | tb
+    return len(ta & tb) / len(union) if union else 0.0
+
+
+def _cluster_by_jaccard(
+    candidates: list[tuple["Memory", float]],
+    threshold: float,
+    min_size: int,
+) -> "list[list[Memory]]":
+    """Greedy single-linkage clustering of truncated candidates by token-Jaccard."""
+    n = len(candidates)
+    used = [False] * n
+    clusters: list[list[Memory]] = []
+    for i in range(n):
+        if used[i]:
+            continue
+        mem_i = candidates[i][0]
+        cluster: list[Memory] = [mem_i]
+        used[i] = True
+        for j in range(i + 1, n):
+            if used[j]:
+                continue
+            if _jaccard_sim(mem_i.text, candidates[j][0].text) >= threshold:
+                cluster.append(candidates[j][0])
+                used[j] = True
+        if len(cluster) >= min_size:
+            clusters.append(cluster)
+    return clusters
+
+
+def _compress_group(memories: "list[Memory]") -> str:
+    """Extract first sentence of each memory (most-important first), join with ' | '."""
+    ordered = sorted(memories, key=lambda m: m.importance, reverse=True)
+    snippets = []
+    for m in ordered[:3]:
+        snippet = m.text.split(".")[0].strip()
+        if snippet:
+            snippets.append(snippet)
+    summary = " | ".join(snippets)
+    return f"[×{len(memories)} similar] {summary}"
+
+
 def _build_where(
     type: str | None = None,
     min_importance: float | None = None,
@@ -562,10 +650,11 @@ class MemoryStore:
             where=where,
         )
 
+        w = weights or self._hybrid_weights or HybridWeights()
         if mode == "hybrid":
             out = self._hybrid_score(res, query, k, tag, include_superseded, weights)
         else:
-            out = self._semantic_filter(res, k, tag, include_superseded)
+            out = self._semantic_filter(res, k, tag, include_superseded, w.polarity_weight)
 
         for mem, _ in out:
             self._touch(mem)
@@ -594,6 +683,9 @@ class MemoryStore:
         max_items: int = 50,
         token_counter: Callable[[str], int] | None = None,
         header: str = "## Relevant memory",
+        compress: bool = False,
+        compress_threshold: float = 0.30,
+        compress_min_group: int = 2,
     ) -> PackResult:
         """Assemble the highest-ranked memories that fit a token budget into a
         ready-to-inject context block.
@@ -605,6 +697,11 @@ class MemoryStore:
 
         ``token_counter`` overrides the default ~4-chars/token estimate; the
         budget is therefore a soft ceiling unless an exact counter is supplied.
+
+        ``compress=True`` enables query-time compression: candidates that could
+        not be packed individually are clustered by Jaccard similarity; clusters
+        of ≥ ``compress_min_group`` members are folded into a single summary
+        line, which is packed if it fits the remaining budget.
         """
         count_fn = token_counter or _estimate_tokens
 
@@ -624,6 +721,7 @@ class MemoryStore:
         )
 
         items: list[PackedMemory] = []
+        dropped: list[tuple[Memory, float]] = []
         used = 0
         truncated = False
         for mem, score in ranked:
@@ -631,7 +729,77 @@ class MemoryStore:
             cost = count_fn(line)
             if used + cost > token_budget:
                 truncated = True
+                dropped.append((mem, score))
                 continue  # a smaller, lower-ranked item may still fit
+            items.append(PackedMemory(memory=mem, score=score, tokens=cost))
+            used += cost
+
+        compressed_groups: list[CompressedGroup] = []
+        if compress and dropped:
+            for group_mems in _cluster_by_jaccard(dropped, compress_threshold, compress_min_group):
+                summary = _compress_group(group_mems)
+                line = f"- (compressed) {summary}"
+                cost = count_fn(line)
+                if used + cost <= token_budget:
+                    compressed_groups.append(CompressedGroup(
+                        memories=group_mems, text=line, tokens=cost,
+                    ))
+                    used += cost
+
+        if items or compressed_groups:
+            parts = [self._pack_line(p.memory) for p in items]
+            parts.extend(cg.text for cg in compressed_groups)
+            body = "\n".join(parts)
+            text = f"{header}\n{body}" if header else body
+        else:
+            text = ""
+
+        return PackResult(
+            items=items,
+            text=text,
+            used_tokens=used,
+            budget=token_budget,
+            truncated=truncated,
+            compressed_groups=compressed_groups,
+        )
+
+    def auto_context_pack(
+        self,
+        task: str,
+        *,
+        token_budget: int = 800,
+        max_phrases: int = 3,
+        mode: Literal["semantic", "hybrid"] = "hybrid",
+        header: str = "## Relevant memory",
+        token_counter: Callable[[str], int] | None = None,
+    ) -> PackResult:
+        """Fan-out recall over *task* and extracted key phrases, deduplicate, and pack.
+
+        More thorough than a single :meth:`recall_pack` call: extracts up to
+        *max_phrases* bigram/keyword angles from the task description, runs
+        :meth:`recall` for each, deduplicates by ID (keeping the highest score
+        seen), then packs greedily within *token_budget*.
+        """
+        count_fn = token_counter or _estimate_tokens
+        queries = [task] + extract_key_phrases(task, max_phrases)
+
+        best: dict[str, tuple[Memory, float]] = {}
+        for q in queries:
+            for mem, score in self.recall(query=q, k=10, mode=mode):
+                if mem.id not in best or score > best[mem.id][1]:
+                    best[mem.id] = (mem, score)
+
+        ranked = sorted(best.values(), key=lambda x: x[1], reverse=True)
+
+        items: list[PackedMemory] = []
+        used = 0
+        truncated = False
+        for mem, score in ranked:
+            line = self._pack_line(mem)
+            cost = count_fn(line)
+            if used + cost > token_budget:
+                truncated = True
+                continue
             items.append(PackedMemory(memory=mem, score=score, tokens=cost))
             used += cost
 
@@ -728,7 +896,10 @@ class MemoryStore:
                         and not (set(mem_a.tags) & set(mem_b.tags))):
                     continue
                 seen.add(pair)
-                if _negation_diff(mem_a.text, mem_b.text):
+                if (mem_a.polarity != 0 and mem_b.polarity != 0
+                        and mem_a.polarity != mem_b.polarity):
+                    kind, reason = "contradiction", "polarity_diff"
+                elif _negation_diff(mem_a.text, mem_b.text):
                     kind, reason = "contradiction", "negation_diff"
                 elif self._contradiction_fn and self._contradiction_fn(mem_a, mem_b):
                     kind, reason = "contradiction", "custom_fn"
@@ -1275,7 +1446,10 @@ class MemoryStore:
             if mem.tags and candidate.tags and not (set(mem.tags) & set(candidate.tags)):
                 continue
             cfn = contradiction_fn or self._contradiction_fn
-            if _negation_diff(mem.text, candidate.text):
+            if (mem.polarity != 0 and candidate.polarity != 0
+                    and mem.polarity != candidate.polarity):
+                kind, reason = "contradiction", "polarity_diff"
+            elif _negation_diff(mem.text, candidate.text):
                 kind, reason = "contradiction", "negation_diff"
             elif cfn and cfn(mem, candidate):
                 kind, reason = "contradiction", "custom_fn"
@@ -1294,21 +1468,23 @@ class MemoryStore:
         k: int,
         tag: str | None,
         include_superseded: bool,
+        polarity_weight: float = 0.0,
     ) -> list[tuple[Memory, float]]:
         out: list[tuple[Memory, float]] = []
         for mid, doc, meta, dist in zip(
             res["ids"][0], res["documents"][0],
             res["metadatas"][0], res["distances"][0],
         ):
-            if len(out) >= k:
-                break
             mem = Memory.from_record(mid, doc, meta)
             if tag and tag not in mem.tags:
                 continue
             if not include_superseded and mem.superseded_by:
                 continue
-            out.append((mem, 1.0 - dist))
-        return out
+            score = (1.0 - dist) + polarity_weight * mem.polarity
+            out.append((mem, score))
+        if polarity_weight:
+            out.sort(key=lambda x: x[1], reverse=True)
+        return out[:k]
 
     def _hybrid_score(
         self,
@@ -1339,7 +1515,8 @@ class MemoryStore:
             age_d   = max(0.0, (now - mem.last_accessed) / 86_400.0)
             recency = math.exp(-w.decay_rate * age_d)
             score   = (w.cosine * cosine + w.lexical * lexical
-                       + w.recency * recency + w.importance * mem.importance)
+                       + w.recency * recency + w.importance * mem.importance
+                       + w.polarity_weight * mem.polarity)
             candidates.append((mem, score))
 
         candidates.sort(key=lambda x: x[1], reverse=True)
