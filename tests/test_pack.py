@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
-from ai_houkai.memory_system import CompressedGroup, MemoryStore, PackResult
+from ai_houkai.memory_system import CompressedGroup, Memory, MemoryStore, PackResult
 from ai_houkai.memory_system.store import (
     _estimate_tokens,
     _jaccard_sim,
@@ -151,8 +153,6 @@ class TestJaccardHelpers:
 
     def test_cluster_by_jaccard_high_threshold_no_groups(self):
         # threshold=1.0 — only identical texts form groups; these are all different
-        from ai_houkai.memory_system import Memory
-        import time
         def _m(text):
             return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
                            last_accessed=time.time()), 0.9)
@@ -162,8 +162,6 @@ class TestJaccardHelpers:
 
     def test_cluster_by_jaccard_low_threshold_groups(self):
         # threshold=0.0 — every pair qualifies; all similar texts cluster together
-        from ai_houkai.memory_system import Memory
-        import time
         def _m(text):
             return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
                            last_accessed=time.time()), 0.9)
@@ -173,8 +171,6 @@ class TestJaccardHelpers:
 
     def test_cluster_by_jaccard_respects_min_size(self):
         # Only 2 similar items; min_size=3 means no group should form
-        from ai_houkai.memory_system import Memory
-        import time
         def _m(text):
             return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
                            last_accessed=time.time()), 0.9)
