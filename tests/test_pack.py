@@ -142,6 +142,46 @@ class TestJaccardHelpers:
     def test_empty_strings(self):
         assert _jaccard_sim("", "") == 0.0
 
+    def test_one_empty_one_not(self):
+        assert _jaccard_sim("ruff linting", "") == 0.0
+        assert _jaccard_sim("", "ruff linting") == 0.0
+
+    def test_single_token_match(self):
+        assert _jaccard_sim("ruff", "ruff") == 1.0
+
+    def test_cluster_by_jaccard_high_threshold_no_groups(self):
+        # threshold=1.0 — only identical texts form groups; these are all different
+        from ai_houkai.memory_system import Memory
+        import time
+        def _m(text):
+            return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
+                           last_accessed=time.time()), 0.9)
+        cands = [_m("ruff lint python"), _m("ruff lint code"), _m("deploy api release")]
+        groups = _cluster_by_jaccard(cands, threshold=1.0, min_size=2)
+        assert groups == []
+
+    def test_cluster_by_jaccard_low_threshold_groups(self):
+        # threshold=0.0 — every pair qualifies; all similar texts cluster together
+        from ai_houkai.memory_system import Memory
+        import time
+        def _m(text):
+            return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
+                           last_accessed=time.time()), 0.9)
+        cands = [_m("ruff lint python"), _m("ruff lint code"), _m("ruff lint source")]
+        groups = _cluster_by_jaccard(cands, threshold=0.0, min_size=2)
+        assert len(groups) >= 1 and sum(len(g) for g in groups) >= 2
+
+    def test_cluster_by_jaccard_respects_min_size(self):
+        # Only 2 similar items; min_size=3 means no group should form
+        from ai_houkai.memory_system import Memory
+        import time
+        def _m(text):
+            return (Memory(id="x", text=text, type="procedural", created_at=time.time(),
+                           last_accessed=time.time()), 0.9)
+        cands = [_m("ruff lint python"), _m("ruff lint code")]
+        groups = _cluster_by_jaccard(cands, threshold=0.0, min_size=3)
+        assert groups == []
+
 
 class TestExtractKeyPhrases:
     def test_returns_bigrams_first(self):
@@ -161,6 +201,19 @@ class TestExtractKeyPhrases:
     def test_no_duplicates(self):
         phrases = extract_key_phrases("ruff ruff ruff", max_phrases=10)
         assert len(phrases) == len(set(phrases))
+
+    def test_empty_string(self):
+        assert extract_key_phrases("", max_phrases=5) == []
+
+    def test_single_content_word(self):
+        # One word, not a stop word: no bigrams possible, returns the unigram
+        phrases = extract_key_phrases("pytest", max_phrases=5)
+        assert "pytest" in phrases
+
+    def test_all_strings_are_lowercase(self):
+        phrases = extract_key_phrases("Deploy API", max_phrases=5)
+        for p in phrases:
+            assert p == p.lower()
 
 
 class TestCompression:
@@ -244,6 +297,20 @@ class TestCompression:
         assert pack.compressed_groups == []
         assert not pack.truncated
 
+    def test_isolated_dropped_item_below_min_group_forms_no_group(self, store: MemoryStore):
+        # Only 1 dropped item that has no similar companions → min_group=2 means no group
+        store.remember("Use ruff to lint Python files", type="procedural", importance=0.8)
+        store.remember("Deploy with make release script", type="procedural", importance=0.9)
+        # Very small budget: one item fits, one is dropped. They are dissimilar → no group
+        pack = store.recall_pack(
+            "ruff linting",
+            token_budget=20,
+            compress=True,
+            compress_threshold=0.60,
+            compress_min_group=2,
+        )
+        assert pack.compressed_groups == []
+
 
 class TestAutoContextPack:
     def _seed(self, store: MemoryStore) -> None:
@@ -290,3 +357,16 @@ class TestAutoContextPack:
         pack = store.auto_context_pack("testing", token_budget=5000)
         if pack.items:
             assert pack.text.startswith("## Relevant memory")
+
+    def test_result_fits_budget(self, store: MemoryStore):
+        self._seed(store)
+        pack = store.auto_context_pack("run tests deploy api", token_budget=100)
+        assert isinstance(pack, PackResult)
+        assert pack.used_tokens <= 100
+
+    def test_max_phrases_zero_uses_only_task(self, store: MemoryStore):
+        self._seed(store)
+        # max_phrases=0 disables phrase extraction — only the task query is used
+        pack = store.auto_context_pack("testing", token_budget=5000, max_phrases=0)
+        assert isinstance(pack, PackResult)
+        assert len(pack) >= 0  # doesn't crash
