@@ -607,6 +607,16 @@ class MemoryStore:
         self._journal("forget", memory_id, before=before.to_dict())
         return True
 
+    def nuke(self) -> int:
+        """Delete every memory in the current collection. Returns the count deleted."""
+        result = self.collection.get(include=[])
+        ids = result["ids"]
+        if not ids:
+            return 0
+        self.collection.delete(ids=ids)
+        self._journal("nuke", "*", meta={"count": len(ids)})
+        return len(ids)
+
     def recall(
         self,
         query: str,

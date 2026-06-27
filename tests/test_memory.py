@@ -154,6 +154,35 @@ class TestListRecent:
         assert store.list_recent() == []
 
 
+class TestNuke:
+    def test_returns_count_deleted(self, store: MemoryStore):
+        store.remember("alpha")
+        store.remember("beta")
+        store.remember("gamma")
+        assert store.nuke() == 3
+
+    def test_collection_empty_after_nuke(self, store: MemoryStore):
+        store.remember("alpha")
+        store.remember("beta")
+        store.nuke()
+        assert store.count() == 0
+
+    def test_nuke_empty_store_returns_zero(self, store: MemoryStore):
+        assert store.nuke() == 0
+
+    def test_nuke_is_idempotent(self, store: MemoryStore):
+        store.remember("only one")
+        store.nuke()
+        assert store.nuke() == 0
+        assert store.count() == 0
+
+    def test_remember_works_after_nuke(self, store: MemoryStore):
+        store.remember("first batch")
+        store.nuke()
+        store.remember("fresh start")
+        assert store.count() == 1
+
+
 class TestMemoryDataclass:
     def test_to_metadata_roundtrip(self):
         mem = Memory(

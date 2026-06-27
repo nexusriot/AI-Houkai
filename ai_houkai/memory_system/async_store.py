@@ -152,6 +152,10 @@ class AsyncMemoryStore:
     async def forget(self, memory_id: str) -> bool:
         return await self.run(self.sync.forget, memory_id)
 
+    async def nuke(self) -> int:
+        """Delete every memory in the current collection. Returns the count deleted."""
+        return await self.run(self.sync.nuke)
+
     async def recall(
         self,
         query: str,

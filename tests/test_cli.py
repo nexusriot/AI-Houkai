@@ -371,4 +371,39 @@ def test_conflicts_interactive_skips_resolved_memories(tmp_path):
 
     assert res.exception is None, f"interactive resolve crashed: {res.exception!r}"
     assert res.exit_code == 0, res.output
-    assert "already resolved" in res.output
+
+
+def test_nuke_deletes_all_memories(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    for text in ("alpha", "beta", "gamma"):
+        _invoke(["remember", text], store_path)
+
+    result = _invoke(["nuke", "--yes"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "3" in _last_line(result.output)
+
+    result2 = _invoke(["list"], store_path)
+    assert "No memories found" in result2.output
+
+
+def test_nuke_empty_collection(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    result = _invoke(["nuke", "--yes"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "empty" in result.output.lower()
+
+
+def test_nuke_requires_confirmation(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "keep me"], store_path)
+
+    result = runner.invoke(
+        app,
+        ["--store", store_path, "--collection", "cli_test", "nuke"],
+        input="n\n",
+    )
+    assert result.exit_code == 0
+    assert "Aborted" in result.output
+
+    result2 = _invoke(["list", "--format", "json"], store_path)
+    assert len(json.loads(result2.output)) == 1

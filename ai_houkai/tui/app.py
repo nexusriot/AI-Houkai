@@ -43,6 +43,7 @@ class HoukaiTui(App):
         Binding("n", "neighbors", "Neighbors"),
         Binding("b", "back", "Back"),
         Binding("r", "recent", "Recent"),
+        Binding("X", "nuke", "Nuke all"),
         Binding("escape", "dismiss_search", show=False),
     ]
 
@@ -51,6 +52,7 @@ class HoukaiTui(App):
         self.store = store
         self.nav = Navigator(store)
         self.sub_title = collection
+        self._nuke_pending = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -117,6 +119,7 @@ class HoukaiTui(App):
         self.query_one("#list", DataTable).focus()
 
     def action_neighbors(self) -> None:
+        self._nuke_pending = False
         mem = self._selected_memory()
         if mem is None:
             return
@@ -128,7 +131,27 @@ class HoukaiTui(App):
         self._show_view(view)
 
     def action_back(self) -> None:
+        self._nuke_pending = False
         self._show_view(self.nav.back())
 
     def action_recent(self) -> None:
+        self._nuke_pending = False
         self._show_view(self.nav.open_recent())
+
+    def action_nuke(self) -> None:
+        if self._nuke_pending:
+            self._nuke_pending = False
+            deleted = self.store.nuke()
+            self.notify(f"Nuked {deleted} memories.", severity="information")
+            self._show_view(self.nav.open_recent())
+        else:
+            count = self.store.collection.count()
+            if count == 0:
+                self.notify("Collection is already empty.", severity="information")
+                return
+            self._nuke_pending = True
+            self.notify(
+                f"About to nuke all {count} memories. Press X again to confirm.",
+                severity="warning",
+                timeout=5,
+            )

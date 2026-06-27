@@ -51,8 +51,6 @@ class HttpError(Exception):
         self.message = message
 
 
-# ---- serialisation helpers ------------------------------------------------
-
 def _mem_dict(mem: Any) -> dict[str, Any]:
     return {
         "id": mem.id,
@@ -115,7 +113,6 @@ def _require(body: dict[str, Any], key: str) -> Any:
     return body[key]
 
 
-# ---- route handlers -------------------------------------------------------
 # Each takes (store, match, query, body) and returns (status, payload).
 
 def _health(store: MemoryStore, m, q, b):

@@ -15,6 +15,7 @@ from ai_houkai.cli.commands.pack import pack
 from ai_houkai.cli.commands.list_cmd import list_memories
 from ai_houkai.cli.commands.show import show
 from ai_houkai.cli.commands.forget import forget
+from ai_houkai.cli.commands.nuke import nuke
 from ai_houkai.cli.commands.edit import edit, tag, bump
 from ai_houkai.cli.commands.link import link, unlink, neighbors, graph
 from ai_houkai.cli.commands.conflicts import conflicts, supersede, restore
@@ -86,6 +87,7 @@ def _register() -> None:
     app.command("list")(list_memories)
     app.command("show")(show)
     app.command("forget")(forget)
+    app.command("nuke")(nuke)
     app.command("edit")(edit)
     app.command("tag")(tag)
     # ignore_unknown_options so a negative delta like `-0.1` is taken as the
