@@ -44,6 +44,7 @@ AI-Houkai/
 │   ├── memory_system/
 │   │   ├── __init__.py
 │   │   ├── store.py              # MemoryStore + Memory dataclass (+ export/import/undo)
+│   │   ├── async_store.py        # AsyncMemoryStore — coroutine wrapper (single-threaded executor)
 │   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   ├── reflection.py         # ReflectionEngine — episodic → semantic
@@ -72,6 +73,7 @@ AI-Houkai/
 │   │       ├── list_cmd.py       # houkai list
 │   │       ├── show.py           # houkai show
 │   │       ├── forget.py         # houkai forget
+│   │       ├── nuke.py           # houkai nuke
 │   │       ├── edit.py           # houkai edit / tag / bump
 │   │       ├── link.py           # houkai link / unlink / neighbors / graph
 │   │       ├── conflicts.py      # houkai conflicts / supersede / restore
@@ -81,6 +83,7 @@ AI-Houkai/
 │   │       ├── journal.py        # houkai journal tail/show/undo
 │   │       ├── io.py             # houkai export / import / info / backup
 │   │       ├── ingest.py         # houkai ingest
+│   │       ├── serve.py          # houkai serve
 │   │       ├── collections.py    # houkai collections list/create/delete/copy
 │   │       ├── tui_cmd.py        # houkai tui
 │   │       └── stats.py          # houkai stats
@@ -107,16 +110,16 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 338 tests across 16 files
+├── tests/                        # 445 tests across 21 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
-│   ├── test_memory.py            # MemoryStore unit tests
+│   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
 │   ├── test_reflection.py        # ReflectionEngine unit tests
 │   ├── test_dispatch.py          # cross-provider _dispatch_tool tests
 │   ├── test_hybrid.py            # hybrid retrieval scoring
 │   ├── test_links.py             # typed links / neighbors / subgraph
 │   ├── test_conflicts.py         # conflict detection + supersede/restore
-│   ├── test_cli.py               # houkai CLI round-trips
+│   ├── test_cli.py               # houkai CLI round-trips (incl. nuke)
 │   ├── test_pack.py              # recall_pack token budgeting
 │   ├── test_journal.py           # audit journal tail/show/undo
 │   ├── test_export_import.py     # portable .ahkai archives
@@ -124,6 +127,11 @@ AI-Houkai/
 │   ├── test_summarizers.py       # LLM summarizer specs, fallback, wiring
 │   ├── test_importance.py        # heuristic importance tiers + wiring
 │   ├── test_ingest.py            # chunk_text + ingest/collections commands
+│   ├── test_async_store.py       # AsyncMemoryStore coroutine wrapper
+│   ├── test_http_server.py       # HTTP/REST API round-trips
+│   ├── test_stats_health.py      # houkai stats + --health report
+│   ├── test_recall_filters.py    # source/since/until recall filters
+│   ├── test_timeparse.py         # parse_timestamp (epoch/ISO/relative spans)
 │   └── test_tui.py               # TUI view models + Textual pilot runs
 ├── pyproject.toml
 └── requirements.txt
@@ -291,6 +299,10 @@ houkai show 72be7903
 # Delete memories (confirms unless --yes)
 houkai forget 72be7903
 houkai forget id1 id2 id3 --yes
+
+# Delete ALL memories in the current collection (irreversible)
+houkai nuke                  # shows count, confirms before deleting
+houkai nuke --yes            # skip confirmation
 ```
 
 ### Curation
@@ -448,7 +460,8 @@ houkai tui
 A Textual full-screen browser: memory list with detail pane, `/` for
 semantic search, `n` to walk the link graph from the selected memory
 (neighbors view with rel labels), `b` to go back along the breadcrumb,
-`r` for recent, `q` to quit. Read-only — it never mutates the store.
+`r` for recent, `X` to nuke all memories (two-press confirmation),
+`q` to quit.
 
 ### Stats
 

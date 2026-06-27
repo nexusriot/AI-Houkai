@@ -66,9 +66,9 @@ Four cognitive operations model how humans manage long-term memory:
             ▼                                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      MemoryStore                             │
-│   remember()  recall()  recall_pack()  forget()  count()     │
-│   list_recent()  link()  unlink()  neighbors()  subgraph()   │
-│   supersede()  restore()  find_conflicts()                   │
+│   remember()  recall()  recall_pack()  forget()  nuke()      │
+│   count()  list_recent()  link()  unlink()  neighbors()      │
+│   subgraph()  supersede()  restore()  find_conflicts()       │
 └───────────────────────────┬──────────────────────────────────┘
                             │
             ┌───────────────┼────────────────┐
@@ -105,6 +105,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   │                             ImportConflictError, Journal, JournalEntry,
 │   │                             DecayEngine, ReflectionEngine, build_summarizer
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
+│   ├── async_store.py            AsyncMemoryStore — coroutine wrapper, single-threaded executor
 │   ├── journal.py                Journal — append-only JSONL audit log
 │   ├── decay.py                  DecayEngine
 │   ├── reflection.py             ReflectionEngine
@@ -136,6 +137,7 @@ ai_houkai/                        pip package name: ai-houkai
 │       ├── list_cmd.py           houkai list
 │       ├── show.py               houkai show
 │       ├── forget.py             houkai forget
+│       ├── nuke.py               houkai nuke  (bulk delete all memories)
 │       ├── edit.py               houkai edit / tag / bump
 │       ├── link.py               houkai link / unlink / neighbors / graph
 │       ├── conflicts.py          houkai conflicts / supersede / restore
@@ -144,10 +146,15 @@ ai_houkai/                        pip package name: ai-houkai
 │       ├── maintenance.py        houkai maintenance tick/run/start/stop/status
 │       ├── journal.py            houkai journal tail/show/undo
 │       ├── io.py                 houkai export / import / info / backup
+│       ├── ingest.py             houkai ingest
+│       ├── serve.py              houkai serve  (HTTP/REST front-end)
 │       └── stats.py              houkai stats
 └── installers/
-    ├── __init__.py               re-exports ClaudeCodeInstaller
-    └── claude_code.py            patches ~/.claude/settings.json
+    ├── __init__.py               re-exports ClaudeCodeInstaller, CursorInstaller, OpenCodeInstaller
+    ├── common.py                 shared command resolver, JSON patcher, verify_server, memory guide
+    ├── claude_code.py            ClaudeCodeInstaller — patches ~/.claude/settings.json
+    ├── cursor.py                 CursorInstaller — patches ~/.cursor/mcp.json
+    └── opencode.py               OpenCodeInstaller — patches ~/.config/opencode/opencode.json
 ```
 
 Import styles:
@@ -831,26 +838,31 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 338 tests across 16 files
+### 445 tests across 21 files
 
 | File | Tests | What it covers |
 |---|---|---|
-| `test_memory.py` | 22 | `MemoryStore`: remember, forget, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
-| `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
-| `test_reflection.py` | 20 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips already-superseded sources, default summarizer |
-| `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
-| `test_cli.py` | 15 | CLI round-trips: remember → list → show → forget, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed (id/links preserved), interactive conflict resolution |
-| `test_hybrid.py` | 24 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion |
-| `test_conflicts.py` | 31 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
+| `test_maintenance.py` | 57 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
+| `test_pack.py` | 47 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
+| `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
+| `test_hybrid.py` | 30 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion |
+| `test_memory.py` | 27 | `MemoryStore`: remember, forget, nuke, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
+| `test_reflection.py` | 23 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources |
+| `test_summarizers.py` | 22 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
+| `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
+| `test_cli.py` | 21 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
+| `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
+| `test_async_store.py` | 19 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
+| `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
+| `test_http_server.py` | 15 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 error handling, concurrency lock |
+| `test_stats_health.py` | 13 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection |
 | `test_journal.py` | 13 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
 | `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
-| `test_maintenance.py` | 52 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
-| `test_pack.py` | 15 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
-| `test_summarizers.py` | 21 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
-| `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
-| `test_ingest.py` | 18 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
+| `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
+| `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
+| `test_dispatch.py` | 8 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 
 ### Test isolation strategy
 
@@ -1126,7 +1138,7 @@ friendly install hint if the extras are absent.
 
 ```
 houkai (bin)
-  └── ai_houkai/cli/main.py          Typer app; registers 25 commands plus
+  └── ai_houkai/cli/main.py          Typer app; registers 27 commands plus
                                      three sub-command groups (maintenance,
                                      journal, collections); shared
                                      --store / --collection flags
@@ -1162,6 +1174,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
 | `show` | `show.py` | `store._get_by_id()` |
 | `forget` | `forget.py` | `store.forget()` |
+| `nuke` | `nuke.py` | `store.nuke()` — deletes all memories; confirms unless `--yes` |
 | `edit` | `edit.py` | `collection.update()` in place (re-embeds via `documents=` when text changed; id + links preserved) |
 | `tag` | `edit.py` | `collection.update()` metadata-only |
 | `bump` | `edit.py` | `collection.update()` metadata-only |
@@ -1180,6 +1193,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
 | `stats` | `stats.py` | `store.list_recent()` + Counter |
 | `ingest` | `ingest.py` | `chunk_text()` → one `store.remember()` per chunk |
+| `serve` | `serve.py` | `http_server.serve()` — starts JSON HTTP API on `--host`/`--port`, optional `--token` |
 | `tui` | `tui_cmd.py` | `HoukaiTui` (Textual; needs the `tui` extra) |
 | `maintenance` (group) | `maintenance.py` | `MaintenanceScheduler` — tick/run/start/stop/status |
 | `journal` (group) | `journal.py` | `Journal` — tail/show/undo |
@@ -1202,8 +1216,10 @@ raises `ValueError` on ambiguous or missing prefixes.
 
 ### Safety rules
 
-- **Destructive commands** (`forget`, `prune --apply`, `reflect --apply
+- **Destructive commands** (`forget`, `nuke`, `prune --apply`, `reflect --apply
   --consolidate hard`, `import`) confirm interactively unless `--yes`.
+- `nuke` deletes **all** memories in the active collection in one call;
+  it shows the count before prompting, and returns the number deleted.
 - `prune` and `reflect` default to **dry-run** — matching the underlying
   engine conventions — and require an explicit `--apply` flag to write.
 - `tag` and `bump` update only ChromaDB metadata; the embedding vector
