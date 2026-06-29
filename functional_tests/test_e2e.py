@@ -24,6 +24,7 @@ so the ``houkai`` / ``ai-houkai-serve`` entry points are on PATH.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -179,6 +180,44 @@ def test_cli_stats_health_protects_procedural(tmp_path):
     assert "Prune candidates (1)" in dry.stdout, dry.stdout
 
 
+def test_cli_cjk_recall(tmp_path):
+    """CJK text round-trips through the CLI subprocess boundary, and hybrid
+    recall (which now emits CJK character bigrams for lexical matching) surfaces
+    a Japanese memory for a Japanese query over English distractors."""
+    store = str(tmp_path / "chroma")
+
+    jp = remember(store, "日本語のテストメモリ", "-t", "semantic")
+    remember(store, "the quick brown fox jumps over the lazy dog", "-t", "semantic")
+    remember(store, "deploy the service with make release", "-t", "procedural")
+
+    hits = houkai_json(store, "recall", "日本語", "-k", "3",
+                       "--mode", "hybrid", "--format", "json")
+    assert hits, "no hits for the CJK query"
+    assert hits[0]["id"] == jp, [h["text"] for h in hits]
+
+
+def test_cli_stats_health_frequency_weight_reinforces(tmp_path):
+    """`stats --health --frequency-weight` feeds the recall-reinforcement term
+    into the decay-score histogram: a frequently-recalled memory scores into a
+    strictly higher band with reinforcement than without it."""
+    store = str(tmp_path / "chroma")
+
+    remember(store, "reinforced fact about widgets", "-t", "semantic", "-i", "0.5")
+    # Each recall bumps access_count; build it up so reinforcement has an effect.
+    for _ in range(3):
+        houkai_json(store, "recall", "reinforced widgets", "-k", "1", "--format", "json")
+
+    def _top_band(freq_weight: str) -> int:
+        h = houkai_json(store, "stats", "--health", "--decay-rate", "0.1",
+                        "--frequency-weight", freq_weight, "--format", "json")["health"]
+        counts = list(h["decay_histogram"].values())  # bands ordered low → high
+        return max(i for i, c in enumerate(counts) if c > 0)
+
+    base_band = _top_band("0.0")
+    reinforced_band = _top_band("2.0")
+    assert reinforced_band > base_band, (base_band, reinforced_band)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -186,7 +225,7 @@ def _free_port() -> int:
 
 
 def _http(method: str, url: str, payload: dict | None = None, timeout: float = 10,
-          retries: int = 4):
+          retries: int = 4, headers: dict | None = None):
     """Issue a JSON request, retrying only transient connection failures.
 
     A fresh TCP connection per call plus many parallel callers occasionally hits
@@ -194,11 +233,13 @@ def _http(method: str, url: str, payload: dict | None = None, timeout: float = 1
     than raw socket luck. Application errors (4xx/5xx) are never retried.
     """
     data = json.dumps(payload).encode() if payload is not None else None
+    base_headers = {"Content-Type": "application/json"} if data else {}
+    if headers:
+        base_headers.update(headers)
     last_exc: Exception | None = None
     for attempt in range(retries):
         req = urllib.request.Request(
-            url, data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {},
+            url, data=data, method=method, headers=dict(base_headers),
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -213,9 +254,13 @@ def _http(method: str, url: str, payload: dict | None = None, timeout: float = 1
     raise AssertionError(f"{method} {url} failed after {retries} retries: {last_exc}")
 
 
-@pytest.fixture()
-def http_server(tmp_path):
-    """Start ai-houkai-serve as a real subprocess; yield its base URL."""
+@contextlib.contextmanager
+def _serve(tmp_path, extra_env: dict | None = None):
+    """Start ai-houkai-serve as a real subprocess; yield its base URL.
+
+    ``extra_env`` overlays the base environment (e.g. to set
+    ``AI_HOUKAI_HTTP_TOKEN`` for the auth-enabled server).
+    """
     port = _free_port()
     env = {
         **os.environ,
@@ -223,6 +268,7 @@ def http_server(tmp_path):
         "AI_HOUKAI_COLLECTION": "func_http",
         "AI_HOUKAI_HTTP_HOST": "127.0.0.1",
         "AI_HOUKAI_HTTP_PORT": str(port),
+        **(extra_env or {}),
     }
     proc = subprocess.Popen(
         ["ai-houkai-serve"], env=env,
@@ -232,7 +278,7 @@ def http_server(tmp_path):
     try:
         # Wait for liveness — the first request also loads the embedding model.
         # Probe with a raw urlopen (not _http) so a not-yet-listening socket is
-        # tolerated rather than raising.
+        # tolerated rather than raising. /health is open even with auth set.
         deadline = time.time() + 120
         while time.time() < deadline:
             if proc.poll() is not None:
@@ -256,8 +302,32 @@ def http_server(tmp_path):
             proc.kill()
 
 
+@pytest.fixture()
+def http_server(tmp_path):
+    """A running ai-houkai-serve with no auth; yields its base URL."""
+    with _serve(tmp_path) as base:
+        yield base
+
+
+# Bearer token used by the auth-enabled server fixture.
+_AUTH_TOKEN = "func-secret-token"
+
+
+@pytest.fixture()
+def http_server_auth(tmp_path):
+    """A running ai-houkai-serve with AI_HOUKAI_HTTP_TOKEN set; yields (base, token)."""
+    with _serve(tmp_path, {"AI_HOUKAI_HTTP_TOKEN": _AUTH_TOKEN}) as base:
+        yield base, _AUTH_TOKEN
+
+
 def test_http_roundtrip(http_server):
     base = http_server
+
+    # — /health is liveness-only: it must expose status + count but NOT the
+    #   collection name (topology), per the HTTP hardening. —
+    status, health = _http("GET", f"{base}/health")
+    assert status == 200 and health.get("status") == "ok" and "count" in health
+    assert "collection" not in health, health
 
     status, mem = _http("POST", f"{base}/memories",
                         {"text": "remember me over http", "type": "semantic",
@@ -389,6 +459,58 @@ def test_http_stress_concurrent_add_and_fetch(http_server):
         list(pool.map(fetch, list(ids.items())))
 
     assert not fetch_errors, fetch_errors[:10]
+
+
+def test_http_recall_bumps_all_hits(http_server):
+    """Regression guard for the batched access-bump (`_touch_many`): a single
+    /recall that returns several memories must bump *every* hit's access_count
+    exactly once — none dropped by the one batched Chroma write."""
+    base = http_server
+
+    ids = []
+    for i in range(3):
+        _, mem = _http("POST", f"{base}/memories",
+                       {"text": f"alpha widget variant {i}", "type": "semantic"})
+        ids.append(mem["id"])
+
+    # Freshly stored → never recalled yet.
+    for mid in ids:
+        _, got = _http("GET", f"{base}/memories/{mid}")
+        assert got["access_count"] == 0, got
+
+    status, res = _http("POST", f"{base}/recall", {"query": "alpha widget", "k": 5})
+    assert status == 200
+    assert set(ids) <= {r["id"] for r in res["results"]}, res["results"]
+
+    # Every hit bumped exactly once by the single batched write.
+    for mid in ids:
+        _, got = _http("GET", f"{base}/memories/{mid}")
+        assert got["access_count"] == 1, got
+
+
+def test_http_auth_enforced(http_server_auth):
+    """With AI_HOUKAI_HTTP_TOKEN set: /health stays open, but every other route
+    requires the correct bearer token (constant-time compared); an absent or
+    wrong token is rejected with 401."""
+    base, token = http_server_auth
+
+    # Liveness probe is always open, even with auth configured.
+    status, _ = _http("GET", f"{base}/health")
+    assert status == 200
+
+    # Protected route, no token → 401.
+    status, _ = _http("GET", f"{base}/stats")
+    assert status == 401
+
+    # Wrong token → 401.
+    status, _ = _http("GET", f"{base}/stats",
+                      headers={"Authorization": "Bearer wrong-token"})
+    assert status == 401
+
+    # Correct token → 200.
+    status, body = _http("GET", f"{base}/stats",
+                         headers={"Authorization": f"Bearer {token}"})
+    assert status == 200 and "count" in body
 
 
 if __name__ == "__main__":  # allow `python functional_tests/test_e2e.py`
