@@ -1,7 +1,7 @@
 # AI-Houkai — Architecture & Design
 
 > This document covers the **Python** implementation (`ai_houkai/`). The Go
-> port under `go/` has the same feature surface (15 MCP tools, identical
+> port under `go/` has the same feature surface (16 MCP tools, identical
 > `.ahkai` format and journal line format) but its own internals — see
 > [go/DESIGN.md](go/DESIGN.md).
 
@@ -66,8 +66,9 @@ Four cognitive operations model how humans manage long-term memory:
             ▼                                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      MemoryStore                             │
-│   remember()  recall()  recall_pack()  forget()  nuke()      │
-│   count()  list_recent()  link()  unlink()  neighbors()      │
+│   remember()  recall()  recall_pack()  auto_context_pack()   │
+│   forget()  nuke()  count()  list_recent()  link()  unlink() │
+│   neighbors()                                                │
 │   subgraph()  supersede()  restore()  find_conflicts()       │
 └───────────────────────────┬──────────────────────────────────┘
                             │
@@ -103,7 +104,9 @@ ai_houkai/                        pip package name: ai-houkai
 │   │                             PackResult, PackedMemory,
 │   │                             ExportSummary, ImportSummary,
 │   │                             ImportConflictError, Journal, JournalEntry,
-│   │                             DecayEngine, ReflectionEngine, build_summarizer
+│   │                             DecayEngine, ReflectionEngine, build_summarizer,
+│   │                             AsyncMemoryStore, CompressedGroup,
+│   │                             extract_key_phrases, score_importance
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
 │   ├── async_store.py            AsyncMemoryStore — coroutine wrapper, single-threaded executor
 │   ├── journal.py                Journal — append-only JSONL audit log
@@ -123,7 +126,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 15 tools
+│   └── server.py                 FastMCP server — 16 tools
 ├── cli/
 │   ├── __init__.py
 │   ├── __main__.py               python -m ai_houkai.cli
@@ -163,8 +166,8 @@ Import styles:
 # Subpackage (canonical)
 from ai_houkai.memory_system import MemoryStore, DecayEngine, ReflectionEngine
 
-# Top-level convenience re-export
-from ai_houkai import MemoryStore, DecayEngine, ReflectionEngine
+# Top-level convenience re-export (from ai_houkai/__init__.py)
+from ai_houkai import MemoryStore, DecayEngine, ReflectionEngine, AsyncMemoryStore
 ```
 
 ---
@@ -192,6 +195,12 @@ class Memory:
     superseded_at: float        # epoch when superseded
     polarity:      int          # -1 / 0 / +1
 ```
+
+`polarity` plays two roles. Beyond driving `polarity_diff` conflict detection
+(§13 — two non-zero opposite polarities at high similarity flag a
+contradiction), it also contributes a small **additive ranking bonus** at
+recall time via `HybridWeights.polarity_weight` (default `0.05`): `+ζ` for
+`+1`, `−ζ` for `−1`, nothing for neutral. See §14.
 
 ### Link dataclass
 
@@ -318,12 +327,22 @@ be fine — HNSW ensures queries stay fast as collections grow.
 
 #### recall() filtering pipeline
 
-1. Build `where` dict from `type` and `min_importance` args.
-2. Call `collection.query(n_results=k, where=where)`.
-3. Post-filter by `tag` (ChromaDB only supports `$eq` on scalar fields,
+1. Build the `where` clause (`_build_where`) from `type`, `min_importance`,
+   `source`, `since`, `until` and over-fetch a cosine pool.
+2. Post-filter by `tag` (ChromaDB only supports `$eq` on scalar fields,
    not array membership — tag filtering happens in Python).
-4. Call `_touch()` on every returned memory.
-5. Convert cosine distance → similarity score and return.
+3. Score the pool: weighted hybrid (`_hybrid_score`), `fusion="rrf"`
+   (`_rrf_score`), or semantic (`_semantic_filter`); `min_cosine` drops any
+   candidate below an absolute cosine floor.
+4. Optional re-selection: when `diversity` or `dedup_threshold` is set,
+   `_mmr_select` re-orders/drops near-duplicates (min-max-normalising
+   relevance first); otherwise take the top-k.
+5. Unless `touch=False`, batch-bump access tracking for **all** hits in ONE
+   Chroma write (`_touch_many`).
+6. Optional multi-hop graph expansion out to `expand.depth` with a per-hop
+   `expand.decay` multiplier (`_expand_links`).
+7. Return `(Memory, score)` pairs — or `(Memory, score, breakdown)` triples
+   when `explain=True`.
 
 #### recall_pack() — token-budgeted assembly
 
@@ -346,6 +365,28 @@ Token estimation is tokenizer-free (`max(1, round(len/4))`), so `token_budget`
 is a **soft ceiling** covering the memory lines only — the header is excluded.
 Callers needing exact budgets pass `token_counter=`. The budget has no
 data-model impact and is purely additive on the read path.
+
+`recall_pack()` forwards `fusion` / `diversity` / `dedup_threshold` /
+`min_cosine` / `touch` straight through to `recall()`, so all the ranking
+controls from §14 are available on the pack path too. With `compress=True`,
+candidates that were dropped for exceeding the budget are clustered by
+token-Jaccard similarity (`compress_threshold`, default `0.30`); each cluster
+of ≥ `compress_min_group` (default `2`) members is folded into a single
+`- (compressed)` summary line that is packed if it fits the remaining budget,
+surfaced separately as `compressed_groups`.
+
+#### auto_context_pack() — multi-angle fan-out
+
+`auto_context_pack()` sits alongside `recall_pack()` for tasks with compound
+concepts. It extracts up to `max_phrases` key bigram/keyword phrases from the
+task (`extract_key_phrases`), runs `recall()` for the task **and** each phrase
+angle independently, deduplicates by id (keeping the **best** score seen per
+memory), then packs greedily through the **same** packer (`_pack_ranked`) that
+`recall_pack()` uses — so `compress` works here too. It also accepts
+`min_cosine` (an absolute floor applied to every fan-out query, so an
+off-topic task injects nothing rather than weak padding) but deliberately
+omits `fusion="rrf"`, whose pool-relative scores are not comparable across the
+different fan-out pools (see §14).
 
 ---
 
@@ -547,15 +588,16 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose fifteen tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose sixteen tools:
 
 **Core tools**
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored}` or `{stored:false, conflicts:[…]}` |
-| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
-| `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `mode?`, `max_items?`, `include_superseded?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}]}` |
+| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored, importance}` or `{stored:false, conflicts:[…]}` |
+| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
+| `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `max_items?`, `include_superseded?`, `compress?`, `compress_threshold?`, `compress_min_group?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}], compressed_groups:[{ids,text,tokens,count}]}` |
+| `auto_context` | `task`, `token_budget?`, `max_phrases?`, `mode?` | `{text, queries, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}]}` |
 | `forget` | `memory_id` | `{deleted}` |
 | `list_recent` | `limit?`, `include_superseded?` | `list[{…,superseded_by}]` |
 | `stats` | — | `{count, path, collection}` |
@@ -838,31 +880,32 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 445 tests across 21 files
+### 523 tests across 22 files
 
 | File | Tests | What it covers |
 |---|---|---|
 | `test_maintenance.py` | 57 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
-| `test_pack.py` | 47 | `recall_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation |
+| `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
+| `test_pack.py` | 52 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
 | `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
-| `test_hybrid.py` | 30 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion |
-| `test_memory.py` | 27 | `MemoryStore`: remember, forget, nuke, recall (filters, touch), list_recent, `Memory` dataclass serialisation |
+| `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
+| `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
+| `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 | `test_reflection.py` | 23 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources |
-| `test_summarizers.py` | 22 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
 | `test_cli.py` | 21 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
 | `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
 | `test_async_store.py` | 19 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
-| `test_http_server.py` | 15 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 error handling, concurrency lock |
-| `test_stats_health.py` | 13 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection |
+| `test_http_server.py` | 16 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 error handling, concurrency lock, `/health` topology-leak guard |
+| `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
+| `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
 | `test_journal.py` | 13 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
 | `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
-| `test_dispatch.py` | 8 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 
 ### Test isolation strategy
 
@@ -947,12 +990,15 @@ Pass `include_superseded=True` to see them.
 ```
 candidates(a) = recall(a.text, n=12)
 for b in candidates:
-    if b.type != a.type          → skip
-    if sim(a,b) < threshold      → skip   (default 0.80)
-    if tags don't overlap        → skip   (both must share ≥1 tag, or both empty)
-    if negation_diff(a, b)       → kind="contradiction", reason="negation_diff"
-    elif contradiction_fn(a, b)  → kind="contradiction", reason="custom_fn"
-    else                         → kind="duplicate",     reason="similarity"
+    if b.type != a.type            → skip
+    if sim(a,b) < threshold        → skip   (default 0.80)
+    if both have tags & disjoint   → skip   (an untagged side never triggers
+                                             the guard)
+    if both polarities nonzero
+       and opposite                → kind="contradiction", reason="polarity_diff"
+    elif negation_diff(a, b)       → kind="contradiction", reason="negation_diff"
+    elif contradiction_fn(a, b)    → kind="contradiction", reason="custom_fn"
+    else                           → kind="duplicate",     reason="similarity"
 ```
 
 `negation_diff`: strips apostrophes, tokenises, counts negation words
@@ -980,20 +1026,80 @@ store.find_conflicts(memory_id=x)            # check one memory
 ### Score formula
 
 ```
-final = α·cosine + β·BM25_local + γ·recency + δ·importance
+final = α·cosine + β·BM25_local + γ·recency + δ·importance + ζ·polarity
 ```
 
 | Weight | Default |
 |---|---|
-| α cosine    | 0.55 |
-| β lexical   | 0.20 |
-| γ recency   | 0.15 |
-| δ importance| 0.10 |
+| α cosine          | 0.55 |
+| β lexical         | 0.20 |
+| γ recency         | 0.15 |
+| δ importance      | 0.10 |
+| ζ polarity_weight | 0.05 |
+
+The polarity term is `ζ · mem.polarity` (so `+ζ` for `polarity=+1`, `−ζ`
+for `−1`, nothing for neutral). It is **not** confined to hybrid mode: the
+default `mode="semantic"` path also adds the same `ζ·polarity` bonus and
+re-sorts its results whenever `polarity_weight ≠ 0` (with `ζ=0` the order is
+the pure cosine ranking, unchanged).
 
 `recency = exp(−λ · age_days)` — same λ as `DecayEngine` (default 0.1).
+By default `age_days` is measured from `created_at`
+(`HybridWeights.recency_basis="created"`), so a memory's recency score is
+**stable across recalls** — it reflects how recently the fact was *learned*.
+Setting `recency_basis="accessed"` measures from `last_accessed` instead,
+restoring the older retrieved-recency behaviour, which is self-reinforcing
+because every recall hit `_touch`-bumps `last_accessed`.
 
 **BM25 is computed locally** over the cosine over-fetch pool only — no
 second index, O(1) additional storage.
+
+#### Fusion modes
+
+| `fusion` | Blend |
+|---|---|
+| `"weighted"` (default) | the weighted sum above (`α·cosine + … + ζ·polarity`). |
+| `"rrf"` | Reciprocal Rank Fusion — each signal ranks the pool independently and the fused score is `Σ weight_s / (rrf_k + rank_s)` with `rrf_k=60`; polarity stays a tiny additive nudge. |
+
+RRF is **scale-free** (it consumes only ordinal ranks, so it is immune to
+the BM25-vs-cosine magnitude mismatch), but its scores are **pool-relative**
+— comparable only across identically-pooled fan-outs, not arbitrary recalls.
+That is why `auto_context_pack` (which fans out over several different query
+pools and dedupes by score) deliberately does **not** expose `fusion="rrf"`.
+
+#### Re-selection, dedup, and gating
+
+- `diversity` (0..1) re-selects results with Maximal Marginal Relevance
+  (`_mmr_select`): `score = λ·relevance − (1−λ)·max_cosine_to_selected`,
+  higher → more relevance, lower → more novelty. Relevance is min-max
+  normalised to [0,1] so the trade-off is on the same scale as the cosine
+  novelty penalty (critical for the tiny RRF scores).
+- `dedup_threshold` hard-drops a candidate whose cosine to an
+  already-selected result is ≥ the threshold (e.g. `0.92`).
+- `min_cosine` is an **absolute** cosine floor; candidates below it are
+  dropped so a caller can receive *nothing* rather than weak hits. Out of
+  the `[-1, 1]` range → `ValueError` (as do out-of-range `diversity` /
+  `dedup_threshold`).
+- `touch=False` makes recall read-only (no access-count / `last_accessed`
+  bump) — e.g. for evaluation.
+- `explain=True` returns `(Memory, score, breakdown)` triples.
+- `diversity` / `dedup_threshold` also apply in `mode="semantic"`.
+
+#### Lexical renormalisation
+
+When a query yields **zero** BM25 across the whole pool (e.g. an
+all-stopword or out-of-vocabulary query), the lexical weight is dropped and
+the remaining core weights (`cosine`, `recency`, `importance`) are
+renormalised so scores are not artificially depressed — unless the config is
+lexical-only (nothing to scale the weight into), in which case the weights
+are left untouched.
+
+#### CJK / Korean tokenization
+
+`_tokenize` emits character **bigrams** for non-Latin runs (Hiragana,
+Katakana, CJK ideographs, and Hangul), so BM25 and the Jaccard similarity
+used elsewhere still produce a lexical signal for CJK/Korean text that has no
+whitespace word boundaries.
 
 ### API
 
@@ -1004,16 +1110,33 @@ store.recall(query, k, mode="hybrid",
                                    recency=0.05, importance=0.05))
 store.recall(query, k, overfetch=6)                      # larger cosine pool
 
-# Graph-walk expansion after scoring
+# Ranking controls
+store.recall(query, k, fusion="rrf")                     # Reciprocal Rank Fusion
+store.recall(query, k, diversity=0.7, dedup_threshold=0.92)  # MMR + near-dup drop
+store.recall(query, k, min_cosine=0.2)                   # absolute relevance gate
+store.recall(query, k, touch=False, explain=True)        # read-only + breakdowns
+
+# Graph-walk expansion after scoring (multi-hop BFS)
 store.recall(query, k,
              expand=ExpandSpec(rels=("refines","example_of"),
-                               depth=1, cap=5, score=0.70))
+                               depth=2, cap=5, score=0.70, decay=0.8))
+#   hop-h neighbour scored score·decay**(h-1); decay=1.0 (default) = old
+#   distance-independent behaviour; depth>1 now does a real BFS over links.
 
 # Metadata filters — provenance + creation-time window
 store.recall(query, k, source="git", since=ts_a, until=ts_b)
 ```
 
 Default `mode="semantic"` is unchanged — zero risk for existing callers.
+
+The `explain=True` breakdown shape **varies by scoring path**:
+
+| Path | Breakdown keys |
+|---|---|
+| weighted hybrid | `cosine`, `lexical`, `recency`, `importance`, `polarity`, `weights`, `score` |
+| `fusion="rrf"`  | `signals` (per-signal `{rank, contribution}`), `polarity`, `rrf_k`, `score` |
+| semantic        | `cosine`, `polarity`, `score` |
+| graph-expanded  | `{source:"graph_expansion", rel, hop, score}` |
 
 #### Metadata filters
 
@@ -1191,7 +1314,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `import` | `io.py` | JSONL → `store.remember()` |
 | `info` | `io.py` | inspect a `.ahkai` archive without importing |
 | `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
-| `stats` | `stats.py` | `store.list_recent()` + Counter |
+| `stats` | `stats.py` | `store.list_recent()` + Counter; `--health` reuses the engine decay formula (incl. frequency reinforcement) with `decay_rate` / `min_score` / `protect_types` / `frequency_weight` loaded from `[maintenance.decay]` config (overridable via `--decay-rate` / `--frequency-weight`) so its at-risk count matches `prune()` |
 | `ingest` | `ingest.py` | `chunk_text()` → one `store.remember()` per chunk |
 | `serve` | `serve.py` | `http_server.serve()` — starts JSON HTTP API on `--host`/`--port`, optional `--token` |
 | `tui` | `tui_cmd.py` | `HoukaiTui` (Textual; needs the `tui` extra) |
@@ -1387,7 +1510,7 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 
 | Method & path | Store call |
 |---|---|
-| `GET /health` | `count()` — always reachable (liveness, skips auth) |
+| `GET /health` | `count()` — always reachable (liveness, skips auth); returns only `{status, count}`, omitting the collection name |
 | `GET /stats` | path / collection / count |
 | `GET /memories` | `list_recent(limit, include_superseded)` |
 | `POST /memories` | `remember(...)` → 201, or 409 on `ConflictError` |
@@ -1399,6 +1522,14 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 | `POST /links` · `POST /unlink` | `link` / `unlink` |
 | `POST /supersede` · `POST /conflicts` | `supersede` / `find_conflicts` |
 
+The newer ranking and compression knobs (`fusion`, `diversity`,
+`dedup_threshold`, `min_cosine`, `expand`, and `recall_pack`'s `compress*`
+group) are **not** exposed over HTTP — `/recall` and `/recall_pack` accept
+only the stable parameter set (`query`, `k` / `token_budget`, `type`, `tag`,
+`min_importance`, `source`, `since`, `until`, `mode`, `max_items`,
+`include_superseded`). Callers needing the full ranking surface use the
+Python API or MCP.
+
 ### Design
 
 - **Framework-free routing.** A single `_ROUTES` table of
@@ -1408,12 +1539,17 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
   A path that matches a row but not the verb returns `405`; no match is `404`.
 - **Errors.** Handlers raise `HttpError(status, message)` for expected
   failures (400 bad input, 404 missing, 413 oversized body); any other
-  exception is caught and rendered as `500 {"error": "<Type>: <msg>"}` so a
-  single bad request never takes the server down. Request bodies are capped at
-  4 MiB and parsed as a JSON object.
+  exception is caught and rendered as
+  `500 {"error": "internal server error", "request_id": "<hex>"}` so a single
+  bad request never takes the server down. The exception type, message, and
+  traceback are deliberately **not** leaked to the client — only the
+  `request_id` is, so a failure can be correlated to a server-side log.
+  Request bodies are capped at 4 MiB and parsed as a JSON object.
 - **Auth.** Optional bearer token (`auth_token` arg / `AI_HOUKAI_HTTP_TOKEN`).
   When set, every route except `/health` requires
-  `Authorization: Bearer <token>`, else `401`. Binds `127.0.0.1` by default;
+  `Authorization: Bearer <token>`, compared with `hmac.compare_digest`
+  (constant-time, so a wrong token can't be recovered by timing), else `401`.
+  Binds `127.0.0.1` by default;
   exposing `0.0.0.0` is left to a deliberate `--host` / env override behind a
   trusted network or reverse proxy.
 - **Attribution.** The server sets the store's actor to `"http"`, so journal

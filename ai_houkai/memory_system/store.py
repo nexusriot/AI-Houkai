@@ -85,6 +85,11 @@ class HybridWeights:
     importance:     float = 0.10
     decay_rate:     float = 0.10   # λ — shared with DecayEngine
     polarity_weight: float = 0.05  # additive bonus: +0.05 for polarity=+1, -0.05 for -1
+    # Which timestamp the recency term measures. "created" (default) scores by
+    # how recently the fact was *learned* — stable across recalls. "accessed"
+    # scores by how recently it was *retrieved*, which `_touch` moves on every
+    # recall (self-reinforcing); kept as an opt-in for the old behaviour.
+    recency_basis:  Literal["created", "accessed"] = "created"
 
     def __post_init__(self) -> None:
         total = self.cosine + self.lexical + self.recency + self.importance
@@ -99,6 +104,10 @@ class ExpandSpec:
     depth: int   = 1
     cap:   int   = 5
     score: float = 0.70
+    # Per-hop score multiplier beyond the first hop: a hop-h neighbour is scored
+    # ``score * decay**(h-1)``. 1.0 (default) keeps every expanded node at
+    # ``score`` regardless of distance (backward-compatible).
+    decay: float = 1.0
 
 
 @dataclass
@@ -275,10 +284,29 @@ _BM25_K1 = 1.5
 _BM25_B  = 0.75
 
 
+# CJK / Korean ranges: these scripts are written without spaces, so a run of
+# them collapses into a single \w+ token. We additionally emit character bigrams
+# of each run so lexical (BM25/Jaccard) matching works for non-Latin queries —
+# a standard, dependency-free IR technique for CJK.
+_CJK_RE = re.compile(
+    r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힣]"
+)
+
+
 def _tokenize(text: str) -> list[str]:
     # Strip apostrophes so "don't" → "dont", "won't" → "wont", matching _NEG
     normalized = text.lower().replace("’", "").replace("'", "")
-    return re.findall(r"\b\w+\b", normalized)
+    tokens = re.findall(r"\b\w+\b", normalized)
+    if not _CJK_RE.search(normalized):
+        return tokens
+    extra: list[str] = []
+    for tok in tokens:
+        chars = [c for c in tok if _CJK_RE.match(c)]
+        # Bigrams of multi-char CJK runs; a single CJK char is already its own
+        # \w+ token, so we don't re-emit it (avoids double-counting in tf).
+        if len(chars) >= 2:
+            extra.extend(chars[i] + chars[i + 1] for i in range(len(chars) - 1))
+    return tokens + extra
 
 
 def _bm25_score_pool(
@@ -630,49 +658,100 @@ class MemoryStore:
         until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "semantic",
         weights: HybridWeights | None = None,
+        fusion: Literal["weighted", "rrf"] = "weighted",
+        diversity: float | None = None,
+        dedup_threshold: float | None = None,
+        min_cosine: float | None = None,
         overfetch: int = 4,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
-    ) -> list[tuple[Memory, float]]:
+        touch: bool = True,
+        explain: bool = False,
+    ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         """Semantic (or hybrid) search with optional metadata filters.
 
         ``type``/``min_importance``/``source`` match exactly (``source`` is the
         provenance string set at :meth:`remember` time); ``since``/``until`` are
         Unix timestamps bounding ``created_at`` (inclusive). ``tag`` is matched
         post-query against the memory's tag list.
+
+        Ranking controls (hybrid mode unless noted):
+          ``fusion="rrf"`` blends signals by Reciprocal Rank Fusion (scale-free)
+          instead of the default weighted sum.
+          ``diversity`` (0..1) re-selects results with Maximal Marginal Relevance:
+          higher → more relevance, lower → more novelty. ``dedup_threshold``
+          (e.g. 0.92) hard-drops a candidate whose cosine to an already-selected
+          result exceeds it. Both also apply in semantic mode.
+          ``min_cosine`` drops any candidate below an absolute cosine floor —
+          a relevance gate that lets callers receive *nothing* rather than weak hits.
+
+        ``touch=False`` skips the access-count / last_accessed bump (read-only
+        recall — e.g. for evaluation). ``explain=True`` returns
+        ``(Memory, score, breakdown)`` triples with per-signal contributions.
         """
+        if diversity is not None and not (0.0 <= diversity <= 1.0):
+            raise ValueError("diversity must be in [0, 1]")
+        if dedup_threshold is not None and not (0.0 <= dedup_threshold <= 1.0):
+            raise ValueError("dedup_threshold must be in [0, 1]")
+        if min_cosine is not None and not (-1.0 <= min_cosine <= 1.0):
+            raise ValueError("min_cosine must be in [-1, 1]")
+
         count = self.collection.count()
         if k <= 0 or count == 0:
             return []
 
+        need_emb = diversity is not None or dedup_threshold is not None
+
         # The fast path (fetch exactly k) is only safe when no post-query
-        # filtering can drop rows: the `tag` filter in _semantic_filter always
-        # runs, so it needs the overfetch headroom too.
-        no_post_filter = mode == "semantic" and include_superseded and tag is None
+        # filtering or re-selection can drop/reorder rows.
+        no_post_filter = (
+            mode == "semantic" and include_superseded and tag is None
+            and not need_emb and min_cosine is None
+        )
         n_fetch = k if no_post_filter else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
 
         where = _build_where(type, min_importance, source, since, until)
 
+        include = ["documents", "metadatas", "distances"]
+        if need_emb:
+            include = include + ["embeddings"]
         res = self.collection.query(
             query_texts=[query],
             n_results=n_fetch,
             where=where,
+            include=include,
         )
 
         w = weights or self._hybrid_weights or HybridWeights()
+        expl: dict[str, dict] | None = {} if explain else None
         if mode == "hybrid":
-            out = self._hybrid_score(res, query, k, tag, include_superseded, weights)
+            if fusion == "rrf":
+                scored = self._rrf_score(
+                    res, query, tag, include_superseded, weights, min_cosine, expl)
+            else:
+                scored = self._hybrid_score(
+                    res, query, tag, include_superseded, weights, min_cosine, expl)
         else:
-            out = self._semantic_filter(res, k, tag, include_superseded, w.polarity_weight)
+            scored = self._semantic_filter(
+                res, tag, include_superseded, w.polarity_weight, min_cosine, expl)
 
-        for mem, _ in out:
-            self._touch(mem)
+        if need_emb:
+            out = self._mmr_select(
+                scored, k, self._emb_map(res), diversity, dedup_threshold)
+        else:
+            out = scored[:k]
+
+        if touch and out:
+            self._touch_many([mem for mem, _ in out])
 
         # Expand via outgoing links
         if expand is not None and expand.cap > 0:
-            out = self._expand_links(out, expand, include_superseded)
+            out = self._expand_links(out, expand, include_superseded, expl)
 
+        if explain:
+            return [(mem, score, (expl.get(mem.id, {}) if expl else {}))
+                    for mem, score in out]
         return out
 
     def recall_pack(
@@ -688,9 +767,14 @@ class MemoryStore:
         until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "hybrid",
         weights: HybridWeights | None = None,
+        fusion: Literal["weighted", "rrf"] = "weighted",
+        diversity: float | None = None,
+        dedup_threshold: float | None = None,
+        min_cosine: float | None = None,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
         max_items: int = 50,
+        touch: bool = True,
         token_counter: Callable[[str], int] | None = None,
         header: str = "## Relevant memory",
         compress: bool = False,
@@ -712,6 +796,10 @@ class MemoryStore:
         not be packed individually are clustered by Jaccard similarity; clusters
         of ≥ ``compress_min_group`` members are folded into a single summary
         line, which is packed if it fits the remaining budget.
+
+        ``fusion``/``diversity``/``dedup_threshold``/``min_cosine`` are passed
+        through to :meth:`recall` — e.g. ``diversity`` stops the budget being
+        spent on near-duplicate memories; ``min_cosine`` keeps weak hits out.
         """
         count_fn = token_counter or _estimate_tokens
 
@@ -726,10 +814,33 @@ class MemoryStore:
             until=until,
             mode=mode,
             weights=weights,
+            fusion=fusion,
+            diversity=diversity,
+            dedup_threshold=dedup_threshold,
+            min_cosine=min_cosine,
             expand=expand,
             include_superseded=include_superseded,
+            touch=touch,
+        )
+        return self._pack_ranked(
+            ranked, token_budget=token_budget, count_fn=count_fn, header=header,
+            compress=compress, compress_threshold=compress_threshold,
+            compress_min_group=compress_min_group,
         )
 
+    def _pack_ranked(
+        self,
+        ranked: list[tuple[Memory, float]],
+        *,
+        token_budget: int,
+        count_fn: Callable[[str], int],
+        header: str,
+        compress: bool = False,
+        compress_threshold: float = 0.30,
+        compress_min_group: int = 2,
+    ) -> PackResult:
+        """Greedily pack already-ranked ``(memory, score)`` pairs to a token
+        budget (shared by recall_pack and auto_context_pack)."""
         items: list[PackedMemory] = []
         dropped: list[tuple[Memory, float]] = []
         used = 0
@@ -780,51 +891,45 @@ class MemoryStore:
         token_budget: int = 800,
         max_phrases: int = 3,
         mode: Literal["semantic", "hybrid"] = "hybrid",
+        min_cosine: float | None = None,
         header: str = "## Relevant memory",
         token_counter: Callable[[str], int] | None = None,
+        compress: bool = False,
+        compress_threshold: float = 0.30,
+        compress_min_group: int = 2,
     ) -> PackResult:
         """Fan-out recall over *task* and extracted key phrases, deduplicate, and pack.
 
         More thorough than a single :meth:`recall_pack` call: extracts up to
         *max_phrases* bigram/keyword angles from the task description, runs
         :meth:`recall` for each, deduplicates by ID (keeping the highest score
-        seen), then packs greedily within *token_budget*.
+        seen), then packs greedily within *token_budget* via the shared packer
+        (so ``compress`` works here too).
+
+        ``min_cosine`` applies an absolute relevance floor to every fan-out
+        query, so an off-topic task injects nothing rather than padding context
+        with weak hits.
+
+        Note: this uses the default *weighted* fusion. ``fusion="rrf"`` is not
+        offered here because RRF scores are rank-relative to each query's own
+        candidate pool, so they cannot be compared across the fan-out queries.
         """
         count_fn = token_counter or _estimate_tokens
         queries = [task] + extract_key_phrases(task, max_phrases)
 
         best: dict[str, tuple[Memory, float]] = {}
         for q in queries:
-            for mem, score in self.recall(query=q, k=10, mode=mode):
+            for mem, score in self.recall(
+                query=q, k=10, mode=mode, min_cosine=min_cosine,
+            ):
                 if mem.id not in best or score > best[mem.id][1]:
                     best[mem.id] = (mem, score)
 
         ranked = sorted(best.values(), key=lambda x: x[1], reverse=True)
-
-        items: list[PackedMemory] = []
-        used = 0
-        truncated = False
-        for mem, score in ranked:
-            line = self._pack_line(mem)
-            cost = count_fn(line)
-            if used + cost > token_budget:
-                truncated = True
-                continue
-            items.append(PackedMemory(memory=mem, score=score, tokens=cost))
-            used += cost
-
-        if items:
-            body = "\n".join(self._pack_line(p.memory) for p in items)
-            text = f"{header}\n{body}" if header else body
-        else:
-            text = ""
-
-        return PackResult(
-            items=items,
-            text=text,
-            used_tokens=used,
-            budget=token_budget,
-            truncated=truncated,
+        return self._pack_ranked(
+            ranked, token_budget=token_budget, count_fn=count_fn, header=header,
+            compress=compress, compress_threshold=compress_threshold,
+            compress_min_group=compress_min_group,
         )
 
     @staticmethod
@@ -1036,7 +1141,7 @@ class MemoryStore:
         for _ in range(depth):
             next_frontier: list[str] = []
             for mid in frontier:
-                # ── outgoing ──
+                # outgoing
                 if direction in ("out", "both"):
                     mem = self._get_by_id(mid)
                     if mem is not None:
@@ -1422,6 +1527,96 @@ class MemoryStore:
         mem.access_count += 1
         self.collection.update(ids=[mem.id], metadatas=[mem.to_metadata()])
 
+    def _touch_many(self, mems: list[Memory]) -> None:
+        """Bump access tracking for several memories in ONE Chroma write.
+
+        A recall hitting ``k`` memories used to issue ``k`` separate updates
+        (and, under the HTTP server's single lock, serialise every read behind
+        them). Batching collapses that to a single read-modify-write.
+        """
+        if not mems:
+            return
+        now = time.time()
+        ids: list[str] = []
+        metas: list[dict[str, Any]] = []
+        for mem in mems:
+            mem.last_accessed = now
+            mem.access_count += 1
+            ids.append(mem.id)
+            metas.append(mem.to_metadata())
+        self.collection.update(ids=ids, metadatas=metas)
+
+    @staticmethod
+    def _emb_map(res: dict) -> dict[str, list[float]]:
+        """Build {id: embedding} from a Chroma query result (when embeddings
+        were requested)."""
+        raw = res.get("embeddings")
+        if raw is None:
+            return {}
+        ids = res["ids"][0]
+        embs = raw[0]
+        return {ids[i]: list(embs[i]) for i in range(len(ids)) if i < len(embs)}
+
+    def _mmr_select(
+        self,
+        scored: list[tuple[Memory, float]],
+        k: int,
+        emb_by_id: dict[str, list[float]],
+        diversity: float | None,
+        dedup_threshold: float | None,
+    ) -> list[tuple[Memory, float]]:
+        """Re-select up to *k* results balancing relevance and novelty (MMR) and/or
+        hard-dropping near-duplicates of already-selected results.
+
+        ``diversity`` (λ): score = λ·relevance − (1−λ)·max_cosine_to_selected.
+        ``dedup_threshold``: skip a candidate whose cosine to any selected
+        result is ≥ the threshold. With neither set this is a plain top-k.
+        """
+        lam = diversity
+        # Min-max normalize relevance to [0,1] so the MMR trade-off is on the
+        # same scale as the cosine novelty penalty. Critical for RRF scores
+        # (which live around 1/rrf_k ≈ 0.016, so without this the novelty term
+        # would dominate and scramble the order); a harmless uniform rescale for
+        # the already-[0,1] weighted scores.
+        rel_vals = [s for _, s in scored]
+        lo = min(rel_vals) if rel_vals else 0.0
+        hi = max(rel_vals) if rel_vals else 1.0
+        span = hi - lo
+
+        def _rel(s: float) -> float:
+            return (s - lo) / span if span > 1e-12 else 1.0
+
+        selected: list[tuple[Memory, float]] = []
+        sel_embs: list[list[float]] = []
+        pool = list(scored)
+        while pool and len(selected) < k:
+            best_idx = -1
+            best_val: float | None = None
+            for idx, (mem, score) in enumerate(pool):
+                emb = emb_by_id.get(mem.id)
+                max_sim = (
+                    max((_cosine_sim(emb, e) for e in sel_embs), default=0.0)
+                    if emb is not None else 0.0
+                )
+                if (dedup_threshold is not None and sel_embs and emb is not None
+                        and max_sim >= dedup_threshold):
+                    continue
+                if lam is not None:
+                    val = lam * _rel(score) - (1.0 - lam) * max_sim
+                else:
+                    val = score
+                if best_val is None or val > best_val:
+                    best_val = val
+                    best_idx = idx
+            if best_idx < 0:
+                break  # every remaining candidate was a near-duplicate
+            mem, score = pool.pop(best_idx)
+            selected.append((mem, score))
+            emb = emb_by_id.get(mem.id)
+            if emb is not None:
+                sel_embs.append(emb)
+        return selected
+
     def _check_conflicts(
         self,
         mem: Memory,
@@ -1472,13 +1667,19 @@ class MemoryStore:
             ))
         return conflicts
 
+    def _recency(self, mem: Memory, w: HybridWeights, now: float) -> float:
+        basis = mem.created_at if w.recency_basis == "created" else mem.last_accessed
+        age_d = max(0.0, (now - basis) / 86_400.0)
+        return math.exp(-w.decay_rate * age_d)
+
     def _semantic_filter(
         self,
         res: dict,
-        k: int,
         tag: str | None,
         include_superseded: bool,
         polarity_weight: float = 0.0,
+        min_cosine: float | None = None,
+        explanations: dict | None = None,
     ) -> list[tuple[Memory, float]]:
         out: list[tuple[Memory, float]] = []
         for mid, doc, meta, dist in zip(
@@ -1490,25 +1691,48 @@ class MemoryStore:
                 continue
             if not include_superseded and mem.superseded_by:
                 continue
-            score = (1.0 - dist) + polarity_weight * mem.polarity
+            cosine = 1.0 - dist
+            if min_cosine is not None and cosine < min_cosine:
+                continue
+            score = cosine + polarity_weight * mem.polarity
+            if explanations is not None:
+                explanations[mem.id] = {
+                    "mode": "semantic", "cosine": round(cosine, 4),
+                    "polarity": mem.polarity, "score": round(score, 4),
+                }
             out.append((mem, score))
         if polarity_weight:
             out.sort(key=lambda x: x[1], reverse=True)
-        return out[:k]
+        return out
 
     def _hybrid_score(
         self,
         res: dict,
         query: str,
-        k: int,
         tag: str | None,
         include_superseded: bool,
         weights: HybridWeights | None,
+        min_cosine: float | None = None,
+        explanations: dict | None = None,
     ) -> list[tuple[Memory, float]]:
         w = weights or self._hybrid_weights or HybridWeights()
         docs = res["documents"][0]
         bm25 = _bm25_score_pool(query, docs)
         now  = time.time()
+
+        # When the query produces no lexical signal at all (e.g. a non-Latin or
+        # all-stopword query that matches no document term), drop the lexical
+        # weight and renormalise the remaining core weights so scores are not
+        # artificially depressed and stay comparable.
+        cw, lw, rw, iw = w.cosine, w.lexical, w.recency, w.importance
+        if lw > 0 and not any(s > 0 for s in bm25):
+            core = cw + lw + rw + iw
+            # Only renormalise when other signals exist to absorb the lexical
+            # weight; for a lexical-only config there is nothing to scale into,
+            # so leave the weights untouched rather than zeroing them all.
+            if core > lw:
+                scale = core / (core - lw)
+                cw, rw, iw, lw = cw * scale, rw * scale, iw * scale, 0.0
 
         candidates: list[tuple[Memory, float]] = []
         for i, (mid, doc, meta, dist) in enumerate(zip(
@@ -1521,45 +1745,158 @@ class MemoryStore:
             if not include_superseded and mem.superseded_by:
                 continue
             cosine  = 1.0 - dist
+            if min_cosine is not None and cosine < min_cosine:
+                continue
             lexical = bm25[i] if i < len(bm25) else 0.0
-            age_d   = max(0.0, (now - mem.last_accessed) / 86_400.0)
-            recency = math.exp(-w.decay_rate * age_d)
-            score   = (w.cosine * cosine + w.lexical * lexical
-                       + w.recency * recency + w.importance * mem.importance
+            recency = self._recency(mem, w, now)
+            score   = (cw * cosine + lw * lexical
+                       + rw * recency + iw * mem.importance
                        + w.polarity_weight * mem.polarity)
+            if explanations is not None:
+                explanations[mem.id] = {
+                    "mode": "hybrid", "fusion": "weighted",
+                    "cosine": round(cosine, 4), "lexical": round(lexical, 4),
+                    "recency": round(recency, 4),
+                    "importance": round(mem.importance, 4), "polarity": mem.polarity,
+                    "weights": {"cosine": round(cw, 4), "lexical": round(lw, 4),
+                                "recency": round(rw, 4), "importance": round(iw, 4),
+                                "polarity": w.polarity_weight},
+                    "score": round(score, 4),
+                }
             candidates.append((mem, score))
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[:k]
+        return candidates
+
+    def _rrf_score(
+        self,
+        res: dict,
+        query: str,
+        tag: str | None,
+        include_superseded: bool,
+        weights: HybridWeights | None,
+        min_cosine: float | None = None,
+        explanations: dict | None = None,
+        rrf_k: int = 60,
+    ) -> list[tuple[Memory, float]]:
+        """Reciprocal Rank Fusion of the hybrid signals.
+
+        Each signal (cosine, lexical, recency, importance) ranks the candidate
+        pool independently; the fused score is ``Σ weight_s / (rrf_k + rank_s)``.
+        Because it consumes only ordinal ranks it is scale-free — immune to the
+        BM25 pool-normalisation magnitude and the cosine-vs-lexical scale
+        mismatch that the weighted blend mixes. Polarity stays a tiny additive
+        nudge. (Ranks are pool-relative, so scores are comparable across queries
+        only for identically-pooled fan-outs, not arbitrary recalls.)
+        """
+        w = weights or self._hybrid_weights or HybridWeights()
+        ids   = res["ids"][0]
+        docs  = res["documents"][0]
+        metas = res["metadatas"][0]
+        dists = res["distances"][0]
+        bm25  = _bm25_score_pool(query, docs)
+        now   = time.time()
+
+        rows: list[dict[str, Any]] = []
+        for i in range(len(ids)):
+            mem = Memory.from_record(ids[i], docs[i], metas[i])
+            if tag and tag not in mem.tags:
+                continue
+            if not include_superseded and mem.superseded_by:
+                continue
+            cosine = 1.0 - dists[i]
+            if min_cosine is not None and cosine < min_cosine:
+                continue
+            rows.append({
+                "mem": mem, "cosine": cosine,
+                "lexical": bm25[i] if i < len(bm25) else 0.0,
+                "recency": self._recency(mem, w, now),
+                "importance": mem.importance,
+            })
+        if not rows:
+            return []
+
+        n = len(rows)
+        signals = [
+            ("cosine", w.cosine), ("lexical", w.lexical),
+            ("recency", w.recency), ("importance", w.importance),
+        ]
+        ranks: dict[str, list[int]] = {}
+        for name, wt in signals:
+            if wt <= 0:
+                continue
+            order = sorted(range(n), key=lambda j: rows[j][name], reverse=True)
+            r = [0] * n
+            for pos, j in enumerate(order):
+                r[j] = pos
+            ranks[name] = r
+
+        out: list[tuple[Memory, float]] = []
+        for i, row in enumerate(rows):
+            mem = row["mem"]
+            score = 0.0
+            contrib: dict[str, Any] = {}
+            for name, wt in signals:
+                if wt <= 0:
+                    continue
+                part = wt / (rrf_k + ranks[name][i])
+                score += part
+                contrib[name] = {"rank": ranks[name][i], "contribution": round(part, 6)}
+            score += w.polarity_weight * mem.polarity / (rrf_k + 1)
+            if explanations is not None:
+                explanations[mem.id] = {
+                    "mode": "hybrid", "fusion": "rrf", "rrf_k": rrf_k,
+                    "polarity": mem.polarity, "signals": contrib,
+                    "score": round(score, 6),
+                }
+            out.append((mem, score))
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out
 
     def _expand_links(
         self,
         out: list[tuple[Memory, float]],
         spec: ExpandSpec,
         include_superseded: bool,
+        explanations: dict | None = None,
     ) -> list[tuple[Memory, float]]:
-        added = 0
-        seen  = {m.id for m, _ in out}
+        """Breadth-first graph expansion honouring ``spec.depth`` (multi-hop) with
+        a per-hop ``spec.decay`` applied to the assigned ``spec.score``."""
+        seen = {m.id for m, _ in out}
         extra: list[tuple[Memory, float]] = []
-        for base_mem, _ in out:
-            if added >= spec.cap:
+        added = 0
+        frontier = [m.id for m, _ in out]
+        for hop in range(1, spec.depth + 1):
+            if added >= spec.cap or not frontier:
                 break
-            src = self._get_by_id(base_mem.id)
-            if src is None:
-                continue
-            for lnk in src.links:
-                if lnk.rel not in spec.rels:
-                    continue
-                if lnk.to in seen:
-                    continue
-                nb = self._get_by_id(lnk.to)
-                if nb is None:
-                    continue
-                if not include_superseded and nb.superseded_by:
-                    continue
-                extra.append((nb, spec.score))
-                seen.add(lnk.to)
-                added += 1
+            hop_score = spec.score * (spec.decay ** (hop - 1))
+            next_frontier: list[str] = []
+            for mid in frontier:
                 if added >= spec.cap:
                     break
+                src = self._get_by_id(mid)
+                if src is None:
+                    continue
+                for lnk in src.links:
+                    if lnk.rel not in spec.rels:
+                        continue
+                    if lnk.to in seen:
+                        continue
+                    nb = self._get_by_id(lnk.to)
+                    if nb is None:
+                        continue
+                    if not include_superseded and nb.superseded_by:
+                        continue
+                    extra.append((nb, hop_score))
+                    if explanations is not None:
+                        explanations[nb.id] = {
+                            "source": "graph_expansion", "rel": lnk.rel,
+                            "hop": hop, "score": round(hop_score, 4),
+                        }
+                    seen.add(lnk.to)
+                    next_frontier.append(lnk.to)
+                    added += 1
+                    if added >= spec.cap:
+                        break
+            frontier = next_frontier
         return out + extra

@@ -212,3 +212,24 @@ class TestMemoryDataclass:
     def test_from_record_missing_source(self):
         mem = Memory.from_record("x", "text", {"source": "", "type": "semantic"})
         assert mem.source is None
+
+
+class TestTouchControl:
+    """recall(touch=...) controls the access-count / last_accessed bump."""
+
+    def test_touch_false_does_not_bump_access(self, store: MemoryStore):
+        m = store.remember("touchless probe unique", type="semantic")
+        store.recall("touchless probe unique", k=1, touch=False)
+        assert store._get_by_id(m.id).access_count == 0
+
+    def test_touch_true_bumps_access(self, store: MemoryStore):
+        m = store.remember("touchy probe unique", type="semantic")
+        store.recall("touchy probe unique", k=1, touch=True)
+        assert store._get_by_id(m.id).access_count == 1
+
+    def test_batched_touch_bumps_all_hits(self, store: MemoryStore):
+        a = store.remember("alpha shared token", type="semantic")
+        b = store.remember("alpha shared token two", type="semantic")
+        store.recall("alpha shared token", k=2, touch=True)
+        assert store._get_by_id(a.id).access_count == 1
+        assert store._get_by_id(b.id).access_count == 1

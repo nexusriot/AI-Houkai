@@ -175,6 +175,8 @@ install                Register MCP server (claude-code | cursor | opencode)
 ```
 
 All commands accept `--store`, `--collection`, and `--format auto|json|tsv`.
+Exception: `pack` controls its own output via `-f`/`--output text|json` and
+ignores the global `--format`.
 
 ### Context packing
 
@@ -435,11 +437,14 @@ houkai import dump.ahkai --dry-run
 ### Audit journal
 
 Every mutation (`remember`, `forget`, `supersede`, `restore`, `link`,
-`unlink`, `import`, `export`, `reflect`, `decay`, `undo`) is appended to
-an append-only JSONL file next to the store (`journal.log`, rotated and
-gzipped at 64 MB, 90-day retention by default). Entries carry the actor
-(`cli` / `mcp` / `reflection` / `decay` / `import` / `lib`) plus
-`before`/`after` snapshots where applicable.
+`unlink`, `import`, `export`, `undo`) is appended to an append-only JSONL
+file next to the store (`journal.log`, rotated and gzipped at 64 MB, 90-day
+retention by default). There is no `reflect`/`decay` op — reflection and
+decay surface as ordinary `remember`/`forget`/`link` entries attributed to
+their actor. Entries carry the actor (`cli` / `mcp` / `http` / `reflection` /
+`decay` / `import` / `lib`) plus `before`/`after` snapshots where applicable.
+The `http` actor is set by the serve commands; `restore` is an op, not an
+actor.
 
 ```bash
 # tail recent entries (newest first)
@@ -697,10 +702,14 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The MCP tool surface is now at parity: **15 tools** in both ports —
-`remember`, `recall`, `recall_pack`, `forget`, `list_recent`, `stats`, `link`,
-`unlink`, `neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`,
-`journal_tail`, `export`, `import`.
+The Go port exposes **15 MCP tools** — `remember`, `recall`, `recall_pack`,
+`forget`, `list_recent`, `stats`, `link`, `unlink`, `neighbors`,
+`find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`, `export`,
+`import`. The Python reference port has since added an `auto_context` tool plus
+advanced retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`,
+diversity/MMR, `dedup_threshold`, `min_cosine`, `touch`, `explain`,
+`recall_pack` compression) that the Go port does not yet implement. The shared
+tools keep the same names and core behaviour, so existing clients keep working.
 
 The audit journal is enabled by default in both ports and uses the same
 JSONL line format, so a journal written by one binary can be read by the

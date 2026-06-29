@@ -2,7 +2,7 @@
 
 Status: **implemented** — the port shipped in `go/` (merged 2026-06-10) and
 has since reached full feature parity with the Python version (15 MCP tools,
-pack/ingest/collections/TUI/installers/summarizers). This file is the
+pack/ingest/collections/TUI/installers/summarizers/HTTP-REST-API server). This file is the
 original 2026-05-20 feasibility study, kept as a historical record; the
 authoritative docs for the shipped port are [go/README.md](go/README.md)
 and [go/DESIGN.md](go/DESIGN.md).
@@ -34,7 +34,10 @@ Where the implementation diverged from this proposal:
 - **Packaging:** Debian `.deb` (`scripts/build-deb.sh`, conffile + systemd
   unit) and macOS tarballs — not GoReleaser. No Windows builds.
 - **Open questions (§12):** 1 — both ports live on in parallel, at parity;
-  2 — same repo, `go/` subdir; 3 — stdio only, no HTTP transport;
+  2 — same repo, `go/` subdir; 3 — the MCP transport stayed stdio-only,
+  but a separate JSON HTTP/REST API shipped anyway (ai-houkai-serve binary /
+  houkai serve, package internal/httpserver) — see go/README.md and
+  go/DESIGN.md;
   4 — yes: Ollama-by-default won, dropping MiniLM/ONNX entirely.
 
 The original study follows, unedited.

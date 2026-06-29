@@ -46,6 +46,12 @@ class TestHttpServer:
         assert body["status"] == "ok"
         assert body["count"] == 0
 
+    def test_health_does_not_leak_collection(self, server):
+        # /health is liveness-only and must not expose the collection name/topology.
+        status, body = _req(server, "GET", "/health")
+        assert status == 200 and body["status"] == "ok"
+        assert "collection" not in body
+
     def test_remember_and_get(self, server):
         status, body = _req(server, "POST", "/memories",
                             {"text": "http memory", "type": "semantic",

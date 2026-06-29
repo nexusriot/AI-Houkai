@@ -9,6 +9,9 @@ import types
 
 import pytest
 
+from ai_houkai.cli import config as cfgmod
+from ai_houkai.maintenance import scheduler as sched_mod
+from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.memory_system.reflection import _default_summarizer
 from ai_houkai.memory_system.store import Memory
 from ai_houkai.memory_system import summarizers
@@ -250,8 +253,6 @@ class TestSdkProviders:
 
 class TestWiring:
     def test_env_var_overrides_config(self, monkeypatch, tmp_path):
-        from ai_houkai.cli import config as cfgmod
-
         toml = tmp_path / "config.toml"
         toml.write_text(
             "[maintenance.reflect]\nsummarizer = \"ollama:from-file\"\n"
@@ -265,16 +266,11 @@ class TestWiring:
         assert cfgmod.load_maintenance().summarizer == "ollama:from-env"
 
     def test_unset_summarizer_is_none(self, monkeypatch, tmp_path):
-        from ai_houkai.cli import config as cfgmod
-
         monkeypatch.setattr(cfgmod, "_CONFIG_FILE", tmp_path / "missing.toml")
         monkeypatch.delenv("AI_HOUKAI_SUMMARIZER", raising=False)
         assert cfgmod.load_maintenance().summarizer is None
 
     def test_scheduler_forwards_summarizer_to_reflection(self, monkeypatch, tmp_path):
-        from ai_houkai.maintenance import scheduler as sched_mod
-        from ai_houkai.maintenance.scheduler import MaintenanceScheduler
-
         seen = {}
 
         class FakeEngine:

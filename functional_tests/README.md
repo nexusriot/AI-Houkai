@@ -6,7 +6,8 @@ surface** as a black box:
 
 - the **`houkai` CLI** — driven as a subprocess over a real on-disk ChromaDB
   store, covering the full lifecycle: `remember → recall → pack → link →
-  neighbors → export → import → supersede → list → prune → stats → journal`;
+  neighbors → export → import → supersede → list → stats → journal` (`prune` is
+  exercised separately by `test_cli_stats_health_protects_procedural`);
 - the **`ai-houkai-serve` HTTP server** — started as its own process and hit
   over a real socket, including a **concurrency regression test** (25 parallel
   `POST /links`, none lost) and a **stress test** (120 items added by 16
