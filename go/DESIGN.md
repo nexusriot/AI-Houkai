@@ -7,8 +7,8 @@ see [README.md](README.md); for the original Python design see
 
 ## Goals
 
-1. **Single static binary per command** — `ai-houkai-mcp` and `houkai`,
-   ~8 MB each, no Python runtime, no native deps beyond glibc.
+1. **Single static binary per command** — `ai-houkai-mcp`, `ai-houkai-serve`,
+   and `houkai`, ~8 MB each, no Python runtime, no native deps beyond glibc.
 2. **Same model as the Python version** — episodic/semantic/procedural/feedback
    memories, hybrid recall, decay-based pruning, reflection clusters, link
    graph, conflict detection. Tool names preserved so external MCP clients
@@ -80,8 +80,10 @@ into `httpserver`.
 
 `journal.go` defines `Journal` and `JournalEntry`. Every mutation on
 `MemoryStore` (`remember`, `forget`, `supersede`, `restore`, `link`,
-`unlink`, plus the higher-level `import` / `export` / `reflect` / `decay`
-markers) is appended as one JSON line to `journal.log` next to the store.
+`unlink`, plus the higher-level `import` / `export` ops) is appended as one
+JSON line to `journal.log` next to the store. Reflection and decay are *not*
+op markers — they run through ordinary `remember` / `forget` / `link` entries
+and are distinguished only by their `actor` tag (`reflection` / `decay`).
 
 - **Best-effort writes.** `Journal.Append` swallows and logs all errors —
   a journal failure must never break the underlying memory op.
@@ -275,7 +277,12 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-The tool surface is at parity with the Python version. `export` / `import`
+These 15 tools mirror the Python tool names so existing MCP clients keep
+working, but the surface is no longer at full parity: the Python reference
+port has since added an `auto_context` tool plus advanced `recall` /
+`recall_pack` parameters (`fusion=rrf`, diversity/MMR, `dedup_threshold`,
+`min_cosine`, `touch`, `explain`, `recall_pack` compression) that the Go port
+does not yet implement. `export` / `import`
 take a server-local file path — there's no streaming over MCP yet, and
 binary payloads (the gzipped bytes) are kept off the JSON wire. `recall` /
 `recall_pack` accept the `source` / `since` / `until` metadata filters
@@ -384,7 +391,7 @@ binaries see identical settings.
 
 `scripts/build-deb.sh` produces a `.deb` per arch:
 
-- Binaries → `/usr/bin/{ai-houkai-mcp, houkai}`
+- Binaries → `/usr/bin/{ai-houkai-mcp, ai-houkai-serve, houkai}`
 - Default config → `/etc/ai-houkai/config.toml` (marked as a **conffile** so
   upgrades preserve user edits)
 - systemd unit → `/lib/systemd/system/ai-houkai-mcp.service` (not enabled by
@@ -410,7 +417,7 @@ install or Homebrew tap distribution:
   Xcode / osxcross toolchain is required).
 - Apple Silicon → `..._darwin_arm64.tar.gz`; Intel → `..._darwin_x86_64.tar.gz`
   (Homebrew naming, despite Go's `GOARCH=amd64`).
-- Layout inside the archive: `bin/{ai-houkai-mcp, houkai}`,
+- Layout inside the archive: `bin/{ai-houkai-mcp, ai-houkai-serve, houkai}`,
   `share/ai-houkai/config.toml.example`, `README.txt`.
 - A sibling `.sha256` file is emitted next to each tarball so Homebrew
   formulae can reference the hash without recomputing it.

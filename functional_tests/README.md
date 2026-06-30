@@ -6,18 +6,27 @@ surface** as a black box:
 
 - the **`houkai` CLI** — driven as a subprocess over a real on-disk ChromaDB
   store, covering the full lifecycle: `remember → recall → pack → link →
-  neighbors → export → import → supersede → list → prune → stats → journal`;
+  neighbors → export → import → supersede → list → stats → journal` (`prune` is
+  exercised separately by `test_cli_stats_health_protects_procedural`), plus
+  **CJK recall** (a Japanese query surfaces a Japanese memory via the bigram
+  tokenizer) and the **`stats --health --frequency-weight`** reinforcement flag;
 - the **`ai-houkai-serve` HTTP server** — started as its own process and hit
-  over a real socket, including a **concurrency regression test** (25 parallel
-  `POST /links`, none lost) and a **stress test** (120 items added by 16
+  over a real socket: a **concurrency regression test** (25 parallel
+  `POST /links`, none lost), a **stress test** (120 items added by 16
   concurrent workers while readers run in parallel, then every item fetched back
-  concurrently).
+  concurrently), the **hardened `/health`** (liveness only — no collection name),
+  **bearer-token auth** (`/health` open; protected routes reject an absent/wrong
+  token), and a **batched access-bump** check (one `/recall` bumps every hit's
+  `access_count` exactly once).
 
-They also lock in two fixed bugs:
+They also lock in specific regressions:
 
 | Test | Guards against |
 |---|---|
 | `test_http_concurrent_links_no_lost_updates` | read-modify-write races in the threaded HTTP server (lost link/`_touch` updates) |
+| `test_http_recall_bumps_all_hits` | the batched `_touch_many` dropping an access-bump for some hits of a single recall |
+| `test_http_auth_enforced` | auth bypass — every non-`/health` route must reject an absent/wrong bearer token |
+| `test_http_roundtrip` | `/health` leaking the collection name (topology) to callers |
 | `test_cli_stats_health_protects_procedural`  | `stats --health` counting protected (`procedural`) memories as at-risk |
 
 ## Why they live outside `tests/`

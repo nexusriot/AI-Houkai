@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 
 import pytest
 from typer.testing import CliRunner
 
+from ai_houkai.cli.commands.stats import _compute_health, _decay_score
 from ai_houkai.cli.main import app
-from ai_houkai.memory_system import MemoryStore
+from ai_houkai.memory_system import Memory, MemoryStore
 
 
 runner = CliRunner()
@@ -146,3 +148,29 @@ class TestStatsBasicUnchanged:
         data = json.loads(result.output)
         assert "health" not in data
         assert data["active"] > 0
+
+
+class TestStatsHealthAlignment:
+    """The health report's decay maths mirror DecayEngine exactly (incl.
+    frequency reinforcement) and honour protected types."""
+
+    def test_decay_score_matches_engine_with_reinforcement(self):
+        t_old = time.time() - 10 * 86_400.0
+        base = _decay_score(0.5, t_old, 0.1, access_count=20, frequency_weight=0.0)
+        reinforced = _decay_score(0.5, t_old, 0.1, access_count=20, frequency_weight=0.3)
+        assert reinforced > base
+        # matches DecayEngine.score formula exactly
+        expected = 0.5 * math.exp(-0.1 * 10) * (1 + 0.3 * math.log1p(20))
+        assert reinforced == pytest.approx(expected)
+
+    def test_protect_types_excluded_from_at_risk(self):
+        old = time.time() - 100 * 86_400.0
+        proc = Memory(id="p", text="runbook", type="procedural", importance=0.1,
+                      created_at=old, last_accessed=old)
+        sem = Memory(id="s", text="fact", type="semantic", importance=0.1,
+                     created_at=old, last_accessed=old)
+        h = _compute_health([proc, sem], stale_days=30, decay_rate=0.1,
+                            min_score=0.05, protect_types=("procedural",),
+                            frequency_weight=0.0)
+        # Both decayed below 0.05, but procedural is protected → only semantic at risk.
+        assert h["at_risk_count"] == 1

@@ -56,6 +56,11 @@ Defaults:
 `recency_decay(t) = exp(−λ · age_days)` reusing the `DecayEngine` formula
 with the **same** `λ` so the two systems agree on what "fresh" means.
 
+> **Editor's note (as shipped):** the default measures `created_at`, not
+> `last_accessed` (`HybridWeights.recency_basis` defaults to `"created"`;
+> `recency_basis="accessed"` restores the `last_accessed` behaviour
+> described here).
+
 `bm25_score_normalized` is computed lazily over the query result set
 only (top-k from cosine + a small over-fetch), not the whole corpus —
 no second index needed.
@@ -234,7 +239,7 @@ class Conflict:
     b: Memory
     similarity: float
     kind: Literal["duplicate", "contradiction"]
-    reason: str            # "polarity", "negation_diff", "custom_fn"
+    reason: str            # "polarity_diff", "negation_diff", "custom_fn", "similarity" (near-dup, kind="duplicate")
 ```
 
 ### Behaviour matrix

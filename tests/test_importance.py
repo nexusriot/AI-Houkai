@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from ai_houkai.cli import config as cfgmod
+from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.importance import score_importance
 
 
@@ -79,8 +81,6 @@ class TestModifiers:
 
 class TestStoreWiring:
     def test_remember_without_importance_uses_fn(self, tmp_path):
-        from ai_houkai.memory_system import MemoryStore
-
         s = MemoryStore(
             path=str(tmp_path / "chroma"),
             collection="imp_test",
@@ -102,16 +102,12 @@ class TestStoreWiring:
 
 class TestConfig:
     def test_default_importance_auto(self, monkeypatch, tmp_path):
-        from ai_houkai.cli import config as cfgmod
-
         toml = tmp_path / "config.toml"
         toml.write_text('default_importance = "auto"\n')
         monkeypatch.setattr(cfgmod, "_CONFIG_FILE", toml)
         assert cfgmod.load().default_importance == "auto"
 
     def test_default_importance_float_still_works(self, monkeypatch, tmp_path):
-        from ai_houkai.cli import config as cfgmod
-
         toml = tmp_path / "config.toml"
         toml.write_text("default_importance = 0.7\n")
         monkeypatch.setattr(cfgmod, "_CONFIG_FILE", toml)

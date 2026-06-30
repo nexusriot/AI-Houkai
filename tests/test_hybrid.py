@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from ai_houkai.memory_system import ExpandSpec, HybridWeights, MemoryStore
@@ -265,8 +267,200 @@ class TestPolarityScoring:
         # MemoryStore constructor accepts hybrid_weights and applies them store-wide
         w = HybridWeights(cosine=0.6, lexical=0.2, recency=0.1, importance=0.1,
                           polarity_weight=0.0)
-        from ai_houkai.memory_system import MemoryStore
         store = MemoryStore(str(tmp_path), hybrid_weights=w)
         m = store.remember("pytest testing isolates tests", type="procedural")
         hits = store.recall("pytest", k=5, mode="hybrid")
         assert any(x.id == m.id for x, _ in hits)
+
+
+class TestRecencyBasis:
+    def test_default_is_created(self):
+        assert HybridWeights().recency_basis == "created"
+
+    def test_created_vs_accessed_basis_differ_for_aged_memory(self, store: MemoryStore):
+        m = store.remember("zenith unique recency token", type="semantic", importance=0.5)
+        # Backdate created_at by 60 days but keep last_accessed recent.
+        rec = store.collection.get(ids=[m.id], include=["metadatas"])
+        meta = dict(rec["metadatas"][0])
+        meta["created_at"] = time.time() - 60 * 86_400.0
+        store.collection.update(ids=[m.id], metadatas=[meta])
+
+        c = store.recall("zenith unique recency token", k=1, mode="hybrid",
+                         weights=HybridWeights(recency_basis="created"), touch=False)
+        a = store.recall("zenith unique recency token", k=1, mode="hybrid",
+                         weights=HybridWeights(recency_basis="accessed"), touch=False)
+        # 'accessed' sees a fresh last_accessed (recency≈1); 'created' sees a
+        # 60-day-old fact (recency≈0) → accessed scores strictly higher.
+        assert a[0][1] > c[0][1]
+
+
+class TestRRFFusion:
+    def _seed(self, store: MemoryStore):
+        store.remember("python gil blocks cpu parallelism", type="semantic", importance=0.8)
+        store.remember("javascript event loop concurrency", type="semantic", importance=0.5)
+        store.remember("rust has no garbage collector", type="semantic", importance=0.6)
+
+    def test_rrf_returns_ranked_results(self, store: MemoryStore):
+        self._seed(store)
+        hits = store.recall("python gil", k=3, mode="hybrid", fusion="rrf")
+        assert len(hits) > 0
+        scores = [s for _, s in hits]
+        assert scores == sorted(scores, reverse=True)
+        assert all(s > 0 for s in scores)
+
+    def test_rrf_ranks_exact_match_top(self, store: MemoryStore):
+        self._seed(store)
+        hits = store.recall("python gil parallelism", k=3, mode="hybrid", fusion="rrf")
+        assert "python gil" in hits[0][0].text
+
+    def test_rrf_single_doc_pool_does_not_crash(self, store: MemoryStore):
+        store.remember("solitary memory", type="semantic")
+        hits = store.recall("solitary", k=5, mode="hybrid", fusion="rrf")
+        assert len(hits) == 1
+
+
+class TestDiversityAndDedup:
+    def test_dedup_collapses_identical_memories(self, store: MemoryStore):
+        for _ in range(3):
+            store.remember("alpha duplicate fact", type="semantic")
+        hits = store.recall("alpha duplicate fact", k=5, dedup_threshold=0.95)
+        # Three identical texts → identical embeddings → only one survives.
+        assert len(hits) == 1
+
+    def test_no_dedup_keeps_duplicates(self, store: MemoryStore):
+        for _ in range(3):
+            store.remember("beta duplicate fact", type="semantic")
+        hits = store.recall("beta duplicate fact", k=5)
+        assert len(hits) == 3
+
+    def test_diversity_first_pick_is_most_relevant(self, store: MemoryStore):
+        # First MMR pick has no novelty penalty → always the most relevant.
+        best = store.remember("python testing with pytest fixtures", type="semantic")
+        store.remember("python docker deployment pipeline", type="semantic")
+        store.remember("banana bread baking recipe", type="semantic")
+        hits = store.recall("python testing pytest fixtures", k=3, diversity=0.5)
+        assert hits[0][0].id == best.id
+
+    def test_rrf_diversity_does_not_promote_irrelevant(self, store: MemoryStore):
+        # Regression for the RRF/MMR scale mismatch: with diversity high
+        # (relevance-dominant) an off-topic memory must not be promoted into the
+        # top results over relevant near-duplicates.
+        for _ in range(3):
+            store.remember("python concurrency with asyncio event loop", type="semantic")
+        banana = store.remember("strawberry banana smoothie recipe", type="semantic")
+        hits = store.recall("python asyncio concurrency", k=2,
+                            mode="hybrid", fusion="rrf", diversity=0.9)
+        ids = [m.id for m, _ in hits]
+        assert banana.id not in ids
+
+
+class TestRangeValidation:
+    def test_diversity_out_of_range_raises(self, store: MemoryStore):
+        store.remember("x", type="semantic")
+        with pytest.raises(ValueError):
+            store.recall("x", diversity=1.5)
+
+    def test_dedup_threshold_out_of_range_raises(self, store: MemoryStore):
+        store.remember("x", type="semantic")
+        with pytest.raises(ValueError):
+            store.recall("x", dedup_threshold=2.0)
+
+    def test_min_cosine_out_of_range_raises(self, store: MemoryStore):
+        store.remember("x", type="semantic")
+        with pytest.raises(ValueError):
+            store.recall("x", min_cosine=5.0)
+
+
+class TestMinCosineGate:
+    def test_unrelated_query_returns_nothing(self, store: MemoryStore):
+        store.remember("quantum chromodynamics lattice gauge theory", type="semantic")
+        hits = store.recall("banana smoothie brunch recipe", k=5, min_cosine=0.9)
+        assert hits == []
+
+    def test_matching_query_passes_floor(self, store: MemoryStore):
+        m = store.remember("kubernetes ingress controller setup", type="semantic")
+        hits = store.recall("kubernetes ingress controller setup", k=5, min_cosine=0.5)
+        assert any(x.id == m.id for x, _ in hits)
+
+
+class TestExplain:
+    def test_hybrid_explain_breakdown(self, store: MemoryStore):
+        store.remember("explainable hybrid scoring memory", type="semantic", importance=0.7)
+        hits = store.recall("hybrid scoring", k=1, mode="hybrid", explain=True)
+        mem, score, breakdown = hits[0]
+        assert isinstance(mem, Memory)
+        assert breakdown["mode"] == "hybrid" and breakdown["fusion"] == "weighted"
+        assert {"cosine", "lexical", "recency", "importance", "weights"} <= set(breakdown)
+
+    def test_rrf_explain_has_signal_ranks(self, store: MemoryStore):
+        store.remember("explainable rrf scoring memory", type="semantic")
+        hits = store.recall("rrf scoring", k=1, mode="hybrid", fusion="rrf", explain=True)
+        _, _, breakdown = hits[0]
+        assert breakdown["fusion"] == "rrf"
+        assert "signals" in breakdown and "cosine" in breakdown["signals"]
+
+    def test_semantic_explain(self, store: MemoryStore):
+        store.remember("semantic explain memory", type="semantic")
+        hits = store.recall("semantic explain", k=1, mode="semantic", explain=True)
+        _, _, breakdown = hits[0]
+        assert breakdown["mode"] == "semantic" and "cosine" in breakdown
+
+    def test_explain_false_returns_two_tuples(self, store: MemoryStore):
+        store.remember("plain memory", type="semantic")
+        hits = store.recall("plain", k=1)
+        assert len(hits[0]) == 2
+
+
+class TestExpansionDepthDecay:
+    def _chain(self, store: MemoryStore):
+        a = store.remember("root alpha concept", type="semantic")
+        b = store.remember("child beta detail", type="semantic")
+        c = store.remember("grandchild gamma detail", type="semantic")
+        store.link(a.id, b.id, rel="refines")
+        store.link(b.id, c.id, rel="refines")
+        return a, b, c
+
+    def test_depth_one_stops_at_first_hop(self, store: MemoryStore):
+        a, b, c = self._chain(store)
+        hits = store.recall("root alpha concept", k=1,
+                            expand=ExpandSpec(rels=("refines",), depth=1, cap=5, score=0.6))
+        ids = [m.id for m, _ in hits]
+        assert b.id in ids and c.id not in ids
+
+    def test_depth_two_reaches_second_hop(self, store: MemoryStore):
+        a, b, c = self._chain(store)
+        hits = store.recall("root alpha concept", k=1,
+                            expand=ExpandSpec(rels=("refines",), depth=2, cap=5, score=0.6))
+        ids = [m.id for m, _ in hits]
+        assert b.id in ids and c.id in ids
+
+    def test_per_hop_decay(self, store: MemoryStore):
+        a, b, c = self._chain(store)
+        hits = store.recall("root alpha concept", k=1,
+                            expand=ExpandSpec(rels=("refines",), depth=2, cap=5,
+                                              score=0.6, decay=0.5))
+        smap = {m.id: s for m, s in hits}
+        assert smap[b.id] == pytest.approx(0.6)        # hop 1
+        assert smap[c.id] == pytest.approx(0.3)        # hop 2 = 0.6 * 0.5
+
+    def test_decay_default_keeps_flat_score(self, store: MemoryStore):
+        a, b, c = self._chain(store)
+        hits = store.recall("root alpha concept", k=1,
+                            expand=ExpandSpec(rels=("refines",), depth=2, cap=5, score=0.55))
+        smap = {m.id: s for m, s in hits}
+        assert smap[b.id] == pytest.approx(0.55)
+        assert smap[c.id] == pytest.approx(0.55)       # decay defaults to 1.0
+
+
+class TestCJKTokenization:
+    def test_ascii_unchanged(self):
+        assert _tokenize("Hello World") == ["hello", "world"]
+
+    def test_cjk_emits_bigrams(self):
+        toks = _tokenize("日本語")
+        assert "日本" in toks and "本語" in toks
+
+    def test_cjk_query_recall(self, store: MemoryStore):
+        store.remember("日本語のテストメモリ", type="semantic")
+        hits = store.recall("日本語", k=3, mode="hybrid")
+        assert any("日本語" in m.text for m, _ in hits)

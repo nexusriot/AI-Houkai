@@ -29,10 +29,12 @@ The handler is intentionally framework-free: a single regex routing table maps
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -116,8 +118,8 @@ def _require(body: dict[str, Any], key: str) -> Any:
 # Each takes (store, match, query, body) and returns (status, payload).
 
 def _health(store: MemoryStore, m, q, b):
-    return 200, {"status": "ok", "count": store.count(),
-                 "collection": store.collection_name}
+    # Liveness only — deliberately does not leak the collection name / topology.
+    return 200, {"status": "ok", "count": store.count()}
 
 
 def _stats(store: MemoryStore, m, q, b):
@@ -338,7 +340,8 @@ def build_handler(
             if auth_token is None or path == "/health":
                 return True
             header = self.headers.get("Authorization", "")
-            return header == f"Bearer {auth_token}"
+            # Constant-time compare so a wrong token can't be recovered by timing.
+            return hmac.compare_digest(header, f"Bearer {auth_token}")
 
         def _read_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -379,8 +382,13 @@ def build_handler(
                     self._send(status, payload)
                 except HttpError as e:
                     self._send(e.status, {"error": e.message})
-                except Exception as e:  # noqa: BLE001 — surface as 500, keep serving
-                    self._send(500, {"error": f"{type(e).__name__}: {e}"})
+                except Exception:  # noqa: BLE001 — surface as 500, keep serving
+                    # Don't leak internals (exception type/message/trace) to the
+                    # client; tag with a request id so it can be correlated to a
+                    # server-side log if one is wired up.
+                    rid = uuid.uuid4().hex[:12]
+                    self._send(500, {"error": "internal server error",
+                                     "request_id": rid})
                 return
 
             if matched_path:

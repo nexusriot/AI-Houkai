@@ -20,7 +20,9 @@ and periodic reflection that condenses experience into knowledge.
 | **Reflection** | Cluster episodic memories → condense into semantic summaries |
 | **Memory linking** | Typed directed edges — `refines`, `supersedes`, `derived_from`, … |
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
-| **Hybrid retrieval** | Cosine + BM25 + recency + importance blended scoring |
+| **Hybrid retrieval** | Cosine + BM25 + recency (creation-time by default) + importance + polarity blended scoring; CJK/Korean lexical tokenization |
+| **Retrieval controls** | RRF fusion · MMR diversity · near-duplicate dedup · `min_cosine` relevance gate · read-only/`explain` recall |
+| **Retrieval eval** | `ai_houkai.eval` — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set |
 | **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
 | **Importance auto-assignment** | Heuristic 0–1 scoring from text (instructions > decisions > completions > observations) |
 | **Bulk ingest** | `houkai ingest` — chunk files/stdin into memories (markdown-aware) |
@@ -30,7 +32,7 @@ and periodic reflection that condenses experience into knowledge.
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
 | **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
-| **MCP server** | 15 tools for any MCP client (Claude Code, Claude Desktop) |
+| **MCP server** | 16 tools for any MCP client (Claude Code, Claude Desktop) |
 | **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links), optional bearer-token auth |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
@@ -59,7 +61,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (15 tools)
+│   │   └── server.py             # FastMCP server (16 tools)
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── __main__.py           # python -m ai_houkai.cli
@@ -110,7 +112,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 445 tests across 21 files
+├── tests/                        # 523 tests across 22 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -205,7 +207,30 @@ for mem, score in store.recall("parallel execution", k=3):
 pack = store.recall_pack("parallel execution", token_budget=600)
 print(pack.text)          # "## Relevant memory\n- (semantic) Python's GIL …"
 print(pack.used_tokens, "/", pack.budget, "truncated:", pack.truncated)
+
+# Multi-angle counterpart to recall_pack — fans out over the task plus
+# extracted key phrases, dedupes by id, then packs (no fusion="rrf" here):
+pack = store.auto_context_pack("deploy the API to production", token_budget=800)
 ```
+
+### Tuning retrieval
+
+```python
+# Scale-free Reciprocal Rank Fusion instead of the weighted blend
+hits = store.recall("deploy", k=5, mode="hybrid", fusion="rrf")
+# Maximal Marginal Relevance re-rank + near-duplicate drop
+hits = store.recall("deploy", k=5, diversity=0.7, dedup_threshold=0.92)
+# Absolute relevance gate — return nothing rather than weak hits
+hits = store.recall("off-topic", k=5, min_cosine=0.2)
+# Read-only recall (no access-count bump) + score breakdowns
+for mem, score, why in store.recall("deploy", k=3, touch=False, explain=True):
+    print(score, why)   # why: {'mode':'hybrid','fusion':'weighted','cosine':…,'weights':{…}}
+```
+
+`diversity`/`dedup_threshold` must be in `[0, 1]` and `min_cosine` in `[-1, 1]`
+(else `ValueError`). `recall_pack(...)` accepts the same
+`fusion`/`diversity`/`dedup_threshold`/`min_cosine`/`touch` and forwards them to
+`recall`.
 
 ### Async usage
 
@@ -228,7 +253,10 @@ The constructor takes the same arguments as `MemoryStore`. Use `await store.aclo
 (or the `async with` block) to flush and shut the executor down; `store.close()`
 is the synchronous equivalent for non-async teardown. The underlying sync store
 is reachable as `store.sync`, and any not-yet-wrapped method can be offloaded via
-`await store.run(store.sync.<method>, ...)`.
+`await store.run(store.sync.<method>, ...)`. `recall`/`recall_pack` accept the
+same tuning params as the sync store (`fusion`, `diversity`, `dedup_threshold`,
+`min_cosine`, `touch`, `explain`; `recall_pack` also `compress`/
+`compress_threshold`/`compress_min_group`) and forward them through.
 
 > **Note:** the constructor itself runs synchronously — building the store loads
 > the embedding model, so construct it before entering your hot path (or wrap the
@@ -472,17 +500,21 @@ houkai stats --format json   # machine-readable
 # Detailed health report: decay-score histogram, at-risk / stale / never-recalled
 # counts, episodic clusters ripe for reflection, link density and top-recalled.
 houkai stats --health
-houkai stats --health --stale-days 14 --decay-rate 0.05
+houkai stats --health --stale-days 14 --decay-rate 0.05 --frequency-weight 0.2
 houkai stats --health --format json   # health block nested under "health"
 ```
 
-The health view scores each active memory with the same exponential decay
-formula as the engine (`importance × exp(-decay_rate × days_idle)`). **At-risk**
-counts active, non-protected memories whose score has fallen below the prune
-threshold (`0.05`) — i.e. those `houkai prune` would remove. `procedural`
-memories are protected and never counted as at-risk, matching `DecayEngine`'s
-`protect_types`. `--decay-rate` and `--stale-days` only affect this report; they
-do not mutate the store.
+The health view scores each active memory with the same formula as the engine:
+`importance × exp(-decay_rate × days_idle) × (1 + frequency_weight × ln(1 + access_count))`.
+`--decay-rate`, `--frequency-weight`, the at-risk threshold, and the protected
+types all **default to the `[maintenance.decay]` config** (fallbacks `0.1` /
+`0.0` / `0.05` / `["procedural"]`), so the report matches what `houkai prune`
+and the maintenance daemon would actually remove. **At-risk** counts active,
+non-protected memories whose score has fallen below the prune threshold — i.e.
+those `prune` would remove; protected types (default `procedural`) are never
+counted as at-risk, matching `DecayEngine`'s `protect_types`. The new
+`--frequency-weight` flag, plus `--decay-rate` and `--stale-days`, only affect
+this report; they do not mutate the store.
 
 ### Output formats
 
@@ -553,16 +585,31 @@ lock costs little; for true parallelism run multiple processes against separate
 stores. (`AsyncMemoryStore` gives the same guarantee in-process via a
 single-threaded executor.)
 
+**Hardening:** `GET /health` returns only `{"status":"ok","count":N}` and
+deliberately omits the collection name / topology. Bearer-token checks use a
+constant-time comparison (`hmac.compare_digest`). Unhandled errors return
+`500 {"error":"internal server error","request_id":"<hex>"}` — no exception
+type, message, or traceback is leaked to the client.
+
+**Stable surface:** the new ranking/compression controls
+(`fusion`/`diversity`/`dedup_threshold`/`min_cosine`/`touch`/`explain` and
+`compress*`) are available via the Python API and MCP tools only — the HTTP
+`/recall` and `/recall_pack` endpoints expose just the stable param set.
+
 ---
 
 ## Go port
 
 A full Go port lives in [`go/`](go/) — two static binaries (`houkai` CLI +
 `ai-houkai-mcp` MCP server), no Python runtime, packaged as a Debian `.deb`
-and macOS tarballs. It is at feature parity with this Python version: the
-same 15 MCP tools, hybrid retrieval, decay/reflection with LLM summarizers,
-context packing, bulk ingest, collections, importance auto-assignment,
-installers for Claude Code / Cursor / OpenCode, and a Bubble Tea TUI.
+and macOS tarballs. It is at parity on the core surface: the same 15 MCP
+tools, hybrid retrieval, decay/reflection with LLM summarizers, context
+packing, bulk ingest, collections, importance auto-assignment, installers for
+Claude Code / Cursor / OpenCode, and a Bubble Tea TUI. The Python-side phase
+0–1 retrieval refinements (RRF fusion, MMR diversity/dedup, `min_cosine`,
+read-only/`explain` recall, created-based recency, multi-hop link decay, CJK
+tokenization, compression packing, the eval harness) and the latest HTTP
+hardening are not yet in the Go port.
 Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean
 instead of bundled sentence-transformers, and the store is
 [chromem-go](https://github.com/philippgille/chromem-go) — not
@@ -733,6 +780,33 @@ REPL commands: `memories` to list recent memories · `quit` to exit.
 
 ---
 
+## Retrieval evaluation
+
+`ai_houkai.eval` is a dependency-free (stdlib-only) harness for scoring
+retrieval quality against a gold set — library-only, not wired to the CLI or
+MCP.
+
+```python
+from ai_houkai.eval import EvalCase, evaluate
+
+cases = [
+    EvalCase(query="how do we deploy", relevant_ids=[deploy_mem.id]),
+    EvalCase(query="test isolation",   relevant_ids=[a.id, b.id], k=3),
+]
+result = evaluate(store, cases, default_mode="hybrid")
+print(result.summary())          # n=… recall@…=… P@…=… MRR=… MAP=… nDCG@…=…
+print(result.recall_at_k, result.mrr, result.ndcg_at_k)
+```
+
+Metrics (binary relevance; a duplicated retrieved id is credited once):
+`recall_at_k` · `precision_at_k` · `reciprocal_rank` · `average_precision` ·
+`dcg_at_k` · `ndcg_at_k`. The metric functions also work standalone on any
+ranked list of ids. `evaluate()` calls `recall(..., touch=False)`, so scoring
+never perturbs access tracking. Extra keyword args (e.g. `weights=`, `fusion=`,
+`diversity=`) are forwarded to `recall` so you can A/B ranking configs.
+
+---
+
 ## MCP server
 
 Exposes the memory store to any MCP client.
@@ -742,12 +816,15 @@ ai-houkai-mcp
 # or: python -m ai_houkai.mcp_server.server
 ```
 
-Exposed tools (15):
+Exposed tools (16):
 
-- **Core** — `remember` · `recall` · `recall_pack` · `forget` · `list_recent` · `stats`
+- **Core** — `remember` · `recall` · `recall_pack` · `auto_context` · `forget` · `list_recent` · `stats`
 - **Linking** — `link` · `unlink` · `neighbors`
 - **Conflicts** — `find_conflicts` · `supersede`
 - **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `export` · `import`
+
+`auto_context` fans out recall over several angles extracted from a task
+description, dedupes by id, and packs the result within a token budget.
 
 Environment variables:
 

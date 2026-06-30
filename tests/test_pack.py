@@ -366,3 +366,66 @@ class TestAutoContextPack:
         pack = store.auto_context_pack("testing", token_budget=5000, max_phrases=0)
         assert isinstance(pack, PackResult)
         assert len(pack) >= 0  # doesn't crash
+
+
+class TestNonVacuousCompress:
+    """Force a compressed group to actually form AND fit, for both packers."""
+
+    def _seed_similar(self, store: MemoryStore) -> None:
+        for i in range(4):
+            store.remember(f"use ruff to lint python files variant {i}",
+                           type="procedural", tags=["lint"], importance=0.7)
+
+    @staticmethod
+    def _counter(s: str) -> int:
+        # Items cost 30, a compressed line costs 10 → with budget 50 exactly one
+        # item fits, the rest drop and fold into one compressed line that fits.
+        return 10 if s.startswith("- (compressed)") else 30
+
+    def test_recall_pack_compress_forms_group(self, store: MemoryStore):
+        self._seed_similar(store)
+        pack = store.recall_pack(
+            "ruff lint python", token_budget=50, compress=True,
+            compress_threshold=0.2, compress_min_group=2, token_counter=self._counter,
+        )
+        assert len(pack.compressed_groups) >= 1
+        assert "- (compressed)" in pack.text
+        assert pack.used_tokens <= 50
+
+    def test_auto_context_compress_forms_group(self, store: MemoryStore):
+        self._seed_similar(store)
+        pack = store.auto_context_pack(
+            "ruff lint python", token_budget=50, compress=True,
+            compress_threshold=0.2, compress_min_group=2, token_counter=self._counter,
+        )
+        assert len(pack.compressed_groups) >= 1
+        assert "- (compressed)" in pack.text
+
+
+class TestAutoContextAdditions:
+    def _seed(self, store: MemoryStore):
+        store.remember("Run pytest with tmp_path", type="procedural", tags=["testing"])
+        store.remember("Deploy API with make release", type="procedural", tags=["deploy"])
+
+    def test_min_cosine_gate_returns_empty(self, store: MemoryStore):
+        self._seed(store)
+        pack = store.auto_context_pack("xylophone unrelated kazoo", token_budget=500,
+                                       min_cosine=0.9)
+        assert len(pack) == 0
+
+    def test_compress_param_accepted(self, store: MemoryStore):
+        for i in range(4):
+            store.remember(f"use ruff to lint python files variant {i}",
+                           type="procedural", tags=["lint"])
+        pack = store.auto_context_pack("ruff lint python", token_budget=40,
+                                       compress=True, compress_threshold=0.25)
+        assert pack.budget == 40
+        assert pack.used_tokens <= 40
+
+
+class TestPackMinCosine:
+    def test_min_cosine_in_recall_pack(self, store: MemoryStore):
+        store.remember("astrophysics neutron star merger", type="semantic")
+        pack = store.recall_pack("favourite pizza toppings", token_budget=500, min_cosine=0.9)
+        assert len(pack) == 0
+        assert pack.text == ""

@@ -7,13 +7,18 @@ import math
 import time
 from collections import Counter
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from ai_houkai.cli import config as _config
+
 # Decay defaults mirror DecayEngine.__init__ so the health view is consistent
-# with the engine's behaviour when no custom engine has been constructed.
+# with the engine's behaviour when no custom engine has been constructed. The
+# effective values are loaded from the [maintenance.decay] config so the report
+# matches what `houkai prune` / the maintenance daemon would actually remove.
 _DEFAULT_DECAY_RATE     = 0.1
 _DEFAULT_MIN_SCORE      = 0.05
 # DecayEngine.prune() never removes these types regardless of score, so they
@@ -23,9 +28,19 @@ _DEFAULT_PROTECT_TYPES  = ("procedural",)
 _BUCKET_LABELS = ["0.0–0.2", "0.2–0.4", "0.4–0.6", "0.6–0.8", "0.8–1.0"]
 
 
-def _decay_score(importance: float, last_accessed: float, decay_rate: float) -> float:
+def _decay_score(
+    importance: float,
+    last_accessed: float,
+    decay_rate: float,
+    access_count: int = 0,
+    frequency_weight: float = 0.0,
+) -> float:
+    """Mirror DecayEngine.score exactly, including frequency reinforcement."""
     days = max(0.0, (time.time() - last_accessed) / 86_400.0)
-    return importance * math.exp(-decay_rate * days)
+    base = importance * math.exp(-decay_rate * days)
+    if frequency_weight:
+        base *= 1.0 + frequency_weight * math.log1p(max(0, access_count))
+    return base
 
 
 def _bucket(score: float) -> int:
@@ -44,14 +59,26 @@ def stats(
         30, "--stale-days",
         help="Days without access before a memory is considered stale (--health only).",
     ),
-    decay_rate: float = typer.Option(
-        _DEFAULT_DECAY_RATE, "--decay-rate",
-        help="Decay λ used for the health histogram (--health only).",
+    decay_rate: Optional[float] = typer.Option(
+        None, "--decay-rate",
+        help="Decay λ for the health histogram (--health only). "
+             "Defaults to [maintenance.decay].decay_rate from config.",
+    ),
+    frequency_weight: Optional[float] = typer.Option(
+        None, "--frequency-weight",
+        help="Recall-reinforcement weight for the health scores (--health only). "
+             "Defaults to [maintenance.decay].frequency_weight from config.",
     ),
 ) -> None:
     """Show memory store statistics."""
     store = ctx.obj["store"]
     cfg   = ctx.obj["config"]
+
+    # Pull the real decay parameters so --health reflects what prune() removes.
+    mcfg = _config.load_maintenance()
+    eff_decay_rate  = decay_rate if decay_rate is not None else mcfg.decay_rate
+    eff_freq_weight = (frequency_weight if frequency_weight is not None
+                       else mcfg.frequency_weight)
 
     memories    = store.list_recent(limit=999_999, include_superseded=True)
     active      = [m for m in memories if not m.superseded_by]
@@ -81,7 +108,11 @@ def stats(
     }
 
     if health:
-        data["health"] = _compute_health(active, stale_days=stale_days, decay_rate=decay_rate)
+        data["health"] = _compute_health(
+            active, stale_days=stale_days, decay_rate=eff_decay_rate,
+            min_score=mcfg.min_score, protect_types=tuple(mcfg.protect_types),
+            frequency_weight=eff_freq_weight,
+        )
 
     if fmt == "json":
         print(json.dumps(data, indent=2))
@@ -101,13 +132,22 @@ def _compute_health(
     *,
     stale_days: int,
     decay_rate: float,
+    min_score: float = _DEFAULT_MIN_SCORE,
+    protect_types: tuple[str, ...] = _DEFAULT_PROTECT_TYPES,
+    frequency_weight: float = 0.0,
 ) -> dict:
     now       = time.time()
     stale_ts  = now - stale_days * 86_400.0
-    at_risk_threshold = _DEFAULT_MIN_SCORE
+    at_risk_threshold = min_score
 
-    # Decay score per memory
-    scored = [(m, _decay_score(m.importance, m.last_accessed, decay_rate)) for m in active]
+    # Decay score per memory — same formula as DecayEngine.score (incl. the
+    # frequency-reinforcement term) so the histogram and at-risk count match
+    # what the engine would actually prune.
+    scored = [
+        (m, _decay_score(m.importance, m.last_accessed, decay_rate,
+                         m.access_count, frequency_weight))
+        for m in active
+    ]
 
     # Histogram buckets 0–1 in 5 bands
     hist = [0, 0, 0, 0, 0]
@@ -118,7 +158,7 @@ def _compute_health(
     # DecayEngine.prune(), which skips protect_types regardless of score.
     at_risk = [
         m for m, s in scored
-        if s < at_risk_threshold and m.type not in _DEFAULT_PROTECT_TYPES
+        if s < at_risk_threshold and m.type not in protect_types
     ]
 
     # Never recalled

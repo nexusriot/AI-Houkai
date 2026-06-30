@@ -169,10 +169,16 @@ class AsyncMemoryStore:
         until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "semantic",
         weights: HybridWeights | None = None,
+        fusion: Literal["weighted", "rrf"] = "weighted",
+        diversity: float | None = None,
+        dedup_threshold: float | None = None,
+        min_cosine: float | None = None,
         overfetch: int = 4,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
-    ) -> list[tuple[Memory, float]]:
+        touch: bool = True,
+        explain: bool = False,
+    ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         return await self.run(
             self.sync.recall,
             query,
@@ -185,9 +191,15 @@ class AsyncMemoryStore:
             until=until,
             mode=mode,
             weights=weights,
+            fusion=fusion,
+            diversity=diversity,
+            dedup_threshold=dedup_threshold,
+            min_cosine=min_cosine,
             overfetch=overfetch,
             expand=expand,
             include_superseded=include_superseded,
+            touch=touch,
+            explain=explain,
         )
 
     async def recall_pack(
@@ -203,11 +215,19 @@ class AsyncMemoryStore:
         until: float | None = None,
         mode: Literal["semantic", "hybrid"] = "hybrid",
         weights: HybridWeights | None = None,
+        fusion: Literal["weighted", "rrf"] = "weighted",
+        diversity: float | None = None,
+        dedup_threshold: float | None = None,
+        min_cosine: float | None = None,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
         max_items: int = 50,
+        touch: bool = True,
         token_counter: Callable[[str], int] | None = None,
         header: str = "## Relevant memory",
+        compress: bool = False,
+        compress_threshold: float = 0.30,
+        compress_min_group: int = 2,
     ) -> PackResult:
         return await self.run(
             self.sync.recall_pack,
@@ -221,11 +241,19 @@ class AsyncMemoryStore:
             until=until,
             mode=mode,
             weights=weights,
+            fusion=fusion,
+            diversity=diversity,
+            dedup_threshold=dedup_threshold,
+            min_cosine=min_cosine,
             expand=expand,
             include_superseded=include_superseded,
             max_items=max_items,
+            touch=touch,
             token_counter=token_counter,
             header=header,
+            compress=compress,
+            compress_threshold=compress_threshold,
+            compress_min_group=compress_min_group,
         )
 
     async def list_recent(
