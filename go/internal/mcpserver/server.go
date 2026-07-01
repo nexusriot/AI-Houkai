@@ -16,7 +16,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 15 tools.
+// New wires up the MCP server with all 16 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -25,6 +25,7 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addRemember(s, store)
 	addRecall(s, store)
 	addRecallPack(s, store)
+	addAutoContext(s, store)
 	addForget(s, store)
 	addListRecent(s, store)
 	addStats(s, store, path, collection)
@@ -70,6 +71,18 @@ func parseSinceUntil(req mcp.CallToolRequest) (since, until float64, err error) 
 		return 0, 0, err
 	}
 	return since, until, nil
+}
+
+// optFloat32 returns a *float32 for an optional numeric arg (nil when absent),
+// used for the recall knobs whose "unset" state disables a feature.
+func optFloat32(req mcp.CallToolRequest, key string) *float32 {
+	if v, ok := req.GetArguments()[key]; ok {
+		if f, ok := v.(float64); ok {
+			x := float32(f)
+			return &x
+		}
+	}
+	return nil
 }
 
 func jsonText(v any) *mcp.CallToolResult {
@@ -132,8 +145,14 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("since", mcp.Description("Bound created_at: epoch seconds, an ISO-8601 date/datetime, or a relative span like \"7d\" / \"24h\"")),
 		mcp.WithString("until", mcp.Description("Bound created_at (upper): epoch seconds, ISO-8601, or a relative span")),
 		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: semantic)")),
-		mcp.WithNumber("overfetch", mcp.Description("Overfetch multiplier for hybrid (default: 3)")),
+		mcp.WithNumber("overfetch", mcp.Description("Overfetch multiplier (default: 4)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+		mcp.WithString("fusion", mcp.Description("weighted (default) | rrf — Reciprocal Rank Fusion of the hybrid signals")),
+		mcp.WithNumber("diversity", mcp.Description("MMR λ in [0,1]: higher favours relevance, lower novelty (omit to disable)")),
+		mcp.WithNumber("dedup_threshold", mcp.Description("Drop a candidate whose cosine to an already-selected result exceeds this [0,1]")),
+		mcp.WithNumber("min_cosine", mcp.Description("Absolute cosine relevance floor in [-1,1]; drops weak hits (omit to disable)")),
+		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on the hits (default: true; false = read-only)")),
+		mcp.WithBoolean("explain", mcp.Description("Include a per-signal score breakdown on each result")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
@@ -150,25 +169,32 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			Tag:               req.GetString("tag", ""),
 			MinImportance:     float32(req.GetFloat("min_importance", 0)),
 			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeSemantic))),
-			Overfetch:         req.GetInt("overfetch", 3),
+			Overfetch:         req.GetInt("overfetch", 4),
 			IncludeSuperseded: req.GetBool("include_superseded", false),
 			Source:            req.GetString("source", ""),
 			Since:             since,
 			Until:             until,
+			Fusion:            memory.FusionMode(req.GetString("fusion", "")),
+			Diversity:         optFloat32(req, "diversity"),
+			DedupThreshold:    optFloat32(req, "dedup_threshold"),
+			MinCosine:         optFloat32(req, "min_cosine"),
+			NoTouch:           !req.GetBool("touch", true),
+			Explain:           req.GetBool("explain", false),
 		}
 		results, err := store.Recall(ctx, query, k, opts)
 		if err != nil {
 			return errResult(err), nil
 		}
 		type row struct {
-			ID           string   `json:"id"`
-			Text         string   `json:"text"`
-			Type         string   `json:"type"`
-			Tags         []string `json:"tags"`
-			Importance   float32  `json:"importance"`
-			Score        float32  `json:"score"`
-			CreatedAt    float64  `json:"created_at"`
-			SupersededBy string   `json:"superseded_by,omitempty"`
+			ID           string         `json:"id"`
+			Text         string         `json:"text"`
+			Type         string         `json:"type"`
+			Tags         []string       `json:"tags"`
+			Importance   float32        `json:"importance"`
+			Score        float32        `json:"score"`
+			CreatedAt    float64        `json:"created_at"`
+			SupersededBy string         `json:"superseded_by,omitempty"`
+			Explain      map[string]any `json:"explain,omitempty"`
 		}
 		out := make([]row, len(results))
 		for i, r := range results {
@@ -181,6 +207,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 				Score:        r.Score,
 				CreatedAt:    r.CreatedAt,
 				SupersededBy: r.SupersededBy,
+				Explain:      r.Explain,
 			}
 		}
 		return jsonText(out), nil
@@ -205,6 +232,13 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: hybrid)")),
 		mcp.WithNumber("max_items", mcp.Description("Ranked candidates to consider (default: 50)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+		mcp.WithString("fusion", mcp.Description("weighted (default) | rrf")),
+		mcp.WithNumber("diversity", mcp.Description("MMR λ in [0,1] to reduce near-duplicate memories in the pack (omit to disable)")),
+		mcp.WithNumber("dedup_threshold", mcp.Description("Hard-drop candidates whose cosine exceeds this [0,1]")),
+		mcp.WithNumber("min_cosine", mcp.Description("Absolute cosine relevance floor in [-1,1] (omit to disable)")),
+		mcp.WithBoolean("compress", mcp.Description("Fold budget-dropped, similar memories into compressed summary lines")),
+		mcp.WithNumber("compress_threshold", mcp.Description("Jaccard similarity for compression clustering (default: 0.30)")),
+		mcp.WithNumber("compress_min_group", mcp.Description("Minimum cluster size to compress (default: 2)")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
@@ -226,29 +260,90 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 			Source:            req.GetString("source", ""),
 			Since:             since,
 			Until:             until,
+			Fusion:            memory.FusionMode(req.GetString("fusion", "")),
+			Diversity:         optFloat32(req, "diversity"),
+			DedupThreshold:    optFloat32(req, "dedup_threshold"),
+			MinCosine:         optFloat32(req, "min_cosine"),
+			Compress:          req.GetBool("compress", false),
+			CompressThreshold: float32(req.GetFloat("compress_threshold", 0.30)),
+			CompressMinGroup:  req.GetInt("compress_min_group", 2),
 		})
 		if err != nil {
 			return errResult(err), nil
 		}
-		items := make([]map[string]any, len(pack.Items))
-		for i, p := range pack.Items {
-			items[i] = map[string]any{
-				"id":         p.Memory.ID,
-				"text":       p.Memory.Text,
-				"type":       string(p.Memory.Type),
-				"tags":       p.Memory.Tags,
-				"importance": p.Memory.Importance,
-				"score":      p.Score,
-				"tokens":     p.Tokens,
+		return jsonText(packResultJSON(pack)), nil
+	})
+}
+
+// packResultJSON renders a PackResult as the MCP/HTTP response payload,
+// including compressed groups as {ids, count, text, tokens}.
+func packResultJSON(pack memory.PackResult) map[string]any {
+	items := make([]map[string]any, len(pack.Items))
+	for i, p := range pack.Items {
+		items[i] = map[string]any{
+			"id":         p.Memory.ID,
+			"text":       p.Memory.Text,
+			"type":       string(p.Memory.Type),
+			"tags":       p.Memory.Tags,
+			"importance": p.Memory.Importance,
+			"score":      p.Score,
+			"tokens":     p.Tokens,
+		}
+	}
+	out := map[string]any{
+		"text":        pack.Text,
+		"used_tokens": pack.UsedTokens,
+		"budget":      pack.Budget,
+		"truncated":   pack.Truncated,
+		"items":       items,
+	}
+	if len(pack.CompressedGroups) > 0 {
+		groups := make([]map[string]any, len(pack.CompressedGroups))
+		for i, g := range pack.CompressedGroups {
+			groups[i] = map[string]any{
+				"ids": g.IDs(), "count": len(g.Memories), "text": g.Text, "tokens": g.Tokens,
 			}
 		}
-		return jsonText(map[string]any{
-			"text":        pack.Text,
-			"used_tokens": pack.UsedTokens,
-			"budget":      pack.Budget,
-			"truncated":   pack.Truncated,
-			"items":       items,
-		}), nil
+		out["compressed_groups"] = groups
+	}
+	return out
+}
+
+func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("auto_context",
+		mcp.WithDescription("Build a token-budgeted context block for a task by fanning out recall over the "+
+			"task plus extracted key phrases, deduplicating by memory id (keeping the highest score), then "+
+			"packing greedily. More thorough than a single recall_pack for open-ended tasks."),
+		mcp.WithString("task", mcp.Required(), mcp.Description("Task or situation description to gather context for")),
+		mcp.WithNumber("token_budget", mcp.Description("Token budget for the packed block (default: 800)")),
+		mcp.WithNumber("max_phrases", mcp.Description("Max key phrases to fan out over (default: 3)")),
+		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: hybrid)")),
+		mcp.WithNumber("min_cosine", mcp.Description("Absolute cosine relevance floor applied to every fan-out query [-1,1]")),
+		mcp.WithBoolean("compress", mcp.Description("Fold budget-dropped, similar memories into compressed summary lines")),
+		mcp.WithNumber("compress_threshold", mcp.Description("Jaccard similarity for compression clustering (default: 0.30)")),
+		mcp.WithNumber("compress_min_group", mcp.Description("Minimum cluster size to compress (default: 2)")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		task, err := req.RequireString("task")
+		if err != nil {
+			return errResult(err), nil
+		}
+		maxPhrases := req.GetInt("max_phrases", 3)
+		pack, err := store.AutoContextPack(ctx, task, memory.AutoContextOpts{
+			TokenBudget:       req.GetInt("token_budget", 800),
+			MaxPhrases:        maxPhrases,
+			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeHybrid))),
+			MinCosine:         optFloat32(req, "min_cosine"),
+			Compress:          req.GetBool("compress", false),
+			CompressThreshold: float32(req.GetFloat("compress_threshold", 0.30)),
+			CompressMinGroup:  req.GetInt("compress_min_group", 2),
+		})
+		if err != nil {
+			return errResult(err), nil
+		}
+		out := packResultJSON(pack)
+		out["queries"] = append([]string{task}, memory.ExtractKeyPhrases(task, maxPhrases)...)
+		return jsonText(out), nil
 	})
 }
 
@@ -442,14 +537,14 @@ func addMaintenanceTick(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("min_score", mcp.Description("Prune threshold (default: 0.05)")),
 		mcp.WithNumber("frequency_weight", mcp.Description("Reinforcement: how strongly recall count resists decay (default: 0 = off)")),
 		mcp.WithBoolean("reflect", mcp.Description("Also run reflection (default: false)")),
-		mcp.WithBoolean("consolidate", mcp.Description("Consolidate episodic memories after reflection")),
+		mcp.WithString("consolidate", mcp.Description("Consolidate sources after reflection: none|soft|hard (default: none)")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		decayRate := float32(req.GetFloat("decay_rate", 0.1))
 		minScore := float32(req.GetFloat("min_score", 0.05))
 		frequencyWeight := float32(req.GetFloat("frequency_weight", 0))
 		doReflect := req.GetBool("reflect", false)
-		consolidate := req.GetBool("consolidate", false)
+		consolidate := reflectpkg.ConsolidateModeFromString(req.GetString("consolidate", "none"))
 
 		de := decay.New(store, decayRate, minScore, nil, frequencyWeight)
 		pruned, err := de.Prune(ctx, false)

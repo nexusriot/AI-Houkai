@@ -41,17 +41,39 @@ type Memory struct {
 type MemoryWithScore struct {
 	Memory
 	Score float32 `json:"score"`
+	// Explain, when non-nil, carries the per-signal score breakdown produced
+	// by Recall(..., Explain=true). Omitted from JSON otherwise.
+	Explain map[string]any `json:"explain,omitempty"`
 }
+
+// FusionMode selects how the hybrid signals are combined.
+type FusionMode string
+
+const (
+	FusionWeighted FusionMode = "weighted"
+	FusionRRF      FusionMode = "rrf"
+)
 
 type HybridWeights struct {
 	Cosine     float32
 	Lexical    float32
 	Recency    float32
 	Importance float32
+	// PolarityWeight is an additive bonus of +weight for polarity=+1 and
+	// -weight for polarity=-1 (0 disables the nudge).
+	PolarityWeight float32
+	// RecencyBasis selects which timestamp the recency term measures:
+	// "created" (default) scores by how recently the fact was learned — stable
+	// across recalls; "accessed" scores by how recently it was retrieved
+	// (self-reinforcing, the old behaviour). The empty string means "created".
+	RecencyBasis string
 }
 
 func DefaultWeights() HybridWeights {
-	return HybridWeights{Cosine: 0.55, Lexical: 0.20, Recency: 0.15, Importance: 0.10}
+	return HybridWeights{
+		Cosine: 0.55, Lexical: 0.20, Recency: 0.15, Importance: 0.10,
+		PolarityWeight: 0.05, RecencyBasis: "created",
+	}
 }
 
 type ExpandSpec struct {
@@ -59,6 +81,10 @@ type ExpandSpec struct {
 	Depth int
 	Cap   int
 	Score float32
+	// Decay is the per-hop score multiplier beyond the first hop: a hop-h
+	// neighbour is scored Score*Decay^(h-1). 0 or 1 keeps every expanded node
+	// at Score regardless of distance (backward-compatible).
+	Decay float32
 }
 
 type ConflictKind string

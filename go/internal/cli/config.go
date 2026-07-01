@@ -52,6 +52,47 @@ type Config struct {
 	DOKey             string            `toml:"do_api_key"`
 	DOModel           string            `toml:"do_model"`
 	EmbedDim          int               `toml:"embed_dim"`
+	Maintenance       MaintenanceConfig `toml:"maintenance"`
+}
+
+// MaintenanceConfig holds the [maintenance] config block.
+type MaintenanceConfig struct {
+	Decay        MaintenanceDecayConfig `toml:"decay"`
+	IntervalSecs int                    `toml:"interval_secs"` // tick cadence, default 3600
+	Reflect      bool                   `toml:"reflect"`       // run reflection each tick
+	Consolidate  bool                   `toml:"consolidate"`   // soft-consolidate on reflection
+	StatePath    string                 `toml:"state_path"`    // default: <store-dir>/maintenance_state.json
+	PidPath      string                 `toml:"pid_path"`      // default: <store-dir>/maintenance.pid
+	LogPath      string                 `toml:"log_path"`      // default: <store-dir>/maintenance.log
+}
+
+// MaintPaths returns the resolved state/pid/log paths, defaulting to files
+// alongside the store directory.
+func (c Config) MaintPaths() (statePath, pidPath, logPath string) {
+	dir := filepath.Dir(c.StorePath)
+	statePath = c.Maintenance.StatePath
+	if statePath == "" {
+		statePath = filepath.Join(dir, "maintenance_state.json")
+	}
+	pidPath = c.Maintenance.PidPath
+	if pidPath == "" {
+		pidPath = filepath.Join(dir, "maintenance.pid")
+	}
+	logPath = c.Maintenance.LogPath
+	if logPath == "" {
+		logPath = filepath.Join(dir, "maintenance.log")
+	}
+	return statePath, pidPath, logPath
+}
+
+// MaintenanceDecayConfig holds [maintenance.decay]: the effective decay/prune
+// parameters used by `houkai prune`, the maintenance daemon, and the
+// `stats --health` report so all three agree on what would be pruned.
+type MaintenanceDecayConfig struct {
+	DecayRate       float32  `toml:"decay_rate"`
+	MinScore        float32  `toml:"min_score"`
+	ProtectTypes    []string `toml:"protect_types"`
+	FrequencyWeight float32  `toml:"frequency_weight"`
 }
 
 func defaultConfig() Config {
@@ -68,6 +109,15 @@ func defaultConfig() Config {
 		OpenAIModel:       "text-embedding-3-small",
 		DOModel:           "qwen3-embedding-0.6b",
 		EmbedDim:          384,
+		Maintenance: MaintenanceConfig{
+			Decay: MaintenanceDecayConfig{
+				DecayRate:       0.1,
+				MinScore:        0.05,
+				ProtectTypes:    []string{"procedural"},
+				FrequencyWeight: 0.0,
+			},
+			IntervalSecs: 3600,
+		},
 	}
 }
 

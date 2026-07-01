@@ -64,7 +64,11 @@ func runTick(ctx context.Context, store decay.Storable, reflStore reflectpkg.Sto
 
 	if cfg.Reflect {
 		re := reflectpkg.New(reflStore, 0, 0, cfg.Summarizer)
-		created, err := re.Reflect(ctx, false, cfg.Consolidate)
+		mode := reflectpkg.ConsolidateNone
+		if cfg.Consolidate {
+			mode = reflectpkg.ConsolidateSoft
+		}
+		created, err := re.Reflect(ctx, false, mode)
 		if err != nil {
 			log.Printf("maintenance reflect: %v", err)
 		} else {

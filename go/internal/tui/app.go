@@ -9,6 +9,7 @@ package tui
 //	n          open the selected memory's neighbors (walk the graph)
 //	b          back one view (breadcrumb stack)
 //	r          reload the recent view
+//	X          nuke the whole collection (press twice to confirm)
 //	q          quit
 
 import (
@@ -40,14 +41,15 @@ type Model struct {
 	nav        *Navigator
 	collection string
 
-	tbl       table.Model
-	detail    viewport.Model
-	search    textinput.Model
-	searching bool
-	status    string
-	width     int
-	height    int
-	ready     bool
+	tbl         table.Model
+	detail      viewport.Model
+	search      textinput.Model
+	searching   bool
+	nukePending bool
+	status      string
+	width       int
+	height      int
+	ready       bool
 }
 
 // New builds the TUI model around an open MemoryStore.
@@ -181,6 +183,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// Any key other than a second "X" cancels a pending nuke.
+		if msg.String() != "X" {
+			m.nukePending = false
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -216,6 +223,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.showView(m.nav.Current())
 			return m, nil
+		case "X":
+			return m.handleNuke()
 		}
 	}
 
@@ -223,6 +232,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.tbl, cmd = m.tbl.Update(msg)
 	m.updateDetail()
 	return m, cmd
+}
+
+// handleNuke implements the two-press collection wipe: the first X arms it,
+// the second confirms and deletes everything, then reloads the recent view.
+func (m *Model) handleNuke() (tea.Model, tea.Cmd) {
+	ctx := context.Background()
+	if m.nukePending {
+		m.nukePending = false
+		deleted, err := m.store.Nuke(ctx)
+		if err != nil {
+			m.status = err.Error()
+			return m, nil
+		}
+		if _, err := m.nav.OpenRecent(ctx, 200); err != nil {
+			m.status = err.Error()
+		} else {
+			m.status = fmt.Sprintf("Nuked %d memories.", deleted)
+		}
+		m.showView(m.nav.Current())
+		return m, nil
+	}
+	count, err := m.store.Count(ctx)
+	if err != nil {
+		m.status = err.Error()
+		return m, nil
+	}
+	if count == 0 {
+		m.status = "Collection is already empty."
+		return m, nil
+	}
+	m.nukePending = true
+	m.status = fmt.Sprintf("About to nuke all %d memories. Press X again to confirm.", count)
+	return m, nil
 }
 
 func (m *Model) View() string {
@@ -239,7 +281,7 @@ func (m *Model) View() string {
 	if m.searching {
 		bottom = m.search.View()
 	} else {
-		bottom = helpStyle.Render("/ search · n neighbors · b back · r recent · q quit")
+		bottom = helpStyle.Render("/ search · n neighbors · b back · r recent · X nuke · q quit")
 	}
 	status := statusStyle.Render(m.status)
 	return lipgloss.JoinVertical(lipgloss.Left, title, crumb, body, status, bottom)

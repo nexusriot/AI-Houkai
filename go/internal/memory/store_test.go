@@ -271,8 +271,15 @@ func TestStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
-	if s["count"].(int) != 2 {
-		t.Errorf("count: got %v, want 2", s["count"])
+	if s["active"].(int) != 2 {
+		t.Errorf("active: got %v, want 2", s["active"])
+	}
+	if s["total"].(int) != 2 {
+		t.Errorf("total: got %v, want 2", s["total"])
+	}
+	// top_tags must be an object {tag:count}, matching Python's dict shape.
+	if tt, ok := s["top_tags"].(map[string]int); !ok || tt["x"] != 2 {
+		t.Errorf("top_tags should be a {tag:count} map with x=2, got %#v", s["top_tags"])
 	}
 }
 
@@ -283,4 +290,54 @@ func mustRemember(t *testing.T, s *MemoryStore, text string, opts RememberOpts) 
 		t.Fatalf("Remember(%q): %v", text, err)
 	}
 	return m.ID, stored, conflicts, err
+}
+
+func TestNuke(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		store.Remember(ctx, "memory number "+string(rune('a'+i)), RememberOpts{Type: Semantic})
+	}
+	if c, _ := store.Count(ctx); c != 3 {
+		t.Fatalf("setup: want 3, got %d", c)
+	}
+	deleted, err := store.Nuke(ctx)
+	if err != nil {
+		t.Fatalf("Nuke: %v", err)
+	}
+	if deleted != 3 {
+		t.Errorf("Nuke deleted %d, want 3", deleted)
+	}
+	if c, _ := store.Count(ctx); c != 0 {
+		t.Errorf("after nuke count = %d, want 0", c)
+	}
+	// Nuking an empty collection returns 0, not an error.
+	if d, err := store.Nuke(ctx); err != nil || d != 0 {
+		t.Errorf("empty nuke: got (%d, %v), want (0, nil)", d, err)
+	}
+}
+
+func TestFindConflictsGlobalAllPairs(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	// 5 identical same-type memories → every pair is a duplicate conflict.
+	for i := 0; i < 5; i++ {
+		store.Remember(ctx, "the release pipeline is healthy", RememberOpts{Type: Semantic})
+	}
+	got, err := store.FindConflicts(ctx, "", 0) // 0 → store default threshold
+	if err != nil {
+		t.Fatalf("FindConflicts: %v", err)
+	}
+	if len(got) != 10 { // C(5,2)
+		t.Errorf("global scan should find all 10 pairs, got %d", len(got))
+	}
+	// A superseded member must not appear in any pair.
+	all, _ := store.ListRecent(ctx, 0, true)
+	_ = store.Supersede(ctx, all[0].ID, all[1].ID)
+	got2, _ := store.FindConflicts(ctx, "", 0)
+	for _, c := range got2 {
+		if c.A.ID == all[0].ID || c.B.ID == all[0].ID {
+			t.Errorf("superseded memory %s should be excluded from global conflicts", all[0].ID)
+		}
+	}
 }

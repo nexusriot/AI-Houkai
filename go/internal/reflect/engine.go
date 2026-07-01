@@ -17,10 +17,10 @@ type Summarizer func(ctx context.Context, ms []memory.Memory) (string, error)
 
 // Engine clusters episodic memories and condenses them into semantic ones.
 type Engine struct {
-	store              Storable
+	store               Storable
 	SimilarityThreshold float32
-	MinClusterSize     int
-	Summarizer         Summarizer
+	MinClusterSize      int
+	Summarizer          Summarizer
 }
 
 // Storable is the subset of MemoryStore the Engine needs.
@@ -29,6 +29,33 @@ type Storable interface {
 	Remember(ctx context.Context, text string, opts memory.RememberOpts) (memory.Memory, bool, []memory.Conflict, error)
 	Forget(ctx context.Context, id string) (bool, error)
 	Link(ctx context.Context, srcID, dstID, rel string) error
+	Supersede(ctx context.Context, oldID, newID string) error
+}
+
+// ConsolidateMode selects what happens to source episodics after a reflection.
+//
+//	none — leave sources untouched (default)
+//	soft — supersede sources by the summary and add a derived_from link
+//	hard — permanently forget sources (data is lost)
+type ConsolidateMode string
+
+const (
+	ConsolidateNone ConsolidateMode = "none"
+	ConsolidateSoft ConsolidateMode = "soft"
+	ConsolidateHard ConsolidateMode = "hard"
+)
+
+// ConsolidateModeFromString maps a user string (including "" and legacy bool
+// spellings) to a ConsolidateMode. Unknown values fall back to none.
+func ConsolidateModeFromString(s string) ConsolidateMode {
+	switch s {
+	case "soft", "true", "1", "yes":
+		return ConsolidateSoft
+	case "hard":
+		return ConsolidateHard
+	default:
+		return ConsolidateNone
+	}
 }
 
 // actorScoped is implemented by *memory.MemoryStore. We optionally use it
@@ -97,6 +124,12 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 			if assigned[j] || len(other.embedding) == 0 {
 				continue
 			}
+			// Never merge explicitly opposite polarities: a positive and a
+			// negative memory about the same event describe contradictory
+			// states and must not collapse into one summary.
+			if seed.Polarity != 0 && other.Polarity != 0 && seed.Polarity != other.Polarity {
+				continue
+			}
 			sim := cosineSim(seed.embedding, other.embedding)
 			if sim >= e.SimilarityThreshold {
 				assigned[j] = true
@@ -111,9 +144,15 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 }
 
 // Reflect condenses clusters into semantic memories. Returns created memories.
-// If consolidate is true, deletes source episodic memories.
-// If dryRun is true, no writes occur.
-func (e *Engine) Reflect(ctx context.Context, dryRun, consolidate bool) ([]memory.Memory, error) {
+//
+// consolidate controls what happens to source episodics:
+//
+//	none — leave sources untouched (no derived_from link)
+//	soft — supersede each source by the summary and add a derived_from link
+//	hard — permanently forget each source (no link)
+//
+// If dryRun is true, no writes occur (consolidate is ignored).
+func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate ConsolidateMode) ([]memory.Memory, error) {
 	clusters, err := e.Clusters(ctx)
 	if err != nil {
 		return nil, err
@@ -133,21 +172,23 @@ func (e *Engine) Reflect(ctx context.Context, dryRun, consolidate bool) ([]memor
 			return created, fmt.Errorf("reflect summarizer: %w", err)
 		}
 
-		// Aggregate tags and mean importance.
-		tagSet := map[string]bool{"reflection": true}
-		var totalImp float32
+		// Aggregate tags (reflection first, then first-seen order) and mean
+		// importance rounded to 3 decimals, matching Python.
+		tags := []string{"reflection"}
+		seen := map[string]bool{"reflection": true}
+		var totalImp float64
 		for _, m := range cluster {
 			for _, t := range m.Tags {
-				tagSet[t] = true
+				if !seen[t] {
+					seen[t] = true
+					tags = append(tags, t)
+				}
 			}
-			totalImp += m.Importance
+			totalImp += float64(m.Importance)
 		}
-		tags := make([]string, 0, len(tagSet))
-		for t := range tagSet {
-			tags = append(tags, t)
-		}
-		sort.Strings(tags)
-		avgImp := totalImp / float32(len(cluster))
+		// float64 accumulation + round-half-to-even to 3 decimals, matching
+		// Python's round(sum/len, 3).
+		avgImp := float32(math.RoundToEven(totalImp/float64(len(cluster))*1000) / 1000)
 
 		if dryRun {
 			created = append(created, memory.Memory{
@@ -155,6 +196,7 @@ func (e *Engine) Reflect(ctx context.Context, dryRun, consolidate bool) ([]memor
 				Type:       memory.Semantic,
 				Tags:       tags,
 				Importance: avgImp,
+				Source:     "reflection/dry-run",
 				CreatedAt:  float64(time.Now().Unix()),
 			})
 			continue
@@ -164,19 +206,22 @@ func (e *Engine) Reflect(ctx context.Context, dryRun, consolidate bool) ([]memor
 			Type:       memory.Semantic,
 			Tags:       tags,
 			Importance: avgImp,
+			Source:     "reflection",
 		})
 		if err != nil {
 			return created, err
 		}
-		// Link new semantic memory to sources.
-		for _, src := range cluster {
-			_ = e.store.Link(ctx, newMem.ID, src.ID, memory.RelDerivedFrom)
-		}
 		created = append(created, newMem)
 
-		if consolidate {
+		switch consolidate {
+		case ConsolidateHard:
 			for _, src := range cluster {
 				_, _ = e.store.Forget(ctx, src.ID)
+			}
+		case ConsolidateSoft:
+			for _, src := range cluster {
+				_ = e.store.Supersede(ctx, src.ID, newMem.ID)
+				_ = e.store.Link(ctx, newMem.ID, src.ID, memory.RelDerivedFrom)
 			}
 		}
 	}

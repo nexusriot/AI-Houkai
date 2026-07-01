@@ -277,3 +277,34 @@ func TestRecallPackReturnsBlock(t *testing.T) {
 		t.Errorf("recall_pack missing items: %v", body)
 	}
 }
+
+func TestAutoContextEndpoint(t *testing.T) {
+	ts, store := newTestServer(t, "")
+	ctx := context.Background()
+	store.Remember(ctx, "deployment pipeline runbook and rollback", memory.RememberOpts{Type: memory.Procedural, Importance: 0.9})
+
+	body := bytes.NewBufferString(`{"task":"the deployment pipeline failed","token_budget":800}`)
+	resp, err := http.Post(ts.URL+"/auto_context", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("auto_context status = %d", resp.StatusCode)
+	}
+	m := decode(t, resp)
+	if _, ok := m["queries"].([]any); !ok {
+		t.Errorf("auto_context response missing queries: %v", m)
+	}
+	if _, ok := m["items"].([]any); !ok {
+		t.Errorf("auto_context response missing items: %v", m)
+	}
+}
+
+func TestHealthOmitsCollection(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	resp, _ := http.Get(ts.URL + "/health")
+	m := decode(t, resp)
+	if _, present := m["collection"]; present {
+		t.Error("/health must not expose the collection name")
+	}
+}
