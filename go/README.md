@@ -659,7 +659,7 @@ internal/
   maintenance/      Background daemon (prune + reflect on a ticker)
   ingest/           Deterministic chunking for bulk ingestion
   tui/              Bubble Tea memory browser (navigator + view-models)
-  mcpserver/        15 MCP tool definitions
+  mcpserver/        16 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
   installer/        config patchers for Claude Code, Cursor, OpenCode
   version/          ldflags-injected build info
@@ -702,14 +702,14 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The Go port exposes **15 MCP tools** — `remember`, `recall`, `recall_pack`,
-`forget`, `list_recent`, `stats`, `link`, `unlink`, `neighbors`,
-`find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`, `export`,
-`import`. The Python reference port has since added an `auto_context` tool plus
+The Go port exposes **16 MCP tools** — `remember`, `recall`, `recall_pack`,
+`auto_context`, `forget`, `list_recent`, `stats`, `link`, `unlink`,
+`neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`,
+`export`, `import`. This matches the Python reference port, including the
 advanced retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`,
-diversity/MMR, `dedup_threshold`, `min_cosine`, `touch`, `explain`,
-`recall_pack` compression) that the Go port does not yet implement. The shared
-tools keep the same names and core behaviour, so existing clients keep working.
+diversity/MMR, `dedup_threshold`, `min_cosine`, `touch`, `explain`, and
+`recall_pack` compression) and the `auto_context` fan-out tool. The tools
+keep the same names and behaviour, so existing clients keep working.
 
 The audit journal is enabled by default in both ports and uses the same
 JSONL line format, so a journal written by one binary can be read by the

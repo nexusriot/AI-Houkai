@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
+	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -157,8 +158,12 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		m.Tags = []string{}
 	}
 
-	// Conflict check.
-	if s.cfg.ConflictPolicy != PolicyIgnore {
+	// Conflict check. A per-call OnConflict overrides the store default.
+	policy := s.cfg.ConflictPolicy
+	if opts.OnConflict != "" {
+		policy = opts.OnConflict
+	}
+	if policy != PolicyIgnore {
 		vecs, err := s.embedder.Embed(ctx, []string{text})
 		if err != nil {
 			return Memory{}, false, nil, err
@@ -172,7 +177,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		conflicts := detectConflicts(m, candidates, s.cfg.ConflictThreshold, s.cfg.ConflictFn)
 
 		if len(conflicts) > 0 {
-			switch s.cfg.ConflictPolicy {
+			switch policy {
 			case PolicyWarn:
 				log.Printf("ai-houkai: %d conflict(s) detected for new memory", len(conflicts))
 			case PolicyRaise:
@@ -210,104 +215,154 @@ type RememberOpts struct {
 	Importance float32
 	Source     string
 	Polarity   int
+	// OnConflict overrides the store's configured conflict policy for this
+	// call only (empty = use the store default).
+	OnConflict ConflictPolicy
 }
 
 // Recall returns up to k memories matching query.
 func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts RecallOpts) ([]MemoryWithScore, error) {
-	if k <= 0 {
-		k = 5
+	if opts.Diversity != nil && (*opts.Diversity < 0 || *opts.Diversity > 1) {
+		return nil, fmt.Errorf("diversity must be in [0, 1]")
 	}
-	overfetch := k
-	if opts.Mode == ModeHybrid {
-		overfetch = k * opts.Overfetch
-		if overfetch < k {
-			overfetch = k * 3
+	if opts.DedupThreshold != nil && (*opts.DedupThreshold < 0 || *opts.DedupThreshold > 1) {
+		return nil, fmt.Errorf("dedup_threshold must be in [0, 1]")
+	}
+	if opts.MinCosine != nil && (*opts.MinCosine < -1 || *opts.MinCosine > 1) {
+		return nil, fmt.Errorf("min_cosine must be in [-1, 1]")
+	}
+	count, err := s.backend.Count(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Matches Python: a non-positive k or an empty store returns nothing.
+	if k <= 0 || count == 0 {
+		return nil, nil
+	}
+
+	needEmb := opts.Diversity != nil || opts.DedupThreshold != nil
+	overfetch := opts.Overfetch
+	if overfetch <= 0 {
+		overfetch = 4
+	}
+
+	// Unlike Python (which pushes type/importance/source/time into Chroma's
+	// where-clause), the Go backend filters entirely client-side, so ANY active
+	// filter — not just tag — forces an over-fetch to avoid under-returning.
+	noPostFilter := opts.Mode == ModeSemantic && opts.IncludeSuperseded &&
+		opts.Tag == "" && opts.Type == "" && opts.MinImportance <= 0 &&
+		opts.Source == "" && opts.Since == 0 && opts.Until == 0 &&
+		!needEmb && opts.MinCosine == nil
+
+	nFetch := k
+	if !noPostFilter {
+		nFetch = k * overfetch
+		if nFetch > count {
+			nFetch = count
 		}
+	}
+	if nFetch < k {
+		nFetch = k
 	}
 
 	vecs, err := s.embedder.Embed(ctx, []string{query})
 	if err != nil {
 		return nil, err
 	}
-
-	hits, err := s.backend.Query(ctx, vecs[0], overfetch)
+	hits, err := s.backend.Query(ctx, vecs[0], nFetch)
 	if err != nil {
 		return nil, err
 	}
 
-	candidates := hitsToMemoriesWithScore(hits)
-
-	// Metadata filters.
-	var filtered []MemoryWithScore
-	for _, c := range candidates {
-		if !opts.IncludeSuperseded && c.SupersededBy != "" {
+	// The "where-clause" filters (type/importance/source/since/until) form the
+	// scoring pool; tag/superseded/min_cosine are applied inside the scorers so
+	// the BM25 pool matches Python's server-side-filtered document set.
+	var pool []cand
+	for _, h := range hits {
+		m := MetadataToMemory(h.ID, h.Content, h.Metadata)
+		if opts.Type != "" && m.Type != opts.Type {
 			continue
 		}
-		if opts.Type != "" && c.Type != opts.Type {
+		if m.Importance < opts.MinImportance {
 			continue
 		}
-		if c.Importance < opts.MinImportance {
+		if opts.Source != "" && m.Source != opts.Source {
 			continue
 		}
-		if opts.Tag != "" && !containsTag(c.Memory, opts.Tag) {
+		if opts.Since > 0 && m.CreatedAt < opts.Since {
 			continue
 		}
-		if opts.Source != "" && c.Source != opts.Source {
+		if opts.Until > 0 && m.CreatedAt > opts.Until {
 			continue
 		}
-		if opts.Since > 0 && c.CreatedAt < opts.Since {
-			continue
-		}
-		if opts.Until > 0 && c.CreatedAt > opts.Until {
-			continue
-		}
-		filtered = append(filtered, c)
+		pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
 	}
 
-	// Hybrid rescoring.
+	w := opts.Weights
+	if w == (HybridWeights{}) {
+		w = DefaultWeights()
+	}
+
+	var expl map[string]map[string]any
+	if opts.Explain {
+		expl = map[string]map[string]any{}
+	}
+
+	now := nowFloat()
+	var scored []scoredCand
 	if opts.Mode == ModeHybrid {
-		if opts.Weights == (HybridWeights{}) {
-			opts.Weights = DefaultWeights()
+		docs := make([]string, len(pool))
+		for i, c := range pool {
+			docs[i] = c.mem.Text
 		}
-		texts := make([]string, len(filtered))
-		for i, c := range filtered {
-			texts[i] = c.Text
+		bm25 := bm25Score(query, docs)
+		if opts.Fusion == FusionRRF {
+			scored = s.scoreRRF(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now, 60)
+		} else {
+			scored = s.scoreWeighted(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now)
 		}
-		bm25Scores := bm25Score(query, texts)
-		for i := range filtered {
-			var bm25s float32
-			if bm25Scores != nil {
-				bm25s = bm25Scores[i]
-			}
-			filtered[i].Score = hybridScore(filtered[i].Score, bm25s,
-				filtered[i].Importance, filtered[i].LastAccessed,
-				opts.Weights, s.cfg.DecayRate)
-		}
-		sort.Slice(filtered, func(i, j int) bool {
-			return filtered[i].Score > filtered[j].Score
-		})
+	} else {
+		scored = scoreSemantic(pool, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl)
 	}
 
-	if len(filtered) > k {
-		filtered = filtered[:k]
+	var chosen []scoredCand
+	if needEmb {
+		chosen = mmrSelect(scored, k, opts.Diversity, opts.DedupThreshold)
+	} else if len(scored) > k {
+		chosen = scored[:k]
+	} else {
+		chosen = scored
 	}
 
-	// Touch accessed memories.
-	for i := range filtered {
-		if err := s.touch(ctx, &filtered[i].Memory); err != nil {
-			log.Printf("ai-houkai: touch %s: %v", filtered[i].ID, err)
+	out := make([]MemoryWithScore, 0, len(chosen))
+	for _, sc := range chosen {
+		mws := MemoryWithScore{Memory: sc.mem, Score: sc.score}
+		if expl != nil {
+			mws.Explain = expl[sc.mem.ID]
+		}
+		out = append(out, mws)
+	}
+
+	// Touch accessed memories (batched) unless read-only.
+	if !opts.NoTouch && len(out) > 0 {
+		mems := make([]*Memory, len(out))
+		for i := range out {
+			mems[i] = &out[i].Memory
+		}
+		if err := s.touchMany(ctx, mems); err != nil {
+			log.Printf("ai-houkai: touch: %v", err)
 		}
 	}
 
 	// Graph expansion.
-	if opts.Expand != nil {
-		filtered, err = s.expandResults(ctx, filtered, opts.Expand)
+	if opts.Expand != nil && opts.Expand.Cap > 0 {
+		out, err = s.expandResults(ctx, out, opts.Expand, opts.IncludeSuperseded, expl)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return filtered, nil
+	return out, nil
 }
 
 // RecallOpts holds optional Recall parameters.
@@ -326,6 +381,14 @@ type RecallOpts struct {
 	// Since/Until bound created_at (Unix seconds, inclusive). 0 = unbounded.
 	Since float64
 	Until float64
+
+	// Advanced retrieval controls (all optional; zero values = disabled).
+	Fusion         FusionMode // "" / "weighted" (default) | "rrf"
+	Diversity      *float32   // MMR λ in [0,1]; nil disables MMR re-selection
+	DedupThreshold *float32   // cosine hard-dedup floor in [0,1]; nil disables
+	MinCosine      *float32   // absolute cosine relevance floor in [-1,1]; nil disables
+	NoTouch        bool       // skip the access-count / last_accessed bump (read-only)
+	Explain        bool       // populate MemoryWithScore.Explain with per-signal breakdowns
 }
 
 // Forget deletes a memory by ID. Returns true if found and deleted.
@@ -368,6 +431,27 @@ func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSupersed
 // Count returns total stored memories.
 func (s *MemoryStore) Count(ctx context.Context) (int, error) {
 	return s.backend.Count(ctx)
+}
+
+// Nuke deletes every memory in the current collection (keeping the collection
+// itself) and returns the count deleted, journalling a single "nuke" entry.
+func (s *MemoryStore) Nuke(ctx context.Context) (int, error) {
+	items, err := s.backend.All(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(items))
+	for i, it := range items {
+		ids[i] = it.ID
+	}
+	if err := s.backend.Delete(ctx, ids); err != nil {
+		return 0, err
+	}
+	s.journalEntry("nuke", "*", nil, nil, map[string]any{"count": len(ids)})
+	return len(ids), nil
 }
 
 // GetByID returns a single memory or ErrNotFound.
@@ -422,6 +506,9 @@ func (s *MemoryStore) Link(ctx context.Context, srcID, dstID, rel string) error 
 
 // linkRaw adds a link without journaling. Returns true iff a new edge was inserted.
 func (s *MemoryStore) linkRaw(ctx context.Context, srcID, dstID, rel string) (bool, error) {
+	if srcID == dstID {
+		return false, fmt.Errorf("cannot link a memory to itself")
+	}
 	src, err := s.GetByID(ctx, srcID)
 	if err != nil {
 		return false, fmt.Errorf("link src: %w", err)
@@ -566,41 +653,65 @@ func (s *MemoryStore) FindConflicts(ctx context.Context, memID string, threshold
 		threshold = s.cfg.ConflictThreshold
 	}
 
-	var targets []Memory
+	// Single-memory scan: check the given memory against its top-12 nearest
+	// neighbours (mirrors Python's _check_conflicts).
 	if memID != "" {
 		m, err := s.GetByID(ctx, memID)
 		if err != nil {
 			return nil, err
 		}
-		targets = []Memory{m}
-	} else {
-		all, err := s.ListRecent(ctx, 0, false)
+		vecs, err := s.embedder.Embed(ctx, []string{m.Text})
 		if err != nil {
 			return nil, err
 		}
-		targets = all
-	}
-
-	seen := make(map[string]bool)
-	var conflicts []Conflict
-	for _, t := range targets {
-		vecs, err := s.embedder.Embed(ctx, []string{t.Text})
-		if err != nil {
-			continue
-		}
 		hits, err := s.backend.Query(ctx, vecs[0], 12)
 		if err != nil {
+			return nil, err
+		}
+		return detectConflicts(m, hitsToMemoriesWithScore(hits), threshold, s.cfg.ConflictFn), nil
+	}
+
+	// Global scan: exact O(n²) all-pairs cosine over stored embeddings, matching
+	// Python's find_conflicts(None) — the per-target top-12 approximation missed
+	// pairs once many similar same-type memories existed.
+	return s.findConflictsAll(ctx, threshold)
+}
+
+// findConflictsAll does the exact pairwise conflict scan over all active memories.
+func (s *MemoryStore) findConflictsAll(ctx context.Context, threshold float32) ([]Conflict, error) {
+	items, err := s.backend.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	type memEmb struct {
+		mem Memory
+		emb []float32
+	}
+	pool := make([]memEmb, 0, len(items))
+	for _, it := range items {
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.SupersededBy != "" || len(it.Embedding) == 0 {
 			continue
 		}
-		candidates := hitsToMemoriesWithScore(hits)
-		cs := detectConflicts(t, candidates, threshold, s.cfg.ConflictFn)
-		for _, c := range cs {
-			key := c.A.ID + ":" + c.B.ID
-			if key2 := c.B.ID + ":" + c.A.ID; seen[key] || seen[key2] {
+		pool = append(pool, memEmb{mem: m, emb: it.Embedding})
+	}
+
+	var conflicts []Conflict
+	for i := 0; i < len(pool); i++ {
+		for j := i + 1; j < len(pool); j++ {
+			a, b := pool[i].mem, pool[j].mem
+			if a.Type != b.Type {
 				continue
 			}
-			seen[key] = true
-			conflicts = append(conflicts, c)
+			sim := vector.CosineSim(pool[i].emb, pool[j].emb)
+			if sim < threshold {
+				continue
+			}
+			if !tagsOverlap(a, b) {
+				continue
+			}
+			kind, reason := classifyConflict(a, b, s.cfg.ConflictFn)
+			conflicts = append(conflicts, Conflict{Kind: kind, Reason: reason, Similarity: sim, A: a, B: b})
 		}
 	}
 	return conflicts, nil
@@ -656,10 +767,24 @@ func (s *MemoryStore) Restore(ctx context.Context, memID string) error {
 	return nil
 }
 
-func (s *MemoryStore) touch(ctx context.Context, m *Memory) error {
-	m.LastAccessed = float64(time.Now().Unix())
-	m.AccessCount++
-	return s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(*m))
+// touchMany bumps access tracking for several memories, mirroring Python's
+// _touch_many (which collapses the writes into one Chroma update). The Go
+// backend patches metadata one id at a time; the first error is returned but
+// every memory is still attempted.
+func (s *MemoryStore) touchMany(ctx context.Context, mems []*Memory) error {
+	if len(mems) == 0 {
+		return nil
+	}
+	now := float64(time.Now().Unix())
+	var firstErr error
+	for _, m := range mems {
+		m.LastAccessed = now
+		m.AccessCount++
+		if err := s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(*m)); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func (s *MemoryStore) resolvePrefix(ctx context.Context, prefix string) (Memory, error) {
@@ -682,44 +807,90 @@ func (s *MemoryStore) resolvePrefix(ctx context.Context, prefix string) (Memory,
 	return MetadataToMemory(matches[0].ID, matches[0].Content, matches[0].Metadata), nil
 }
 
-func (s *MemoryStore) expandResults(ctx context.Context, results []MemoryWithScore, spec *ExpandSpec) ([]MemoryWithScore, error) {
-	if spec == nil {
-		return results, nil
+// expandResults performs breadth-first graph expansion of the recalled set,
+// honouring spec.Depth (multi-hop) with a per-hop spec.Decay applied to the
+// assigned spec.Score, mirroring Python's _expand_links.
+func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any) ([]MemoryWithScore, error) {
+	if spec == nil || spec.Cap <= 0 {
+		return out, nil
 	}
-	seen := make(map[string]bool)
-	for _, r := range results {
+	decay := spec.Decay
+	if decay == 0 {
+		decay = 1.0
+	}
+	depth := spec.Depth
+	if depth <= 0 {
+		depth = 1
+	}
+	seen := make(map[string]bool, len(out))
+	frontier := make([]string, 0, len(out))
+	for _, r := range out {
 		seen[r.ID] = true
+		frontier = append(frontier, r.ID)
 	}
-	for _, r := range results {
-		nbs, err := s.Neighbors(ctx, r.ID, "", "out", spec.Depth)
-		if err != nil {
-			continue
+	var extra []MemoryWithScore
+	added := 0
+	for hop := 1; hop <= depth; hop++ {
+		if added >= spec.Cap || len(frontier) == 0 {
+			break
 		}
-		for _, nb := range nbs {
-			if seen[nb.ID] {
+		hopScore := spec.Score * float32(math.Pow(float64(decay), float64(hop-1)))
+		var next []string
+		for _, mid := range frontier {
+			if added >= spec.Cap {
+				break
+			}
+			src, err := s.GetByID(ctx, mid)
+			if err != nil {
 				continue
 			}
-			if spec.Score > 0 && r.Score < spec.Score {
-				continue
-			}
-			relOK := len(spec.Rels) == 0
-			for _, rel := range spec.Rels {
-				if nb.Rel == rel {
-					relOK = true
+			for _, lnk := range src.Links {
+				if !relAllowed(lnk.Rel, spec.Rels) {
+					continue
+				}
+				if seen[lnk.To] {
+					continue
+				}
+				nb, err := s.GetByID(ctx, lnk.To)
+				if err != nil {
+					continue
+				}
+				if !includeSuperseded && nb.SupersededBy != "" {
+					continue
+				}
+				mws := MemoryWithScore{Memory: nb, Score: hopScore}
+				if expl != nil {
+					e := map[string]any{
+						"source": "graph_expansion", "rel": lnk.Rel,
+						"hop": hop, "score": round4(hopScore),
+					}
+					expl[nb.ID] = e
+					mws.Explain = e
+				}
+				extra = append(extra, mws)
+				seen[lnk.To] = true
+				next = append(next, lnk.To)
+				added++
+				if added >= spec.Cap {
 					break
 				}
 			}
-			if !relOK {
-				continue
-			}
-			seen[nb.ID] = true
-			results = append(results, MemoryWithScore{Memory: nb.Memory, Score: r.Score * 0.9})
-			if spec.Cap > 0 && len(results) >= spec.Cap {
-				return results, nil
-			}
+		}
+		frontier = next
+	}
+	return append(out, extra...), nil
+}
+
+// relAllowed reports whether rel is one of the expansion relationships. An
+// empty rels list matches nothing (mirrors Python, whose ExpandSpec.rels
+// defaults to a non-empty tuple).
+func relAllowed(rel string, rels []string) bool {
+	for _, r := range rels {
+		if r == rel {
+			return true
 		}
 	}
-	return results, nil
+	return false
 }
 
 func hitsToMemoriesWithScore(hits []vector.Hit) []MemoryWithScore {
@@ -747,62 +918,78 @@ func (s *MemoryStore) AllRaw(ctx context.Context) ([]vector.Item, error) {
 	return s.backend.All(ctx)
 }
 
-// Stats returns aggregate stats.
+// Stats returns aggregate stats. Type/tag counts and average importance are
+// computed over ACTIVE (non-superseded) memories, matching the Python CLI.
 func (s *MemoryStore) Stats(ctx context.Context) (map[string]any, error) {
-	count, err := s.backend.Count(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	mems, err := s.ListRecent(ctx, 0, true)
 	if err != nil {
 		return nil, err
 	}
 
 	typeCounts := map[string]int{}
-	for _, m := range mems {
-		typeCounts[string(m.Type)]++
-	}
-
 	tagCounts := map[string]int{}
-	var totalImp float32
+	var active, superseded int
 	for _, m := range mems {
+		if m.SupersededBy != "" {
+			superseded++
+			continue
+		}
+		active++
+		typeCounts[string(m.Type)]++
 		for _, t := range m.Tags {
 			tagCounts[t]++
 		}
-		totalImp += m.Importance
 	}
 
-	var avgImp float32
-	if count > 0 {
-		avgImp = totalImp / float32(count)
-	}
-
-	topTags := topN(tagCounts, 5)
+	// Base fields mirror the Python CLI stats dict exactly (avg_importance is
+	// only reported inside the health block, not here).
 	return map[string]any{
-		"count":          count,
-		"by_type":        typeCounts,
-		"top_tags":       topTags,
-		"avg_importance": avgImp,
+		"store_path":       s.cfg.Path,
+		"collection":       s.cfg.Collection,
+		"total":            len(mems),
+		"active":           active,
+		"superseded":       superseded,
+		"by_type":          typeCounts,
+		"top_tags":         topNMap(tagCounts, 15),
+		"store_size_bytes": dirSize(s.cfg.Path),
 	}, nil
 }
 
-func topN(m map[string]int, n int) []string {
+// dirSize sums the byte sizes of all files under path (0 if it doesn't exist).
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
+// topNMap returns the n most-frequent tags as a {tag: count} map, matching
+// Python's `dict(Counter.most_common(n))` JSON shape.
+func topNMap(m map[string]int, n int) map[string]int {
 	type kv struct {
 		k string
 		v int
 	}
-	var sl []kv
+	sl := make([]kv, 0, len(m))
 	for k, v := range m {
 		sl = append(sl, kv{k, v})
 	}
-	sort.Slice(sl, func(i, j int) bool { return sl[i].v > sl[j].v })
-	var out []string
+	sort.Slice(sl, func(i, j int) bool {
+		if sl[i].v != sl[j].v {
+			return sl[i].v > sl[j].v
+		}
+		return sl[i].k < sl[j].k // stable tie-break for determinism
+	})
+	out := map[string]int{}
 	for i, x := range sl {
 		if i >= n {
 			break
 		}
-		out = append(out, x.k+"="+strconv.Itoa(x.v))
+		out[x.k] = x.v
 	}
 	return out
 }

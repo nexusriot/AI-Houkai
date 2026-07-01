@@ -16,6 +16,7 @@
 //	GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=
 //	POST   /recall                         same, via JSON body
 //	POST   /recall_pack                    token-budgeted context block
+//	POST   /auto_context                   fan-out context block for a task
 //	POST   /links        {src_id,dst_id,rel?}      add a directed link
 //	POST   /unlink       {src_id,dst_id,rel?}      remove link(s)
 //	POST   /supersede    {old_id,new_id}           soft-delete + supersede link
@@ -84,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /recall", s.wrap(s.recall))
 	mux.HandleFunc("POST /recall", s.wrap(s.recall))
 	mux.HandleFunc("POST /recall_pack", s.wrap(s.recallPack))
+	mux.HandleFunc("POST /auto_context", s.wrap(s.autoContext))
 	mux.HandleFunc("POST /links", s.wrap(s.link))
 	mux.HandleFunc("POST /unlink", s.wrap(s.unlink))
 	mux.HandleFunc("POST /supersede", s.wrap(s.supersede))
@@ -220,7 +222,9 @@ func (s *Server) health(r *http.Request) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	return 200, map[string]any{"status": "ok", "count": n, "collection": s.collection}, nil
+	// Liveness only — the collection name is intentionally omitted so an
+	// unauthenticated probe cannot enumerate the store (matches Python).
+	return 200, map[string]any{"status": "ok", "count": n}, nil
 }
 
 func (s *Server) stats(r *http.Request) (int, any, error) {
@@ -262,6 +266,7 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		Importance: float32(bodyFloat(b, "importance", 0)),
 		Source:     bodyStr(b, "source", ""),
 		Polarity:   int(bodyFloat(b, "polarity", 0)),
+		OnConflict: memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
 	}
 	mem, stored, conflicts, err := s.store.Remember(r.Context(), text, opts)
 	if err != nil {
@@ -335,6 +340,9 @@ func (s *Server) recall(r *http.Request) (int, any, error) {
 	for i, h := range hits {
 		d := memDict(h.Memory)
 		d["score"] = round4(h.Score)
+		if h.Explain != nil {
+			d["explain"] = h.Explain
+		}
 		out[i] = d
 	}
 	return 200, map[string]any{"results": out}, nil
@@ -366,10 +374,23 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		MaxItems:          int(bodyFloat(b, "max_items", 50)),
 		IncludeSuperseded: bodyBool(b, "include_superseded"),
 		Header:            &header,
+		Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
+		Diversity:         bodyFloatPtr(b, "diversity"),
+		DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
+		MinCosine:         bodyFloatPtr(b, "min_cosine"),
+		Compress:          bodyBool(b, "compress"),
+		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
+		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
 	})
 	if err != nil {
 		return 0, nil, err
 	}
+	return 200, packResponse(res), nil
+}
+
+// packResponse renders a PackResult as an HTTP JSON payload, including any
+// compressed groups.
+func packResponse(res memory.PackResult) map[string]any {
 	items := make([]map[string]any, len(res.Items))
 	for i, p := range res.Items {
 		d := memDict(p.Memory)
@@ -377,13 +398,50 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		d["tokens"] = p.Tokens
 		items[i] = d
 	}
-	return 200, map[string]any{
+	out := map[string]any{
 		"text":        res.Text,
 		"used_tokens": res.UsedTokens,
 		"budget":      res.Budget,
 		"truncated":   res.Truncated,
 		"items":       items,
-	}, nil
+	}
+	if len(res.CompressedGroups) > 0 {
+		groups := make([]map[string]any, len(res.CompressedGroups))
+		for i, g := range res.CompressedGroups {
+			groups[i] = map[string]any{
+				"ids": g.IDs(), "count": len(g.Memories), "text": g.Text, "tokens": g.Tokens,
+			}
+		}
+		out["compressed_groups"] = groups
+	}
+	return out
+}
+
+func (s *Server) autoContext(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	task, err := requireStr(b, "task")
+	if err != nil {
+		return 0, nil, err
+	}
+	maxPhrases := int(bodyFloat(b, "max_phrases", 3))
+	res, err := s.store.AutoContextPack(r.Context(), task, memory.AutoContextOpts{
+		TokenBudget:       int(bodyFloat(b, "token_budget", 800)),
+		MaxPhrases:        maxPhrases,
+		Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeHybrid))),
+		MinCosine:         bodyFloatPtr(b, "min_cosine"),
+		Compress:          bodyBool(b, "compress"),
+		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
+		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	out := packResponse(res)
+	out["queries"] = append([]string{task}, memory.ExtractKeyPhrases(task, maxPhrases)...)
+	return 200, out, nil
 }
 
 func (s *Server) link(r *http.Request) (int, any, error) {
@@ -488,8 +546,14 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Since:             since,
 			Until:             until,
 			Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeSemantic))),
-			Overfetch:         3,
+			Overfetch:         4,
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
+			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
+			Diversity:         bodyFloatPtr(b, "diversity"),
+			DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
+			MinCosine:         bodyFloatPtr(b, "min_cosine"),
+			NoTouch:           !bodyBoolDef(b, "touch", true),
+			Explain:           bodyBool(b, "explain"),
 		}, int(bodyFloat(b, "k", 5)), nil
 	}
 
@@ -509,7 +573,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		Since:             since,
 		Until:             until,
 		Mode:              memory.RecallMode(qsStr(r, "mode", string(memory.ModeSemantic))),
-		Overfetch:         3,
+		Overfetch:         4,
 		IncludeSuperseded: qsBool(r, "include_superseded"),
 	}, qsInt(r, "k", 5), nil
 }
@@ -618,6 +682,28 @@ func bodyFloat(b map[string]any, key string, def float64) float64 {
 func bodyBool(b map[string]any, key string) bool {
 	v, _ := b[key].(bool)
 	return v
+}
+
+// bodyBoolDef reads an optional bool defaulting to def when the key is absent.
+func bodyBoolDef(b map[string]any, key string, def bool) bool {
+	if v, ok := b[key].(bool); ok {
+		return v
+	}
+	return def
+}
+
+// bodyFloatPtr returns a *float32 for an optional numeric field (nil = absent).
+func bodyFloatPtr(b map[string]any, key string) *float32 {
+	switch v := b[key].(type) {
+	case float64:
+		x := float32(v)
+		return &x
+	case json.Number:
+		f, _ := v.Float64()
+		x := float32(f)
+		return &x
+	}
+	return nil
 }
 
 func bodyStrSlice(b map[string]any, key string) []string {

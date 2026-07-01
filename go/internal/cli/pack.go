@@ -11,10 +11,10 @@ import (
 )
 
 func newPackCmd() *cobra.Command {
-	var budget, maxItems int
+	var budget, maxItems, compressMinGroup int
 	var memType, tag, mode, header, format, source, since, until string
-	var minImp float32
-	var inclSup bool
+	var minImp, compressThreshold float32
+	var inclSup, compress bool
 
 	cmd := &cobra.Command{
 		Use:   "pack <query>",
@@ -47,6 +47,9 @@ prompt); a one-line summary goes to stderr.`,
 				Source:            source,
 				Since:             sinceTS,
 				Until:             untilTS,
+				Compress:          compress,
+				CompressThreshold: compressThreshold,
+				CompressMinGroup:  compressMinGroup,
 			})
 			if err != nil {
 				return err
@@ -74,13 +77,23 @@ prompt); a one-line summary goes to stderr.`,
 						Tokens:     p.Tokens,
 					}
 				}
-				b, _ := json.MarshalIndent(map[string]any{
+				payload := map[string]any{
 					"text":        result.Text,
 					"used_tokens": result.UsedTokens,
 					"budget":      result.Budget,
 					"truncated":   result.Truncated,
 					"items":       items,
-				}, "", "  ")
+				}
+				if len(result.CompressedGroups) > 0 {
+					groups := make([]map[string]any, len(result.CompressedGroups))
+					for i, g := range result.CompressedGroups {
+						groups[i] = map[string]any{
+							"ids": g.IDs(), "count": len(g.Memories), "text": g.Text, "tokens": g.Tokens,
+						}
+					}
+					payload["compressed_groups"] = groups
+				}
+				b, _ := json.MarshalIndent(payload, "", "  ")
 				fmt.Println(string(b))
 				return nil
 			}
@@ -112,5 +125,8 @@ prompt); a one-line summary goes to stderr.`,
 	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
 	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
 	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
+	cmd.Flags().BoolVar(&compress, "compress", false, "Fold budget-dropped, similar memories into compressed summary lines")
+	cmd.Flags().Float32Var(&compressThreshold, "compress-threshold", 0.30, "Jaccard similarity for compression clustering")
+	cmd.Flags().IntVar(&compressMinGroup, "compress-min-group", 2, "Minimum cluster size to compress")
 	return cmd
 }

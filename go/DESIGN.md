@@ -264,12 +264,13 @@ optional `--daemon` flag.
 
 ### `internal/mcpserver` — MCP surface
 
-Wraps `mark3labs/mcp-go`. Fifteen tools:
+Wraps `mark3labs/mcp-go`. Sixteen tools:
 
 ```
-remember        recall          recall_pack     forget          list_recent
-stats           link            unlink          neighbors       find_conflicts
-supersede       maintenance_tick  journal_tail  export          import
+remember        recall          recall_pack     auto_context    forget
+list_recent     stats           link            unlink          neighbors
+find_conflicts  supersede       maintenance_tick  journal_tail  export
+import
 ```
 
 Every handler converts inputs via `req.GetString/GetFloat/...`, calls the
@@ -277,12 +278,14 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-These 15 tools mirror the Python tool names so existing MCP clients keep
-working, but the surface is no longer at full parity: the Python reference
-port has since added an `auto_context` tool plus advanced `recall` /
-`recall_pack` parameters (`fusion=rrf`, diversity/MMR, `dedup_threshold`,
-`min_cosine`, `touch`, `explain`, `recall_pack` compression) that the Go port
-does not yet implement. `export` / `import`
+These 16 tools mirror the Python tool names so existing MCP clients keep
+working, and the surface is back at full parity: the `auto_context` tool and
+the advanced `recall` / `recall_pack` parameters (`fusion=rrf`, diversity/MMR,
+`dedup_threshold`, `min_cosine`, `touch`, `explain`, `recall_pack`
+compression via `compress`/`compress_threshold`/`compress_min_group`) are all
+implemented (see `internal/memory/scoring.go`, `pack.go`, `autocontext.go`).
+`maintenance_tick`'s `consolidate` is a tri-state string (`none|soft|hard`).
+`export` / `import`
 take a server-local file path — there's no streaming over MCP yet, and
 binary payloads (the gzipped bytes) are kept off the JSON wire. `recall` /
 `recall_pack` accept the `source` / `since` / `until` metadata filters
@@ -379,8 +382,11 @@ files are silently skipped; unparseable TOML errors are also swallowed
 custom `toml.Unmarshaler` (`ImportanceDefault{Value, Auto}`); `"auto"`
 switches the store to the heuristic scorer. `summarizer` holds the
 reflection summarizer spec (env override: `AI_HOUKAI_SUMMARIZER`). Note the
-key is flat here, unlike Python's `[maintenance.reflect].summarizer` table —
-the Go config has no maintenance section.
+`summarizer` key is flat here, unlike Python's `[maintenance.reflect].summarizer`
+table. There is a `[maintenance]` section (`interval_secs`, `reflect`,
+`consolidate`, `state_path`/`pid_path`/`log_path`) with a `[maintenance.decay]`
+sub-table (`decay_rate`, `min_score`, `protect_types`, `frequency_weight`) that
+`houkai prune`, `stats --health`, and the `maintenance` command group read.
 
 The same resolver is used by both `houkai` and `ai-houkai-mcp` so the two
 binaries see identical settings.
@@ -473,15 +479,18 @@ install or Homebrew tap distribution:
 - `MemoryStore.Neighbors` with `direction in {in, both}` does a full
   `backend.All()` scan per BFS step. Fine at ≤10⁴ memories; O(n·d) at scale.
   A reverse-link index would fix it.
-- `Recall` calls `touch()` on every returned memory, which is a metadata
-  write per hit (delete-then-add in chromem). Cheap in absolute terms but
-  amplifies write volume — consider batching in a future revision.
+- `Recall` bumps access tracking via `touchMany` on the returned memories
+  (one metadata write per hit; `RecallOpts.NoTouch` / the `touch=false`
+  MCP/HTTP param skips it for read-only recall). Still a write per hit —
+  chromem has no true batch-update, so this remains a candidate for a real
+  bulk write if chromem gains one.
 - `ChromemBackend.All()` relies on the zero-vector trick — see the
   `internal/vector` section above. If chromem-go ever changes its behaviour,
   this is the first thing to break.
-- The maintenance daemon is wired up in code but not enabled by either
-  binary. Either enable it via a flag in `ai-houkai-mcp` or remove the
-  package.
+- The maintenance daemon is exposed via the `houkai maintenance` command
+  group (`tick` for a one-shot cron pass, `run` for a foreground loop, and
+  `start`/`stop`/`status` for a detached pidfile-managed daemon that persists
+  a small JSON state file). It can also be embedded via `maintenance.Start`.
 
 ## Adding a new MCP tool
 

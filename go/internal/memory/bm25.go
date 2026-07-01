@@ -2,11 +2,10 @@ package memory
 
 import (
 	"math"
-	"strings"
 )
 
 const (
-	bm25K1 = 1.2
+	bm25K1 = 1.5
 	bm25B  = 0.75
 )
 
@@ -22,15 +21,11 @@ func bm25Score(query string, docs []string) []float32 {
 		return nil
 	}
 
-	tokenise := func(s string) []string {
-		return strings.Fields(strings.ToLower(s))
-	}
-
 	// Build corpus.
 	corpus := make([]bm25Doc, len(docs))
 	var totalLen float64
 	for i, d := range docs {
-		toks := tokenise(d)
+		toks := tokenize(d)
 		tf := make(map[string]int, len(toks))
 		for _, t := range toks {
 			tf[t]++
@@ -57,7 +52,16 @@ func bm25Score(query string, docs []string) []float32 {
 		return math.Log((n-d+0.5)/(d+0.5) + 1)
 	}
 
-	queryTokens := tokenise(query)
+	// Dedup query terms (Python uses set(_tokenize(query))) so a repeated
+	// term is not counted multiple times.
+	seenQ := make(map[string]bool)
+	var queryTokens []string
+	for _, qt := range tokenize(query) {
+		if !seenQ[qt] {
+			seenQ[qt] = true
+			queryTokens = append(queryTokens, qt)
+		}
+	}
 	scores := make([]float32, len(docs))
 	for i, doc := range corpus {
 		dl := float64(len(doc.tokens))

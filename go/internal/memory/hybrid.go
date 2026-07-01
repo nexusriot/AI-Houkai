@@ -1,16 +1,18 @@
 package memory
 
-import (
-	"math"
-	"time"
-)
+import "math"
 
-// hybridScore combines cosine, BM25, recency, and importance.
-func hybridScore(cosine, bm25, importance float32, lastAccessed float64,
-	w HybridWeights, decayRate float32) float32 {
-
-	ageDays := float32(time.Since(time.Unix(int64(lastAccessed), 0)).Hours() / 24)
-	recency := float32(math.Exp(float64(-decayRate * ageDays)))
-
-	return w.Cosine*cosine + w.Lexical*bm25 + w.Recency*recency + w.Importance*importance
+// recencyScore is the recency term of the hybrid blend: exp(-decayRate·ageDays),
+// where ageDays measures from created_at (default) or last_accessed depending
+// on w.RecencyBasis. now is Unix seconds (sub-second precision ok).
+func recencyScore(m Memory, w HybridWeights, decayRate float32, now float64) float32 {
+	basis := m.CreatedAt
+	if w.RecencyBasis == "accessed" {
+		basis = m.LastAccessed
+	}
+	ageDays := (now - basis) / 86400.0
+	if ageDays < 0 {
+		ageDays = 0
+	}
+	return float32(math.Exp(float64(-decayRate) * ageDays))
 }

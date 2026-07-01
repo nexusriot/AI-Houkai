@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -22,8 +23,9 @@ import (
 func newRememberCmd() *cobra.Command {
 	var tags []string
 	var importance float32
-	var memType, source string
-	var autoImportance bool
+	var memType, source, onConflict string
+	var polarity int
+	var autoImportance, stdin bool
 
 	cmd := &cobra.Command{
 		Use:   "remember <text>",
@@ -31,10 +33,10 @@ func newRememberCmd() *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var text string
-			if len(args) > 0 {
+			if len(args) > 0 && !stdin {
 				text = args[0]
 			} else {
-				// Read from stdin.
+				// Read from stdin (no positional arg, or --stdin given).
 				scanner := bufio.NewScanner(os.Stdin)
 				var lines []string
 				for scanner.Scan() {
@@ -42,11 +44,20 @@ func newRememberCmd() *cobra.Command {
 				}
 				text = strings.Join(lines, "\n")
 			}
+			text = strings.TrimRight(text, "\n")
 			if text == "" {
 				return fmt.Errorf("text is required")
 			}
+			if polarity < -1 || polarity > 1 {
+				return fmt.Errorf("polarity must be -1, 0, or 1")
+			}
 			store := storeFromCtx(cmd.Context())
 			cfg := cfgFromCtx(cmd.Context())
+
+			// Honor default_type from config when --type is not given.
+			if !cmd.Flags().Changed("type") && cfg.DefaultType != "" {
+				memType = cfg.DefaultType
+			}
 
 			// Explicit -i wins; --auto-importance (or default_importance =
 			// "auto" in config) scores heuristically; else config default.
@@ -63,19 +74,33 @@ func newRememberCmd() *cobra.Command {
 				Tags:       tags,
 				Importance: imp,
 				Source:     source,
+				Polarity:   polarity,
+				OnConflict: memory.ConflictPolicy(onConflict),
 			}
-			m, _, _, err := store.Remember(cmd.Context(), text, opts)
+			m, stored, conflicts, err := store.Remember(cmd.Context(), text, opts)
 			if err != nil {
+				if ce, ok := err.(*memory.ConflictError); ok {
+					fmt.Printf("not stored: %d conflict(s) detected (use --on-conflict to override)\n", len(ce.Conflicts))
+					return nil
+				}
 				return err
+			}
+			if !stored {
+				fmt.Printf("not stored: %d conflict(s)\n", len(conflicts))
+				return nil
 			}
 			fmt.Printf("stored %s (importance %.2f)\n", m.ID, m.Importance)
 			return nil
 		},
 	}
-	cmd.Flags().StringSliceVarP(&tags, "tag", "t", nil, "Tags (comma-separated or repeated)")
+	// Shorthands match Python (and the export command): -t = type, -g = tag.
+	cmd.Flags().StringSliceVarP(&tags, "tag", "g", nil, "Tags (comma-separated or repeated)")
 	cmd.Flags().Float32VarP(&importance, "importance", "i", 0.5, "Importance 0.0–1.0")
-	cmd.Flags().StringVar(&memType, "type", "episodic", "Memory type")
+	cmd.Flags().StringVarP(&memType, "type", "t", "episodic", "Memory type (default from config default_type)")
 	cmd.Flags().StringVar(&source, "source", "", "Provenance label")
+	cmd.Flags().IntVar(&polarity, "polarity", 0, "Polarity: -1, 0, or 1")
+	cmd.Flags().StringVar(&onConflict, "on-conflict", "", "Conflict policy for this write: ignore|warn|supersede|raise")
+	cmd.Flags().BoolVar(&stdin, "stdin", false, "Read the memory text from stdin")
 	cmd.Flags().BoolVar(&autoImportance, "auto-importance", false,
 		"Score importance heuristically from the text (also: default_importance = \"auto\" in config.toml)")
 	return cmd
@@ -106,7 +131,7 @@ func newRecallCmd() *cobra.Command {
 				Tag:               tag,
 				MinImportance:     minImp,
 				Mode:              memory.RecallMode(mode),
-				Overfetch:         3,
+				Overfetch:         4,
 				IncludeSuperseded: inclSup,
 				Source:            source,
 				Since:             sinceTS,
@@ -148,18 +173,26 @@ func newRecallCmd() *cobra.Command {
 func newListCmd() *cobra.Command {
 	var limit int
 	var inclSup bool
-	var tag, memType string
+	var tag, memType, sortBy, since string
 
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List recent memories",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store := storeFromCtx(cmd.Context())
-			mems, err := store.ListRecent(cmd.Context(), limit, inclSup)
+			if sortBy != "created" && sortBy != "importance" {
+				return fmt.Errorf("--sort must be 'created' or 'importance', got %q", sortBy)
+			}
+			sinceTS, _, err := timeparse.Parse(since)
 			if err != nil {
 				return err
 			}
-			var rows []MemRow
+			store := storeFromCtx(cmd.Context())
+			// Fetch unbounded, then filter/sort/limit client-side (matching Python).
+			mems, err := store.ListRecent(cmd.Context(), 0, inclSup)
+			if err != nil {
+				return err
+			}
+			var filtered []memory.Memory
 			for _, m := range mems {
 				if tag != "" && !containsTag(m.Tags, tag) {
 					continue
@@ -167,7 +200,20 @@ func newListCmd() *cobra.Command {
 				if memType != "" && string(m.Type) != memType {
 					continue
 				}
-				rows = append(rows, MemRow{
+				if sinceTS > 0 && m.CreatedAt < sinceTS {
+					continue
+				}
+				filtered = append(filtered, m)
+			}
+			if sortBy == "importance" {
+				sortByImportance(filtered)
+			}
+			if limit > 0 && len(filtered) > limit {
+				filtered = filtered[:limit]
+			}
+			rows := make([]MemRow, len(filtered))
+			for i, m := range filtered {
+				rows[i] = MemRow{
 					ID:           m.ID,
 					Text:         m.Text,
 					Type:         string(m.Type),
@@ -175,7 +221,7 @@ func newListCmd() *cobra.Command {
 					Importance:   m.Importance,
 					CreatedAt:    m.CreatedAt,
 					SupersededBy: m.SupersededBy,
-				})
+				}
 			}
 			PrintRows(os.Stdout, rows, fmtFromCtx(cmd.Context()))
 			return nil
@@ -185,7 +231,19 @@ func newListCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded")
 	cmd.Flags().StringVar(&tag, "tag", "", "Filter by tag")
 	cmd.Flags().StringVar(&memType, "type", "", "Filter by type")
+	cmd.Flags().StringVar(&sortBy, "sort", "created", "Sort order: created|importance")
+	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
 	return cmd
+}
+
+// sortByImportance sorts descending by importance, then created_at desc.
+func sortByImportance(mems []memory.Memory) {
+	sort.SliceStable(mems, func(i, j int) bool {
+		if mems[i].Importance != mems[j].Importance {
+			return mems[i].Importance > mems[j].Importance
+		}
+		return mems[i].CreatedAt > mems[j].CreatedAt
+	})
 }
 
 func newShowCmd() *cobra.Command {
@@ -209,24 +267,63 @@ func newShowCmd() *cobra.Command {
 func newForgetCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
-		Use:   "forget <id>",
-		Short: "Delete a memory",
-		Args:  cobra.ExactArgs(1),
+		Use:   "forget <id> [id...]",
+		Short: "Delete one or more memories",
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !yes && !Confirm("Delete memory "+args[0]+"?") {
+			prompt := "Delete memory " + args[0] + "?"
+			if len(args) > 1 {
+				prompt = fmt.Sprintf("Delete %d memories?", len(args))
+			}
+			if !yes && !Confirm(prompt) {
 				fmt.Println("aborted")
 				return nil
 			}
 			store := storeFromCtx(cmd.Context())
-			deleted, err := store.Forget(cmd.Context(), args[0])
+			deleted := 0
+			for _, id := range args {
+				ok, err := store.Forget(cmd.Context(), id)
+				if err != nil {
+					return err
+				}
+				if ok {
+					deleted++
+				}
+			}
+			fmt.Printf("Deleted %d/%d\n", deleted, len(args))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation")
+	return cmd
+}
+
+func newNukeCmd() *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{
+		Use:   "nuke",
+		Short: "Delete EVERY memory in the current collection (irreversible)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store := storeFromCtx(cmd.Context())
+			count, err := store.Count(cmd.Context())
 			if err != nil {
 				return err
 			}
-			if deleted {
-				fmt.Println("deleted")
-			} else {
-				fmt.Println("not found")
+			if count == 0 {
+				fmt.Println("Collection is already empty.")
+				return nil
 			}
+			collection := cfgFromCtx(cmd.Context()).Collection
+			if !yes && !Confirm(fmt.Sprintf("Destroy all %d memories in %q?", count, collection)) {
+				fmt.Println("Aborted.")
+				return nil
+			}
+			deleted, err := store.Nuke(cmd.Context())
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Nuked %d memories.\n", deleted)
 			return nil
 		},
 	}
@@ -237,7 +334,7 @@ func newForgetCmd() *cobra.Command {
 func newEditCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "edit <id>",
-		Short: "Open a memory in $EDITOR",
+		Short: "Edit a memory's fields (type/importance/tags/source/polarity + text) in $EDITOR",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
@@ -247,31 +344,86 @@ func newEditCmd() *cobra.Command {
 				return err
 			}
 
-			// Write text to temp file.
-			tmp, err := os.CreateTemp("", "houkai-edit-*.txt")
+			// Present a YAML-ish front-matter block: editable fields above a
+			// "---" separator, the memory text below it.
+			front := fmt.Sprintf(
+				"# Edit memory — save and close to apply. Lines starting with # are ignored.\n"+
+					"id: %s\ntype: %s\nimportance: %g\ntags: %s\nsource: %s\npolarity: %d\n---\n%s\n",
+				m.ID, m.Type, m.Importance, strings.Join(m.Tags, ", "), m.Source, m.Polarity, m.Text)
+
+			tmp, err := os.CreateTemp("", "houkai_edit-*.md")
 			if err != nil {
 				return err
 			}
-			_ = os.WriteFile(tmp.Name(), []byte(m.Text), 0o600)
+			_ = os.WriteFile(tmp.Name(), []byte(front), 0o600)
 			tmp.Close()
 			defer os.Remove(tmp.Name())
 
-			editor := editorCmd(cfg)
-			c := exec.Command(editor, tmp.Name())
+			c := exec.Command(editorCmd(cfg), tmp.Name())
 			c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 			if err := c.Run(); err != nil {
 				return err
 			}
 
-			newText, err := os.ReadFile(tmp.Name())
+			raw, err := os.ReadFile(tmp.Name())
 			if err != nil {
 				return err
 			}
-			m.Text = strings.TrimSpace(string(newText))
-			if err := store.UpdateMemory(cmd.Context(), m, true); err != nil {
+			if !strings.Contains(string(raw), "---") {
+				return fmt.Errorf("missing '---' separator in edited file")
+			}
+			frontPart, bodyPart, _ := strings.Cut(string(raw), "---")
+			newText := strings.TrimSpace(bodyPart)
+			textChanged := newText != m.Text
+			m.Text = newText
+
+			// Parse front-matter, skipping comment lines. The body may contain
+			// markdown headings, so only the front matter drops '#' lines.
+			for _, line := range strings.Split(frontPart, "\n") {
+				if strings.HasPrefix(line, "#") || !strings.Contains(line, ":") {
+					continue
+				}
+				k, v, _ := strings.Cut(line, ":")
+				k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+				switch k {
+				case "type":
+					if v != "" {
+						m.Type = memory.MemoryType(v)
+					}
+				case "importance":
+					if f, err := strconv.ParseFloat(v, 32); err == nil {
+						if f < 0 {
+							f = 0
+						} else if f > 1 {
+							f = 1
+						}
+						m.Importance = float32(f)
+					}
+				case "tags":
+					var tags []string
+					for _, t := range strings.Split(v, ",") {
+						if t = strings.TrimSpace(t); t != "" {
+							tags = append(tags, t)
+						}
+					}
+					m.Tags = tags
+				case "source":
+					m.Source = v
+				case "polarity":
+					if n, err := strconv.Atoi(v); err == nil {
+						m.Polarity = n
+					}
+				}
+			}
+
+			if err := store.UpdateMemory(cmd.Context(), m, textChanged); err != nil {
 				return err
 			}
-			fmt.Println("updated")
+			if textChanged {
+				fmt.Printf("Updated (re-embedded) → %s\n", fmtID(m.ID))
+			} else {
+				fmt.Printf("Updated metadata for %s\n", fmtID(m.ID))
+			}
 			return nil
 		},
 	}
@@ -315,8 +467,8 @@ func newTagCmd() *cobra.Command {
 
 func newBumpCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "bump <id> <importance>",
-		Short: "Update a memory's importance without re-embedding",
+		Use:   "bump <id> <delta>",
+		Short: "Adjust a memory's importance without re-embedding (=0.9 absolute, +0.2 / -0.1 relative)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
@@ -324,14 +476,38 @@ func newBumpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			f, err := strconv.ParseFloat(args[1], 32)
-			if err != nil {
-				return fmt.Errorf("invalid importance: %w", err)
+			delta := args[1]
+			old := m.Importance
+			var newVal float64
+			switch {
+			case strings.HasPrefix(delta, "="):
+				newVal, err = strconv.ParseFloat(delta[1:], 32)
+			case strings.HasPrefix(delta, "+") || strings.HasPrefix(delta, "-"):
+				var d float64
+				d, err = strconv.ParseFloat(delta, 32)
+				newVal = float64(old) + d
+			default:
+				return fmt.Errorf("delta must start with =, +, or - (e.g. =0.9, +0.2, -0.1)")
 			}
-			m.Importance = float32(f)
-			return store.UpdateMemory(cmd.Context(), m, false)
+			if err != nil {
+				return fmt.Errorf("invalid importance delta %q: %w", delta, err)
+			}
+			if newVal < 0 {
+				newVal = 0
+			} else if newVal > 1 {
+				newVal = 1
+			}
+			m.Importance = float32(newVal)
+			if err := store.UpdateMemory(cmd.Context(), m, false); err != nil {
+				return err
+			}
+			fmt.Printf("%s importance: %.2f → %.2f\n", fmtID(m.ID), old, m.Importance)
+			return nil
 		},
 	}
+	// Let a leading-dash delta (e.g. `bump abc -0.1`) be read as a positional
+	// value rather than parsed as a flag.
+	cmd.Flags().SetInterspersed(false)
 	return cmd
 }
 
@@ -406,9 +582,10 @@ func newNeighborsCmd() *cobra.Command {
 
 func newGraphCmd() *cobra.Command {
 	var depth int
+	var format string
 	cmd := &cobra.Command{
 		Use:   "graph <id> [id...]",
-		Short: "Print the subgraph around given memory IDs as JSON",
+		Short: "Print the subgraph around given memory IDs (ascii|dot|json)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
@@ -416,24 +593,73 @@ func newGraphCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			b, _ := json.MarshalIndent(g, "", "  ")
-			fmt.Println(string(b))
+			switch format {
+			case "json":
+				b, _ := json.MarshalIndent(g, "", "  ")
+				fmt.Println(string(b))
+			case "dot":
+				fmt.Print(graphToDOT(g))
+			default: // ascii
+				fmt.Print(graphToASCII(g))
+			}
 			return nil
 		},
 	}
 	cmd.Flags().IntVar(&depth, "depth", 1, "BFS expansion depth")
+	cmd.Flags().StringVar(&format, "format", "ascii", "Output format: ascii|dot|json")
 	return cmd
+}
+
+// graphToASCII renders a subgraph as an indented node/edge listing.
+func graphToASCII(g memory.Graph) string {
+	var b strings.Builder
+	labels := map[string]string{}
+	for _, n := range g.Nodes {
+		snippet := n.Text
+		if r := []rune(snippet); len(r) > 50 {
+			snippet = string(r[:50]) + "…"
+		}
+		labels[n.ID] = snippet
+		fmt.Fprintf(&b, "%s (%s) %s\n", fmtID(n.ID), n.Type, snippet)
+	}
+	for _, e := range g.Edges {
+		fmt.Fprintf(&b, "  %s --%s--> %s\n", fmtID(e.From), e.Rel, fmtID(e.To))
+	}
+	if len(g.Nodes) == 0 {
+		b.WriteString("(empty)\n")
+	}
+	return b.String()
+}
+
+// graphToDOT renders a subgraph as Graphviz DOT.
+func graphToDOT(g memory.Graph) string {
+	var b strings.Builder
+	b.WriteString("digraph memory {\n  rankdir=LR;\n  node [shape=box];\n")
+	for _, n := range g.Nodes {
+		snippet := strings.ReplaceAll(n.Text, "\"", "'")
+		if r := []rune(snippet); len(r) > 40 {
+			snippet = string(r[:40]) + "…"
+		}
+		fmt.Fprintf(&b, "  %q [label=%q];\n", fmtID(n.ID), fmtID(n.ID)+"\\n"+snippet)
+	}
+	for _, e := range g.Edges {
+		fmt.Fprintf(&b, "  %q -> %q [label=%q];\n", fmtID(e.From), fmtID(e.To), e.Rel)
+	}
+	b.WriteString("}\n")
+	return b.String()
 }
 
 func newConflictsCmd() *cobra.Command {
 	var threshold float32
+	var idFlag string
 	cmd := &cobra.Command{
 		Use:   "conflicts [id]",
-		Short: "Detect contradictions or duplicates",
+		Short: "Detect contradictions or duplicates (whole store, or one memory via id/--id)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
-			id := ""
+			// Accept the id either as a positional arg or via --id (Python uses --id).
+			id := idFlag
 			if len(args) > 0 {
 				id = args[0]
 			}
@@ -446,7 +672,8 @@ func newConflictsCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().Float32Var(&threshold, "threshold", 0.80, "Similarity threshold")
+	cmd.Flags().StringVar(&idFlag, "id", "", "Check a single memory (id or 8-char prefix) instead of the whole store")
+	cmd.Flags().Float32VarP(&threshold, "threshold", "T", 0.80, "Similarity threshold")
 	return cmd
 }
 
@@ -475,19 +702,30 @@ func newRestoreCmd() *cobra.Command {
 }
 
 func newPruneCmd() *cobra.Command {
-	var apply bool
+	var apply, yes bool
 	var decayRate, minScore, frequencyWeight float32
+	var protectTypes []string
 	cmd := &cobra.Command{
 		Use:   "prune",
 		Short: "Remove stale memories via decay scoring (dry-run by default)",
 		Long: `Remove stale memories via decay scoring (dry-run by default).
 
 With --frequency-weight > 0, frequently-recalled memories age out more slowly
-than untouched ones of equal importance and age.`,
+than untouched ones of equal importance and age. Memories whose type is in
+--protect-type are never pruned regardless of score.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			store := storeFromCtx(cmd.Context())
-			engine := decay.New(store, decayRate, minScore, nil, frequencyWeight)
-			candidates, err := engine.Prune(cmd.Context(), !apply)
+			// Default protected types from config when the flag is unset.
+			protect := protectTypes
+			if !cmd.Flags().Changed("protect-type") {
+				protect = cfgFromCtx(cmd.Context()).Maintenance.Decay.ProtectTypes
+			}
+			protectMT := make([]memory.MemoryType, len(protect))
+			for i, t := range protect {
+				protectMT[i] = memory.MemoryType(t)
+			}
+			engine := decay.New(store, decayRate, minScore, protectMT, frequencyWeight)
+			candidates, err := engine.Prune(cmd.Context(), true) // preview first
 			if err != nil {
 				return err
 			}
@@ -498,26 +736,40 @@ than untouched ones of equal importance and age.`,
 			for _, m := range candidates {
 				action := "[dry-run]"
 				if apply {
-					action = "[pruned]"
+					action = "[prune]"
 				}
 				fmt.Printf("%s %s  %.2f  %s\n", action, fmtID(m.ID), m.Importance, fmtAge(m.CreatedAt))
 			}
 			if !apply {
 				fmt.Printf("\n%d memories would be pruned. Use --apply to delete.\n", len(candidates))
+				return nil
 			}
+			if !yes && !Confirm(fmt.Sprintf("Delete %d memories?", len(candidates))) {
+				fmt.Println("aborted")
+				return nil
+			}
+			deleted, err := engine.Prune(cmd.Context(), false)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Pruned %d memories.\n", len(deleted))
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&apply, "apply", false, "Actually delete (default: dry-run)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip the confirmation prompt when applying")
 	cmd.Flags().Float32Var(&decayRate, "decay-rate", 0.1, "Decay rate λ")
 	cmd.Flags().Float32Var(&minScore, "min-score", 0.05, "Prune threshold")
+	cmd.Flags().StringSliceVar(&protectTypes, "protect-type", []string{"procedural"},
+		"Memory types never pruned regardless of score (repeatable; default from [maintenance.decay])")
 	cmd.Flags().Float32Var(&frequencyWeight, "frequency-weight", 0.0,
 		"Reinforcement: how strongly recall count resists decay (0 = off)")
 	return cmd
 }
 
 func newReflectCmd() *cobra.Command {
-	var apply, consolidate bool
+	var apply, yes bool
+	var consolidate string
 	var threshold float32
 	var minCluster int
 	var summarizer string
@@ -537,8 +789,16 @@ func newReflectCmd() *cobra.Command {
 			if spec != "" {
 				fmt.Printf("Summarizer: %s\n", spec)
 			}
+			mode := reflectpkg.ConsolidateModeFromString(consolidate)
+			// Hard consolidation permanently deletes sources — confirm first.
+			if apply && mode == reflectpkg.ConsolidateHard && !yes {
+				if !Confirm("Hard-consolidate will permanently delete source episodics. Continue?") {
+					fmt.Println("aborted")
+					return nil
+				}
+			}
 			engine := reflectpkg.New(store, threshold, minCluster, summarize)
-			created, err := engine.Reflect(cmd.Context(), !apply, consolidate && apply)
+			created, err := engine.Reflect(cmd.Context(), !apply, mode)
 			if err != nil {
 				return err
 			}
@@ -560,9 +820,13 @@ func newReflectCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&apply, "apply", false, "Persist reflections")
-	cmd.Flags().BoolVar(&consolidate, "consolidate", false, "Delete source episodics after reflecting")
+	cmd.Flags().StringVar(&consolidate, "consolidate", "none",
+		"After reflecting, consolidate sources: none|soft (supersede+link)|hard (delete)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip the confirmation prompt for hard consolidation")
 	cmd.Flags().Float32Var(&threshold, "threshold", 0.75, "Clustering similarity threshold")
-	cmd.Flags().IntVar(&minCluster, "min-cluster", 2, "Minimum cluster size")
+	cmd.Flags().IntVar(&minCluster, "min-cluster-size", 3, "Minimum cluster size")
+	cmd.Flags().IntVar(&minCluster, "min-cluster", 3, "Minimum cluster size (deprecated alias of --min-cluster-size)")
+	_ = cmd.Flags().MarkHidden("min-cluster")
 	cmd.Flags().StringVar(&summarizer, "summarizer", "",
 		"provider:model (extractive|ollama:M|openai:M|anthropic:M); default from `summarizer` in config.toml. "+
 			"LLM summarizers are also called for the dry-run preview.")
@@ -846,20 +1110,52 @@ func copyDir(src, dst string) error {
 }
 
 func newStatsCmd() *cobra.Command {
-	return &cobra.Command{
+	var health bool
+	var staleDays int
+	var decayRateFlag, freqWeightFlag float32
+	cmd := &cobra.Command{
 		Use:   "stats",
-		Short: "Show store statistics",
+		Short: "Show store statistics (add --health for a decay/link/recall report)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			store := storeFromCtx(cmd.Context())
-			stats, err := store.Stats(cmd.Context())
+			cfg := cfgFromCtx(cmd.Context())
+			data, err := store.Stats(cmd.Context())
 			if err != nil {
 				return err
 			}
-			b, _ := json.MarshalIndent(stats, "", "  ")
-			fmt.Println(string(b))
+
+			if health {
+				dec := cfg.Maintenance.Decay
+				decayRate := dec.DecayRate
+				if cmd.Flags().Changed("decay-rate") {
+					decayRate = decayRateFlag
+				}
+				freqWeight := dec.FrequencyWeight
+				if cmd.Flags().Changed("frequency-weight") {
+					freqWeight = freqWeightFlag
+				}
+				active, err := store.ListRecent(cmd.Context(), 0, false)
+				if err != nil {
+					return err
+				}
+				data["health"] = computeHealth(active, staleDays, decayRate, dec.MinScore, dec.ProtectTypes, freqWeight)
+			}
+
+			if fmtFromCtx(cmd.Context()) == FormatJSON {
+				b, _ := json.MarshalIndent(data, "", "  ")
+				fmt.Println(string(b))
+				return nil
+			}
+			renderStatsText(data)
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&health, "health", "H", false,
+		"Show a detailed health report: decay histogram, stale/at-risk/never-recalled counts, link density, top recalled")
+	cmd.Flags().IntVar(&staleDays, "stale-days", 30, "Days without access before a memory is stale (--health)")
+	cmd.Flags().Float32Var(&decayRateFlag, "decay-rate", 0.1, "Decay λ for the health histogram (--health; default from [maintenance.decay])")
+	cmd.Flags().Float32Var(&freqWeightFlag, "frequency-weight", 0.0, "Recall-reinforcement weight for health scores (--health; default from [maintenance.decay])")
+	return cmd
 }
 
 func newConfigCmd() *cobra.Command {

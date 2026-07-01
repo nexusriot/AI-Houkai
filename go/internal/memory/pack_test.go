@@ -41,6 +41,56 @@ func seedPack(t *testing.T, store *MemoryStore) {
 	}
 }
 
+func TestRecallPackCompression(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	// Four identical memories with a short first sentence and a long tail: the
+	// full line is expensive, but the compressed first-sentence summary is cheap.
+	text := "topic alpha matches. " + strings.Repeat("filler ", 20)
+	for i := 0; i < 4; i++ {
+		if _, _, _, err := store.Remember(ctx, text, RememberOpts{Type: Semantic}); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	// Count tokens as whitespace-separated words for a predictable budget.
+	words := func(s string) int { return len(strings.Fields(s)) }
+
+	// Without compression: one item fits, the rest are dropped and lost.
+	plain, err := store.RecallPack(ctx, text, PackOpts{
+		TokenBudget: 40, TokenCounter: words, Mode: ModeSemantic,
+	})
+	if err != nil {
+		t.Fatalf("RecallPack: %v", err)
+	}
+	if len(plain.Items) != 1 || !plain.Truncated {
+		t.Fatalf("expected 1 item + truncated, got %d items truncated=%v", len(plain.Items), plain.Truncated)
+	}
+	if len(plain.CompressedGroups) != 0 {
+		t.Errorf("compression off should yield no compressed groups")
+	}
+
+	// With compression: the three dropped identical memories fold into one line.
+	comp, err := store.RecallPack(ctx, text, PackOpts{
+		TokenBudget: 40, TokenCounter: words, Mode: ModeSemantic,
+		Compress: true, CompressThreshold: 0.30, CompressMinGroup: 2,
+	})
+	if err != nil {
+		t.Fatalf("RecallPack compress: %v", err)
+	}
+	if len(comp.CompressedGroups) != 1 {
+		t.Fatalf("expected 1 compressed group, got %d", len(comp.CompressedGroups))
+	}
+	if n := len(comp.CompressedGroups[0].Memories); n != 3 {
+		t.Errorf("compressed group should hold 3 memories, got %d", n)
+	}
+	if !strings.Contains(comp.Text, "(compressed)") || !strings.Contains(comp.Text, "[×3 similar]") {
+		t.Errorf("compressed text missing markers: %q", comp.Text)
+	}
+	if comp.UsedTokens > 40 {
+		t.Errorf("compression must respect the budget, used %d > 40", comp.UsedTokens)
+	}
+}
+
 func TestRecallPackReturnsResult(t *testing.T) {
 	store := newTestStore(t)
 	seedPack(t, store)
