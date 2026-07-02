@@ -5,7 +5,9 @@ from typing import List, Optional
 
 import typer
 
+from ai_houkai.cli import output as out
 from ai_houkai.memory_system.importance import score_importance
+from ai_houkai.memory_system.store import ConflictError
 
 
 def remember(
@@ -47,13 +49,25 @@ def remember(
     else:
         imp = cfg.default_importance
 
-    mem = store.remember(
-        text=body,
-        type=mem_type,
-        tags=list(tags),
-        importance=imp,
-        source=source,
-        polarity=polarity,
-        on_conflict=on_conflict,
-    )
+    try:
+        with out.friendly_errors():
+            mem = store.remember(
+                text=body,
+                type=mem_type,
+                tags=list(tags),
+                importance=imp,
+                source=source,
+                polarity=polarity,
+                on_conflict=on_conflict,
+            )
+    except ConflictError as e:
+        # --on-conflict raise doing its job: the memory was NOT stored.
+        typer.echo(f"Not stored: {len(e.conflicts)} conflict(s) detected", err=True)
+        for c in e.conflicts:
+            typer.echo(
+                f"  {c.kind} (sim={c.similarity:.3f}) with "
+                f"{out.short_id(c.b.id)}: {c.b.text[:60]}",
+                err=True,
+            )
+        raise typer.Exit(1)
     typer.echo(mem.id)

@@ -415,3 +415,76 @@ class TestDaemonHelpers:
         path = tmp_path / "deep" / "nested" / "daemon.pid"
         write_pid(path, 42)
         assert path.read_text() == "42"
+
+
+class TestReflectScheduleGating:
+    """Dry-run reflection must advance the schedule: the interval gates the
+    expensive work (clustering + summarizer), not just the writes. Regression
+    tests for the every-tick-reruns-reflection bug."""
+
+    def _sched(self, store, tmp_path, **kwargs):
+        defaults = dict(
+            decay_every=None,               # isolate reflection
+            reflect_every=3_600,
+            tick_interval=300,
+            state_path=str(tmp_path / "state.json"),
+            min_cluster_size=2,
+        )
+        defaults.update(kwargs)
+        return MaintenanceScheduler(store=store, **defaults)
+
+    def _add_cluster(self, store):
+        for i in range(3):
+            store.remember(f"Python is great number {i}",
+                           type="episodic", importance=0.5)
+
+    def test_dry_run_advances_schedule(self, store, tmp_path):
+        self._add_cluster(store)
+        sched = self._sched(store, tmp_path, reflect_apply=False)
+
+        first = sched.tick()
+        assert first.ran_reflect is True
+        assert first.reflect_applied is False
+        assert first.reflected >= 1             # preview count reported
+
+        state = MaintenanceState.load(tmp_path / "state.json")
+        assert state.last_reflect_at is not None
+        assert state.total_reflected == 0       # nothing persisted
+
+        second = sched.tick()                   # immediately after
+        assert second.ran_reflect is False      # NOT re-run every tick
+
+    def test_dry_run_writes_nothing(self, store, tmp_path):
+        self._add_cluster(store)
+        before = store.count()
+        self._sched(store, tmp_path, reflect_apply=False).tick()
+        assert store.count() == before
+
+    def test_apply_counts_totals(self, store, tmp_path):
+        self._add_cluster(store)
+        result = self._sched(store, tmp_path, reflect_apply=True).tick()
+        assert result.ran_reflect is True
+        assert result.reflect_applied is True
+        state = MaintenanceState.load(tmp_path / "state.json")
+        assert state.total_reflected == result.reflected >= 1
+
+    def test_dry_run_becomes_due_after_interval(self, store, tmp_path):
+        """A dry-run stamp must not starve a later apply run — it becomes due
+        again after reflect_every like any other run."""
+        self._add_cluster(store)
+        sched = self._sched(store, tmp_path, reflect_apply=False)
+        t0 = time.time()
+        assert sched.tick(now=t0).ran_reflect is True
+        assert sched.tick(now=t0 + 10).ran_reflect is False
+        sched.reflect_apply = True
+        result = sched.tick(now=t0 + 3_601)     # one interval later
+        assert result.ran_reflect is True
+        assert result.reflect_applied is True
+
+    def test_summary_wording_distinguishes_dry_run(self):
+        dry = TickResult(ran_reflect=True, reflected=2, reflect_applied=False)
+        assert "would create 2" in dry.summary()
+        assert "dry-run" in dry.summary()
+        applied = TickResult(ran_reflect=True, reflected=2, reflect_applied=True)
+        assert "created 2" in applied.summary()
+        assert "dry-run" not in applied.summary()

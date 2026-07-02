@@ -20,8 +20,8 @@ from typing import Any, Iterator
 log = logging.getLogger(__name__)
 
 
-JournalOp = str  # "remember"|"forget"|"supersede"|"restore"|"link"|"unlink"
-                 # |"reflect"|"decay"|"import"|"export"|"undo"
+JournalOp = str  # "remember"|"forget"|"edit"|"supersede"|"restore"|"link"
+                 # |"unlink"|"reflect"|"decay"|"import"|"export"|"undo"
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,9 @@ class JournalEntry:
         if self.op == "forget" and self.before:
             txt = (self.before.get("text") or "")[:60]
             return f"forget {self.id[:8]} «{txt}»"
+        if self.op == "edit" and self.after:
+            txt = (self.after.get("text") or "")[:60]
+            return f"edit {self.id[:8]} «{txt}»"
         if self.op == "supersede":
             new_id = self.meta.get("new_id", "")
             return f"supersede {self.id[:8]} → {new_id[:8]}"

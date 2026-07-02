@@ -8,6 +8,7 @@ Routes (all JSON in / JSON out):
                                            recent memories (list_recent)
     POST   /memories                       store a memory (remember)
     GET    /memories/{id}                  fetch one memory
+    PATCH  /memories/{id}                  edit fields in place (journaled)
     DELETE /memories/{id}                  forget one memory
     GET    /memories/{id}/neighbors?rel=&direction=&depth=
                                            linked memories
@@ -64,8 +65,10 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         "created_at": mem.created_at,
         "last_accessed": mem.last_accessed,
         "access_count": mem.access_count,
+        "polarity": mem.polarity,
         "links": [{"to": l.to, "rel": l.rel} for l in mem.links],
         "superseded_by": mem.superseded_by or None,
+        "superseded_at": mem.superseded_at or None,
     }
 
 
@@ -100,6 +103,57 @@ def _as_float(value: Optional[str]) -> Optional[float]:
 
 def _as_bool(value: Optional[str]) -> bool:
     return (value or "").lower() in ("1", "true", "yes", "on")
+
+
+# JSON-body coercers — the POST twins of _as_int/_as_float/_as_bool. A JSON
+# body can carry any type (null, string, object, …), and passing those raw
+# into the store used to surface as 500s where the GET path returned 400.
+
+def _body_int(body: dict[str, Any], key: str, default: int) -> int:
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bool):  # bool subclasses int — reject explicitly
+        raise HttpError(400, f"{key}: {v!r} is not a valid integer")
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    raise HttpError(400, f"{key}: {v!r} is not a valid integer")
+
+
+def _body_float(body: dict[str, Any], key: str) -> Optional[float]:
+    v = body.get(key)
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise HttpError(400, f"{key}: {v!r} is not a valid number")
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    raise HttpError(400, f"{key}: {v!r} is not a valid number")
+
+
+def _body_bool(body: dict[str, Any], key: str, default: bool = False) -> bool:
+    v = body.get(key)
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):  # JSON string "false" must not be truthy
+        return v.lower() in ("1", "true", "yes", "on")
+    if isinstance(v, (int, float)):
+        return bool(v)
+    raise HttpError(400, f"{key}: {v!r} is not a valid boolean")
 
 
 def _time(value: Any) -> Optional[float]:
@@ -141,9 +195,9 @@ def _remember(store: MemoryStore, m, q, b):
             text=text,
             type=b.get("type", "semantic"),
             tags=b.get("tags") or [],
-            importance=b.get("importance"),
+            importance=_body_float(b, "importance"),
             source=b.get("source"),
-            polarity=int(b.get("polarity", 0)),
+            polarity=_body_int(b, "polarity", 0),
             on_conflict=b.get("on_conflict"),
         )
     except ConflictError as e:
@@ -172,6 +226,31 @@ def _forget(store: MemoryStore, m, q, b):
     return 200, {"forgotten": True, "id": m.group("id")}
 
 
+def _edit(store: MemoryStore, m, q, b):
+    if not b:
+        raise HttpError(400, "empty edit: provide at least one field")
+    kwargs: dict[str, Any] = {}
+    if "text" in b:
+        kwargs["text"] = b["text"]
+    if "type" in b:
+        kwargs["type"] = b["type"]
+    if "tags" in b:
+        kwargs["tags"] = b["tags"] or []
+    if "importance" in b:
+        kwargs["importance"] = _body_float(b, "importance")
+    if "polarity" in b:
+        kwargs["polarity"] = _body_int(b, "polarity", 0)
+    if "source" in b:
+        kwargs["source"] = b["source"]  # null clears the source
+    if not kwargs:
+        raise HttpError(400, "no editable fields in body")
+    try:
+        mem = store.edit(m.group("id"), **kwargs)
+    except KeyError:
+        raise HttpError(404, "memory not found")
+    return 200, _mem_dict(mem)
+
+
 def _neighbors(store: MemoryStore, m, q, b):
     hits = store.neighbors(
         m.group("id"),
@@ -188,15 +267,15 @@ def _recall_params(q, b):
         get = b.get
         return {
             "query": _require(b, "query"),
-            "k": int(get("k", 5)),
+            "k": _body_int(b, "k", 5),
             "type": get("type"),
             "tag": get("tag"),
-            "min_importance": get("min_importance"),
+            "min_importance": _body_float(b, "min_importance"),
             "source": get("source"),
             "since": _time(get("since")),
             "until": _time(get("until")),
-            "mode": get("mode", "semantic"),
-            "include_superseded": bool(get("include_superseded", False)),
+            "mode": get("mode") or "semantic",
+            "include_superseded": _body_bool(b, "include_superseded"),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -224,16 +303,16 @@ def _recall(store: MemoryStore, m, q, b):
 def _recall_pack(store: MemoryStore, m, q, b):
     res = store.recall_pack(
         query=_require(b, "query"),
-        token_budget=int(b.get("token_budget", 800)),
+        token_budget=_body_int(b, "token_budget", 800),
         type=b.get("type"),
         tag=b.get("tag"),
-        min_importance=b.get("min_importance"),
+        min_importance=_body_float(b, "min_importance"),
         source=b.get("source"),
         since=_time(b.get("since")),
         until=_time(b.get("until")),
-        mode=b.get("mode", "hybrid"),
-        max_items=int(b.get("max_items", 50)),
-        include_superseded=bool(b.get("include_superseded", False)),
+        mode=b.get("mode") or "hybrid",
+        max_items=_body_int(b, "max_items", 50),
+        include_superseded=_body_bool(b, "include_superseded"),
         header=b.get("header", "## Relevant memory"),
     )
     return 200, {
@@ -252,8 +331,10 @@ def _link(store: MemoryStore, m, q, b):
     try:
         store.link(src_id=_require(b, "src_id"), dst_id=_require(b, "dst_id"),
                    rel=b.get("rel", "related"))
-    except (KeyError, ValueError) as e:
-        raise HttpError(404, str(e))
+    except KeyError as e:
+        # unknown id → 404; a bad rel/self-link (ValueError) becomes 400
+        # via the dispatcher.
+        raise HttpError(404, e.args[0] if e.args else str(e))
     return 200, {"ok": True}
 
 
@@ -266,14 +347,16 @@ def _unlink(store: MemoryStore, m, q, b):
 def _supersede(store: MemoryStore, m, q, b):
     try:
         store.supersede(old_id=_require(b, "old_id"), new_id=_require(b, "new_id"))
-    except (KeyError, ValueError) as e:
-        raise HttpError(404, str(e))
+    except KeyError as e:
+        # unknown id → 404; self-supersede/cycle (ValueError) becomes 400
+        # via the dispatcher.
+        raise HttpError(404, e.args[0] if e.args else str(e))
     return 200, {"ok": True}
 
 
 def _conflicts(store: MemoryStore, m, q, b):
     found = store.find_conflicts(memory_id=b.get("memory_id"),
-                                 threshold=b.get("threshold"))
+                                 threshold=_body_float(b, "threshold"))
     return 200, {"conflicts": [
         {"kind": c.kind, "reason": c.reason, "similarity": c.similarity,
          "a": {"id": c.a.id, "text": c.a.text[:120], "type": c.a.type},
@@ -290,6 +373,7 @@ _ROUTES: list[Route] = [
     ("GET",    re.compile(r"^/memories$"),                       _list,        False),
     ("POST",   re.compile(r"^/memories$"),                       _remember,    True),
     ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)$"),         _get_one,     False),
+    ("PATCH",  re.compile(r"^/memories/(?P<id>[^/]+)$"),         _edit,        True),
     ("DELETE", re.compile(r"^/memories/(?P<id>[^/]+)$"),         _forget,      False),
     ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)/neighbors$"), _neighbors, False),
     ("GET",    re.compile(r"^/recall$"),                         _recall,      False),
@@ -340,8 +424,13 @@ def build_handler(
             if auth_token is None or path == "/health":
                 return True
             header = self.headers.get("Authorization", "")
-            # Constant-time compare so a wrong token can't be recovered by timing.
-            return hmac.compare_digest(header, f"Bearer {auth_token}")
+            # Constant-time compare so a wrong token can't be recovered by
+            # timing. Compare BYTES: the str overload raises TypeError on
+            # non-ASCII input, which would crash the request thread with no
+            # response instead of returning 401.
+            return hmac.compare_digest(
+                header.encode("utf-8"), f"Bearer {auth_token}".encode("utf-8")
+            )
 
         def _read_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -367,13 +456,17 @@ def build_handler(
                 self._send(401, {"error": "unauthorized"})
                 return
 
+            # HEAD is GET without a body (_send suppresses it) — without this
+            # mapping every HEAD, including HEAD /health probes, was a 405.
+            command = "GET" if self.command == "HEAD" else self.command
+
             matched_path = False
             for method, pattern, fn, needs_body in _ROUTES:
                 match = pattern.match(path)
                 if not match:
                     continue
                 matched_path = True
-                if method != self.command:
+                if method != command:
                     continue
                 try:
                     body = self._read_body() if needs_body else {}
@@ -382,6 +475,10 @@ def build_handler(
                     self._send(status, payload)
                 except HttpError as e:
                     self._send(e.status, {"error": e.message})
+                except ValueError as e:
+                    # Store-level validation (bad mode/type/rel/polarity …)
+                    # is caller error, not an internal fault.
+                    self._send(400, {"error": str(e)})
                 except Exception:  # noqa: BLE001 — surface as 500, keep serving
                     # Don't leak internals (exception type/message/trace) to the
                     # client; tag with a request id so it can be correlated to a
@@ -399,6 +496,7 @@ def build_handler(
         # all verbs funnel through one dispatcher
         do_GET = _dispatch
         do_POST = _dispatch
+        do_PATCH = _dispatch
         do_DELETE = _dispatch
         do_HEAD = _dispatch
 

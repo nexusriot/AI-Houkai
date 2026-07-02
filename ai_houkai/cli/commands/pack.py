@@ -5,6 +5,7 @@ from typing import Optional
 
 import typer
 
+from ai_houkai.cli import output as out
 from ai_houkai.timeparse import parse_timestamp
 
 
@@ -36,20 +37,21 @@ def pack(
         until_ts = parse_timestamp(until)
     except ValueError as exc:
         raise typer.BadParameter(str(exc))
-    result = store.recall_pack(
-        query=query,
-        token_budget=budget,
-        type=type,
-        tag=tag,
-        min_importance=min_importance,
-        source=source,
-        since=since_ts,
-        until=until_ts,
-        mode=mode,
-        max_items=max_items,
-        include_superseded=include_superseded,
-        header=header,
-    )
+    with out.friendly_errors():
+        result = store.recall_pack(
+            query=query,
+            token_budget=budget,
+            type=type,
+            tag=tag,
+            min_importance=min_importance,
+            source=source,
+            since=since_ts,
+            until=until_ts,
+            mode=mode,
+            max_items=max_items,
+            include_superseded=include_superseded,
+            header=header,
+        )
 
     if fmt == "json":
         typer.echo(json.dumps(

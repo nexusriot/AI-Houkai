@@ -35,6 +35,27 @@ from .journal import Journal, JournalEntry
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
 
+# Canonical enum vocabularies. The store validates against these at runtime
+# so every surface (CLI, HTTP, MCP, TUI) rejects typos in ONE place instead
+# of silently degrading (e.g. mode="hybird" used to run semantic search, an
+# unknown on_conflict used to scan and then discard the conflicts).
+MEMORY_TYPES:      tuple[str, ...] = ("episodic", "semantic", "procedural", "feedback")
+LINK_RELS:         tuple[str, ...] = ("related", "refines", "derived_from",
+                                      "example_of", "contradicts", "supersedes")
+RECALL_MODES:      tuple[str, ...] = ("semantic", "hybrid")
+FUSIONS:           tuple[str, ...] = ("weighted", "rrf")
+CONFLICT_POLICIES: tuple[str, ...] = ("ignore", "warn", "supersede", "raise")
+IMPORT_POLICIES:   tuple[str, ...] = ("skip", "overwrite", "rename", "error")
+DIRECTIONS:        tuple[str, ...] = ("out", "in", "both")
+
+
+def _validate_choice(value: object, allowed: tuple[str, ...], param: str) -> None:
+    """Raise ValueError naming the parameter and the allowed vocabulary."""
+    if value not in allowed:
+        raise ValueError(
+            f"{param} must be one of: {', '.join(allowed)} — got {value!r}"
+        )
+
 
 @functools.lru_cache(maxsize=None)
 def _get_embed_fn(model_name: str):
@@ -517,6 +538,7 @@ class MemoryStore:
         journal_rotate_mb: int = 64,
         journal_keep_days: int = 90,
     ) -> None:
+        _validate_choice(conflict_policy, CONFLICT_POLICIES, "conflict_policy")
         self.path = path
         self.collection_name = collection
         self.embedding_model = embedding_model
@@ -580,6 +602,11 @@ class MemoryStore:
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
     ) -> Memory:
+        _validate_choice(type, MEMORY_TYPES, "type")
+        if polarity not in (-1, 0, 1):
+            raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
+        if on_conflict is not None:
+            _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
         # importance=None → auto-score when an importance_fn is configured,
         # else keep the historical 0.5 default.
         if importance is None:
@@ -635,6 +662,75 @@ class MemoryStore:
         self._journal("forget", memory_id, before=before.to_dict())
         return True
 
+    _UNSET: Any = object()  # sentinel: "leave field unchanged" where None is meaningful
+
+    def edit(
+        self,
+        memory_id: str,
+        *,
+        text: str | None = None,
+        type: MemoryType | None = None,
+        tags: Iterable[str] | None = None,
+        importance: float | None = None,
+        polarity: int | None = None,
+        source: str | None = _UNSET,
+    ) -> Memory:
+        """Update fields of an existing memory in place, keeping its id.
+
+        Every ``None`` (or omitted) field is left unchanged; ``source`` uses a
+        sentinel so ``source=None`` explicitly clears it. Text changes re-embed
+        the document. Links, superseded_by, created_at, and access tracking are
+        preserved — unlike a forget()+remember() round-trip.
+
+        The change is journaled (op ``edit``, with before/after snapshots) and
+        reversible via :meth:`undo`. A call that changes nothing is a no-op:
+        no write, no journal entry.
+
+        Raises KeyError if *memory_id* does not exist, ValueError on a bad
+        type / polarity / importance.
+        """
+        mem = self._get_by_id(memory_id)
+        if mem is None:
+            raise KeyError(f"memory_id {memory_id!r} not found")
+        before = mem.to_dict()
+
+        if type is not None:
+            _validate_choice(type, MEMORY_TYPES, "type")
+            mem.type = type
+        if polarity is not None:
+            if polarity not in (-1, 0, 1):
+                raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
+            mem.polarity = polarity
+        if importance is not None:
+            mem.importance = max(0.0, min(1.0, float(importance)))
+        if tags is not None:
+            mem.tags = list(tags)
+        if source is not self._UNSET:
+            mem.source = source
+        text_changed = False
+        if text is not None:
+            new_text = text.strip()
+            if not new_text:
+                raise ValueError("text must be non-empty")
+            text_changed = new_text != mem.text
+            mem.text = new_text
+
+        after = mem.to_dict()
+        if after == before:
+            return mem  # nothing to do — keep the journal quiet
+
+        if text_changed:
+            # Passing documents re-embeds via the collection's embedding fn.
+            self.collection.update(
+                ids=[memory_id],
+                documents=[mem.text],
+                metadatas=[mem.to_metadata()],
+            )
+        else:
+            self.collection.update(ids=[memory_id], metadatas=[mem.to_metadata()])
+        self._journal("edit", memory_id, before=before, after=after)
+        return mem
+
     def nuke(self) -> int:
         """Delete every memory in the current collection. Returns the count deleted."""
         result = self.collection.get(include=[])
@@ -689,6 +785,10 @@ class MemoryStore:
         recall — e.g. for evaluation). ``explain=True`` returns
         ``(Memory, score, breakdown)`` triples with per-signal contributions.
         """
+        _validate_choice(mode, RECALL_MODES, "mode")
+        _validate_choice(fusion, FUSIONS, "fusion")
+        if type is not None:
+            _validate_choice(type, MEMORY_TYPES, "type")
         if diversity is not None and not (0.0 <= diversity <= 1.0):
             raise ValueError("diversity must be in [0, 1]")
         if dedup_threshold is not None and not (0.0 <= dedup_threshold <= 1.0):
@@ -1083,11 +1183,16 @@ class MemoryStore:
 
     def _link_raw(self, src_id: str, dst_id: str, rel: str) -> bool:
         """Add link without journaling. Returns True iff a new edge was inserted."""
+        _validate_choice(rel, LINK_RELS, "rel")
         if src_id == dst_id:
             raise ValueError("Cannot link a memory to itself")
         src = self._get_by_id(src_id)
         if src is None:
             raise KeyError(f"src_id {src_id!r} not found")
+        if self._get_by_id(dst_id) is None:
+            # Refuse dangling edges — graph walkers skip targets that don't
+            # resolve, so the link would be stored but unreachable.
+            raise KeyError(f"dst_id {dst_id!r} not found")
         for existing in src.links:
             if existing.to == dst_id and existing.rel == rel:
                 return False
@@ -1108,6 +1213,8 @@ class MemoryStore:
         return removed
 
     def _unlink_raw(self, src_id: str, dst_id: str, rel: str | None) -> int:
+        if rel is not None:
+            _validate_choice(rel, LINK_RELS, "rel")
         src = self._get_by_id(src_id)
         if src is None:
             return 0
@@ -1134,6 +1241,9 @@ class MemoryStore:
         Outgoing traversal is O(links per node); incoming requires a full
         store scan per hop — fine at agent scale.
         """
+        _validate_choice(direction, DIRECTIONS, "direction")
+        if rel is not None:
+            _validate_choice(rel, LINK_RELS, "rel")
         visited: set[str] = {memory_id}
         frontier: list[str] = [memory_id]
         result:   list[tuple[Memory, str]] = []
@@ -1312,6 +1422,7 @@ class MemoryStore:
         On embedding-model mismatch, raises ``ImportError`` unless
         *regenerate_vectors=True* (re-embeds text on the way in).
         """
+        _validate_choice(on_conflict, IMPORT_POLICIES, "on_conflict")
         in_path = Path(path)
         if not in_path.exists():
             raise FileNotFoundError(in_path)
@@ -1463,6 +1574,25 @@ class MemoryStore:
                           meta={"of": entry.ts, "of_op": entry.op})
             return True
 
+        if entry.op == "edit":
+            if entry.before is None:
+                return False
+            current = self._get_by_id(entry.id)
+            if current is None:
+                return False  # memory has since been forgotten
+            restored = Memory.from_dict(entry.before)
+            # Always pass documents: the edit may have changed the text, and
+            # re-embedding unchanged text is harmless.
+            self.collection.update(
+                ids=[entry.id],
+                documents=[restored.text],
+                metadatas=[restored.to_metadata()],
+            )
+            self._journal("undo", entry.id,
+                          before=current.to_dict(), after=restored.to_dict(),
+                          meta={"of": entry.ts, "of_op": entry.op})
+            return True
+
         if entry.op == "supersede":
             ok = self.restore(entry.id)
             if ok:
@@ -1491,11 +1621,14 @@ class MemoryStore:
             return bool(removed)
 
         if entry.op == "unlink":
-            added = self._link_raw(
-                entry.meta.get("src_id", entry.id),
-                entry.meta.get("dst_id", ""),
-                entry.meta.get("rel") or "related",
-            )
+            try:
+                added = self._link_raw(
+                    entry.meta.get("src_id", entry.id),
+                    entry.meta.get("dst_id", ""),
+                    entry.meta.get("rel") or "related",
+                )
+            except KeyError:
+                return False  # an endpoint has since been forgotten
             if added:
                 self._journal("undo", entry.id,
                               meta={"of": entry.ts, "of_op": entry.op})

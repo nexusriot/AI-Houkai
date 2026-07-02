@@ -16,6 +16,8 @@ and periodic reflection that condenses experience into knowledge.
 | **Vector search** | Cosine-space HNSW via ChromaDB + sentence-transformers |
 | **Memory types** | `episodic` · `semantic` · `procedural` · `feedback` |
 | **Rich metadata** | `importance`, `tags`, `source`, access tracking |
+| **In-place edit** | `edit()` — update text/metadata keeping id, links, history; journaled + undoable |
+| **Validated vocabularies** | Enum params (`type`, `rel`, `mode`, `fusion`, policies, `direction`) checked once in the store — typos raise, never silently degrade |
 | **Decay** | Exponential forgetting — prune old, unimportant memories |
 | **Reflection** | Cluster episodic memories → condense into semantic summaries |
 | **Memory linking** | Typed directed edges — `refines`, `supersedes`, `derived_from`, … |
@@ -32,7 +34,7 @@ and periodic reflection that condenses experience into knowledge.
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
 | **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
-| **MCP server** | 16 tools for any MCP client (Claude Code, Claude Desktop) |
+| **MCP server** | 17 tools for any MCP client (Claude Code, Claude Desktop) |
 | **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links), optional bearer-token auth |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
@@ -45,7 +47,7 @@ AI-Houkai/
 │   ├── __init__.py               # convenience re-exports
 │   ├── memory_system/
 │   │   ├── __init__.py
-│   │   ├── store.py              # MemoryStore + Memory dataclass (+ export/import/undo)
+│   │   ├── store.py              # MemoryStore + Memory dataclass (+ edit/export/import/undo)
 │   │   ├── async_store.py        # AsyncMemoryStore — coroutine wrapper (single-threaded executor)
 │   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
@@ -61,7 +63,10 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (16 tools)
+│   │   └── server.py             # FastMCP server (17 tools)
+│   ├── http_server/
+│   │   ├── __init__.py
+│   │   └── server.py             # stdlib JSON HTTP/REST server (houkai serve)
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   ├── __main__.py           # python -m ai_houkai.cli
@@ -112,7 +117,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 523 tests across 22 files
+├── tests/                        # 594 tests across 25 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -197,8 +202,13 @@ from ai_houkai.memory_system import MemoryStore
 
 store = MemoryStore()                  # persists to ./.chroma
 
-store.remember("Python's GIL blocks CPU parallelism",
-               type="semantic", importance=0.85, tags=["python"])
+mem = store.remember("Python's GIL blocks CPU parallelism",
+                     type="semantic", importance=0.85, tags=["python"])
+
+# Fix or refine in place — same id, links, and history; re-embeds on text
+# change; journaled and undoable (unlike forget()+remember()):
+store.edit(mem.id, text="CPython's GIL blocks CPU-bound thread parallelism",
+           importance=0.9)
 
 for mem, score in store.recall("parallel execution", k=3):
     print(f"{score:.3f}  {mem.text}")
@@ -347,10 +357,16 @@ houkai bump 72be7903 +0.2      # relative delta
 houkai bump 72be7903 =0.9      # absolute value
 ```
 
+All three go through the store's `edit()` API: the change keeps the memory's
+id, links, and access history, lands in the audit journal (`houkai journal
+tail --op edit`), and can be reversed with `houkai journal undo <ts>`.
+
 ### Memory graph
 
 ```bash
-# Link two memories
+# Link two memories — rel must be one of:
+# related | refines | derived_from | example_of | contradicts | supersedes
+# (typos are rejected, as are links to ids that don't exist)
 houkai link src-id dst-id --rel refines
 
 # Remove a link
@@ -444,12 +460,12 @@ houkai backup   # → ~/.ai_houkai/backups/<ISO timestamp>/
 
 ### Audit journal
 
-Every mutation (`remember`, `forget`, `supersede`, `restore`, `link`,
-`unlink`, `import`, `export`, `reflect`, `decay`, `undo`) is appended
-to an append-only JSONL journal next to the store (`journal.log`,
+Every mutation (`remember`, `forget`, `edit`, `supersede`, `restore`,
+`link`, `unlink`, `import`, `export`, `reflect`, `decay`, `undo`) is
+appended to an append-only JSONL journal next to the store (`journal.log`,
 rotated and gzipped at 64 MB, 90-day retention by default). Entries
-carry the actor (`cli` / `mcp` / `reflection` / `decay` / `import` /
-`lib`) plus `before`/`after` snapshots where applicable.
+carry the actor (`cli` / `mcp` / `http` / `reflection` / `decay` /
+`import` / `lib`) plus `before`/`after` snapshots where applicable.
 
 ```bash
 # Tail recent entries (newest first)
@@ -460,7 +476,7 @@ houkai journal tail --all          # include rotated archives
 # Pretty-print one entry by timestamp
 houkai journal show 1748284800.123
 
-# Reverse a single operation (remember/forget/supersede/restore/link/unlink)
+# Reverse a single operation (remember/forget/edit/supersede/restore/link/unlink)
 houkai journal undo 1748284800.123 --yes
 ```
 
@@ -558,6 +574,7 @@ Endpoints (all JSON in / JSON out):
 | `GET /memories?limit=&include_superseded=` | recent memories |
 | `POST /memories` | store a memory (`remember`) |
 | `GET /memories/{id}` | fetch one |
+| `PATCH /memories/{id}` | edit fields in place (journaled, undoable) |
 | `DELETE /memories/{id}` | forget one |
 | `GET /memories/{id}/neighbors?rel=&direction=&depth=` | linked memories |
 | `GET\|POST /recall` | search — supports `source`, `since`, `until` filters |
@@ -570,6 +587,7 @@ curl -s localhost:8077/health
 curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
 curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
 curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
+curl -s -X PATCH localhost:8077/memories/<id> -d '{"importance":0.9}'
 ```
 
 **Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
@@ -585,9 +603,17 @@ lock costs little; for true parallelism run multiple processes against separate
 stores. (`AsyncMemoryStore` gives the same guarantee in-process via a
 single-threaded executor.)
 
+**Validation:** malformed query-string *and* JSON-body parameters (a string
+`k`, a garbage `threshold`, `"include_superseded": "false"`) are coerced or
+rejected with `400` — never a 500. Unknown enum values (`mode`, `type`,
+`rel`, `on_conflict`, `direction`, `polarity`) also return `400` with a
+message naming the allowed vocabulary; unknown ids return `404`. `HEAD` is
+supported on every GET route (probes get `200`, body suppressed).
+
 **Hardening:** `GET /health` returns only `{"status":"ok","count":N}` and
 deliberately omits the collection name / topology. Bearer-token checks use a
-constant-time comparison (`hmac.compare_digest`). Unhandled errors return
+constant-time comparison (`hmac.compare_digest` over UTF-8 bytes, so a
+non-ASCII header gets a clean `401`). Unhandled errors return
 `500 {"error":"internal server error","request_id":"<hex>"}` — no exception
 type, message, or traceback is leaked to the client.
 
@@ -708,7 +734,7 @@ ai-houkai-install-claude-code --install
 ai-houkai-install-claude-code --verify
 ai-houkai-install-claude-code --claudemd
 
-# Option C — auto-patch ~/.claude/settings.json via the example script
+# Option C — auto-register via the example script
 python examples/06_claude_code.py --install
 
 # Option D — preview the config block
@@ -724,13 +750,18 @@ python examples/06_claude_code.py --demo
 python examples/06_claude_code.py --claudemd
 ```
 
-The installed MCP block in `~/.claude/settings.json`:
+The installer registers through `claude mcp add --scope user` (Claude Code
+reads MCP servers from `~/.claude.json` / a project's `.mcp.json`, **not**
+`settings.json`); when the `claude` CLI is not on PATH it merges this block
+into `~/.claude.json` directly:
 
 ```json
 {
   "mcpServers": {
     "ai-houkai": {
+      "type": "stdio",
       "command": "ai-houkai-mcp",
+      "args": [],
       "env": {
         "AI_HOUKAI_PATH": "~/.ai_houkai",
         "AI_HOUKAI_COLLECTION": "claude_code"
@@ -760,11 +791,13 @@ or `python examples/06_claude_code.py --claudemd` to generate it):
 
 - **remember** — store conventions, decisions, preferences
 - **recall** — search before starting any task
+- **edit** — update a memory in place (keeps id, links, history)
 - **forget** — remove outdated facts
 
 | Situation | Action |
 |---|---|
 | User states a convention | `remember` with `type="procedural"` |
+| A stored fact is outdated or has a typo | `edit` it in place |
 | User corrects you | `remember` correction, `forget` old fact |
 | Starting a new task | `recall` relevant context first |
 ```
@@ -816,15 +849,20 @@ ai-houkai-mcp
 # or: python -m ai_houkai.mcp_server.server
 ```
 
-Exposed tools (16):
+Exposed tools (17):
 
-- **Core** — `remember` · `recall` · `recall_pack` · `auto_context` · `forget` · `list_recent` · `stats`
+- **Core** — `remember` · `edit` · `recall` · `recall_pack` · `auto_context` · `forget` · `list_recent` · `stats`
 - **Linking** — `link` · `unlink` · `neighbors`
 - **Conflicts** — `find_conflicts` · `supersede`
 - **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `export` · `import`
 
 `auto_context` fans out recall over several angles extracted from a task
 description, dedupes by id, and packs the result within a token budget.
+
+`edit` updates a memory in place — same id, links, and access history;
+the text is re-embedded only when it changed. The change is journaled and
+reversible, so agents should `edit` to fix or refine a stored fact instead
+of a `forget` + `remember` round-trip (which would discard the graph).
 
 Environment variables:
 
@@ -841,13 +879,15 @@ Environment variables:
 claude mcp add ai-houkai -- ai-houkai-mcp
 ```
 
-**Claude Code** (manual `~/.claude/settings.json`):
+**Claude Code** (manual — `~/.claude.json` user scope, or a project `.mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "ai-houkai": {
+      "type": "stdio",
       "command": "ai-houkai-mcp",
+      "args": [],
       "env": { "AI_HOUKAI_PATH": "/your/memory/path" }
     }
   }
@@ -1034,7 +1074,10 @@ houkai maintenance tick
 
 Run one tick synchronously: prune stale memories and (optionally) reflect.
 Jobs only execute when their configured interval has elapsed since the last
-run — safe to call as often as you like.
+run — safe to call as often as you like. This holds for **dry-run reflection
+too**: a dry-run still pays for clustering (and the LLM summarizer, if one
+is configured), so it advances the schedule like a real run; only the
+persisted-summaries total is reserved for `apply` runs.
 
 Crontab example (daily at 03:00):
 
@@ -1110,7 +1153,7 @@ sched = MaintenanceScheduler(
 
 # One-shot (e.g. from cron or an agent):
 result = sched.tick()
-print(result.summary())   # "decay pruned 3 | reflect nothing to reflect"
+print(result.summary())   # "decay pruned 3 | reflect would create 2 (dry-run)"
 
 # Blocking loop:
 stop = threading.Event()
@@ -1120,11 +1163,13 @@ sched.run_forever(stop)   # blocks; call stop.set() to exit
 ### MCP tool
 
 The `maintenance_tick` tool lets any MCP client trigger a tick without
-running the CLI:
+running the CLI. `reflect_apply` defaults to the config's
+`[maintenance.reflect] apply` setting; the result reports which mode ran:
 
 ```
-maintenance_tick(reflect_apply=false)
-→ {"summary": "decay pruned 2", "decayed": 2, "reflected": 0, ...}
+maintenance_tick()
+→ {"summary": "decay pruned 2 | reflect would create 1 (dry-run)",
+   "decayed": 2, "reflected": 1, "reflect_applied": false, ...}
 ```
 
 ### systemd unit (optional)

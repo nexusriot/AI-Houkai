@@ -4,8 +4,9 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed (16):
+Tools exposed (17):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
+    edit(memory_id, text?, type?, tags?, importance?, polarity?, source?)
     recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?)
     recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?, compress?, compress_threshold?, compress_min_group?)
     auto_context(task, token_budget?, max_phrases?, mode?)
@@ -39,19 +40,31 @@ from ai_houkai.memory_system.store import ConflictError, HybridWeights, extract_
 from ai_houkai.memory_system.summarizers import build_summarizer
 from ai_houkai.timeparse import parse_timestamp
 
-CHROMA_PATH = os.environ.get("AI_HOUKAI_PATH", "./.chroma")
-COLLECTION  = os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai")
-AUTO_IMPORTANCE = os.environ.get("AI_HOUKAI_AUTO_IMPORTANCE", "").lower() in (
-    "1", "true", "yes", "on",
-)
+mcp = FastMCP("AI-Houkai")
 
-store = MemoryStore(
-    path=CHROMA_PATH,
-    collection=COLLECTION,
-    actor="mcp",
-    importance_fn=score_importance if AUTO_IMPORTANCE else None,
-)
-mcp   = FastMCP("AI-Houkai")
+_store: MemoryStore | None = None
+
+
+def get_store() -> MemoryStore:
+    """Return the process-wide store, creating it on first use.
+
+    Importing this module is side-effect-free: no ChromaDB directory is
+    materialised and no embedding model is loaded until a tool actually
+    runs. The installers rely on this to inspect the tool surface, and env
+    configuration (AI_HOUKAI_PATH / AI_HOUKAI_COLLECTION /
+    AI_HOUKAI_AUTO_IMPORTANCE) is read here, at first use, not at import.
+    """
+    global _store
+    if _store is None:
+        auto_importance = os.environ.get(
+            "AI_HOUKAI_AUTO_IMPORTANCE", "").lower() in ("1", "true", "yes", "on")
+        _store = MemoryStore(
+            path=os.path.expanduser(os.environ.get("AI_HOUKAI_PATH", "./.chroma")),
+            collection=os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai"),
+            actor="mcp",
+            importance_fn=score_importance if auto_importance else None,
+        )
+    return _store
 
 
 @mcp.tool()
@@ -74,7 +87,7 @@ def remember(
 
     policy = on_conflict  # type: ignore[assignment]
     try:
-        mem = store.remember(
+        mem = get_store().remember(
             text=text,
             type=type,           # type: ignore[arg-type]
             tags=tags or [],
@@ -115,7 +128,7 @@ def recall(
     since/until: bound created_at — epoch seconds, an ISO-8601 date/datetime,
     or a relative span like "7d" / "24h" (since="7d" → last 7 days).
     """
-    hits = store.recall(
+    hits = get_store().recall(
         query=query,
         k=k,
         type=type,            # type: ignore[arg-type]
@@ -173,7 +186,7 @@ def recall_pack(
     compress_threshold: Jaccard similarity threshold for grouping (default 0.30).
     compress_min_group: minimum cluster size to produce a compressed line (default 2).
     """
-    pack = store.recall_pack(
+    pack = get_store().recall_pack(
         query=query,
         token_budget=token_budget,
         type=type,             # type: ignore[arg-type]
@@ -236,7 +249,7 @@ def auto_context(
     Returns the same structure as recall_pack plus the queries that were used.
     """
     queries = [task] + extract_key_phrases(task, max_phrases)
-    pack = store.auto_context_pack(
+    pack = get_store().auto_context_pack(
         task=task,
         token_budget=token_budget,
         max_phrases=max_phrases,
@@ -266,7 +279,53 @@ def auto_context(
 @mcp.tool()
 def forget(memory_id: str) -> dict[str, Any]:
     """Permanently delete a memory by id."""
-    return {"deleted": store.forget(memory_id)}
+    return {"deleted": get_store().forget(memory_id)}
+
+
+@mcp.tool()
+def edit(
+    memory_id: str,
+    text: str | None = None,
+    type: str | None = None,
+    tags: list[str] | None = None,
+    importance: float | None = None,
+    polarity: int | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Update fields of an existing memory in place, keeping its id.
+
+    Omitted fields stay unchanged. Text changes are re-embedded; links,
+    supersede state, and access tracking are preserved (do NOT forget+remember
+    to fix a typo — that loses them). The change is journaled and undoable.
+    type: episodic | semantic | procedural | feedback.
+    """
+    kwargs: dict[str, Any] = {}
+    if text is not None:
+        kwargs["text"] = text
+    if type is not None:
+        kwargs["type"] = type
+    if tags is not None:
+        kwargs["tags"] = tags
+    if importance is not None:
+        kwargs["importance"] = importance
+    if polarity is not None:
+        kwargs["polarity"] = polarity
+    if source is not None:
+        kwargs["source"] = source
+    try:
+        mem = get_store().edit(memory_id, **kwargs)
+    except (KeyError, ValueError) as e:
+        return {"ok": False, "error": e.args[0] if e.args else str(e)}
+    return {
+        "ok": True,
+        "id": mem.id,
+        "text": mem.text,
+        "type": mem.type,
+        "tags": mem.tags,
+        "importance": mem.importance,
+        "polarity": mem.polarity,
+        "source": mem.source,
+    }
 
 
 @mcp.tool()
@@ -284,14 +343,16 @@ def list_recent(
             "created_at": m.created_at,
             "superseded_by": m.superseded_by or None,
         }
-        for m in store.list_recent(limit=limit, include_superseded=include_superseded)
+        for m in get_store().list_recent(limit=limit, include_superseded=include_superseded)
     ]
 
 
 @mcp.tool()
 def stats() -> dict[str, Any]:
     """Return basic store statistics."""
-    return {"count": store.count(), "path": CHROMA_PATH, "collection": COLLECTION}
+    store = get_store()
+    return {"count": store.count(), "path": store.path,
+            "collection": store.collection_name}
 
 
 @mcp.tool()
@@ -305,7 +366,7 @@ def link(
     Idempotent — calling twice with the same arguments is safe.
     """
     try:
-        store.link(src_id=src_id, dst_id=dst_id, rel=rel)
+        get_store().link(src_id=src_id, dst_id=dst_id, rel=rel)
         return {"ok": True, "src_id": src_id, "dst_id": dst_id, "rel": rel}
     except (KeyError, ValueError) as e:
         return {"ok": False, "error": str(e)}
@@ -318,7 +379,7 @@ def unlink(
     rel: str | None = None,
 ) -> dict[str, Any]:
     """Remove link(s) from src to dst. If rel is omitted, all rels are removed."""
-    removed = store.unlink(src_id=src_id, dst_id=dst_id, rel=rel)
+    removed = get_store().unlink(src_id=src_id, dst_id=dst_id, rel=rel)
     return {"removed": removed}
 
 
@@ -332,7 +393,7 @@ def neighbors(
     """Return memories reachable from memory_id via links.
     direction: out | in | both (default).
     """
-    hits = store.neighbors(
+    hits = get_store().neighbors(
         memory_id,
         rel=rel,
         direction=direction,  # type: ignore[arg-type]
@@ -360,7 +421,7 @@ def find_conflicts(
     memory_id: check one specific memory; omit for a full-store scan.
     threshold: cosine similarity cutoff (default: 0.80).
     """
-    conflicts = store.find_conflicts(memory_id=memory_id, threshold=threshold)
+    conflicts = get_store().find_conflicts(memory_id=memory_id, threshold=threshold)
     return [
         {
             "kind":       c.kind,
@@ -380,7 +441,7 @@ def supersede(old_id: str, new_id: str) -> dict[str, Any]:
     Use restore() / forget() to undo or hard-delete.
     """
     try:
-        store.supersede(old_id=old_id, new_id=new_id)
+        get_store().supersede(old_id=old_id, new_id=new_id)
         return {"ok": True, "old_id": old_id, "new_id": new_id}
     except (KeyError, ValueError) as e:
         return {"ok": False, "error": str(e)}
@@ -388,7 +449,7 @@ def supersede(old_id: str, new_id: str) -> dict[str, Any]:
 
 @mcp.tool()
 def maintenance_tick(
-    reflect_apply: bool = False,
+    reflect_apply: bool | None = None,
 ) -> dict[str, Any]:
     """Run one maintenance tick: prune stale memories via decay and optionally
     consolidate episodic clusters via reflection.
@@ -399,13 +460,17 @@ def maintenance_tick(
 
     reflect_apply
         If True, reflection summaries are written to the store.
-        If False (default), reflection runs in dry-run mode (no writes).
+        If False, reflection runs in dry-run mode (reports what it would
+        create, writes nothing). Omit to use the config file's
+        [maintenance.reflect] apply setting (default False).
 
     Returns a summary dict with counts and any errors.
     """
     mcfg = load_maintenance()
+    if reflect_apply is None:
+        reflect_apply = mcfg.reflect_apply
     sched = MaintenanceScheduler(
-        store=store,
+        store=get_store(),
         decay_every=mcfg.decay_every,
         reflect_every=mcfg.reflect_every,
         tick_interval=mcfg.tick_interval,
@@ -425,6 +490,7 @@ def maintenance_tick(
         "ran_reflect": result.ran_reflect,
         "decayed": result.decayed,
         "reflected": result.reflected,
+        "reflect_applied": result.reflect_applied,
         "decay_error": result.decay_error,
         "reflect_error": result.reflect_error,
     }
@@ -442,7 +508,7 @@ def journal_tail(
     since_seconds: limit to entries within the last N seconds.
     """
     since = (time.time() - since_seconds) if since_seconds else None
-    entries = list(store.journal.read(since=since, op=op))
+    entries = list(get_store().journal.read(since=since, op=op))
     entries = entries[-n:][::-1]
     return [
         {"ts": e.ts, "op": e.op, "actor": e.actor,
@@ -464,7 +530,7 @@ def export(
 
     The path is server-local. Returns summary counts.
     """
-    summary = store.export(
+    summary = get_store().export(
         path,
         include_vectors=include_vectors,
         include_superseded=include_superseded,
@@ -492,7 +558,7 @@ def import_(
     on_conflict: skip | overwrite | rename | error.
     """
     try:
-        summary = store.import_(
+        summary = get_store().import_(
             path,
             on_conflict=on_conflict,            # type: ignore[arg-type]
             regenerate_vectors=regenerate_vectors,

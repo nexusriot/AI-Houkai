@@ -12,10 +12,11 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import textwrap
 
+from ai_houkai.memory_system import MemoryStore
 from ai_houkai.mcp_server import server as srv
-
 
 CONSOLE_SCRIPT = "ai-houkai-mcp"
 
@@ -43,20 +44,41 @@ def load_json(path: str, *, overwrite_unparseable: bool = True) -> dict:
 
 
 def write_json(path: str, config: dict) -> str:
-    """Write `config` to `path` (creating parent dirs). Returns the path."""
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(config, f, indent=2)
-        f.write("\n")
+    """Atomically write `config` to `path` (creating parent dirs). Returns the path.
+
+    Write-to-temp + os.replace so a crash mid-write can never leave the
+    user's client config truncated."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".ahk-", suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
-def verify_server(server_name: str, *, stream=sys.stdout) -> bool:
+def verify_server(
+    server_name: str,
+    *,
+    memory_path: str | None = None,
+    collection: str | None = None,
+    stream=sys.stdout,
+) -> bool:
     """Smoke-test shared across installers: the `ai-houkai-mcp` console script is
     reachable and the MCP server module imports with its core tools. Returns True
-    on success."""
+    on success.
+
+    When *memory_path*/*collection* are given (the values the installer wrote
+    into the client config), the reported store count comes from THAT store —
+    not from whatever env-default store the server would open."""
     ok = True
     cmd = resolve_mcp_command()
     found = shutil.which(cmd) or (os.path.isfile(cmd) and cmd)
@@ -67,20 +89,37 @@ def verify_server(server_name: str, *, stream=sys.stdout) -> bool:
               file=stream)
         ok = False
 
-    try:
-        tools = ["remember", "recall", "forget", "list_recent", "stats"]
-        missing = [t for t in tools if not hasattr(srv, t)]
-        if missing:
-            print(f"  err  missing tools: {missing}", file=stream)
-            ok = False
-        else:
-            print(f"  ok   tools: {', '.join(tools)} | "
-                  f"store count = {srv.store.count()}", file=stream)
-    except Exception as exc:  # pragma: no cover - defensive
-        print(f"  err  import failed: {exc}", file=stream)
+    tools = ["remember", "recall", "forget", "list_recent", "stats"]
+    missing = [t for t in tools if not hasattr(srv, t)]
+    if missing:
+        print(f"  err  missing tools: {missing}", file=stream)
         ok = False
+    else:
+        try:
+            count = _target_store_count(memory_path, collection)
+            print(f"  ok   tools: {', '.join(tools)} | "
+                  f"store count = {count}", file=stream)
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"  err  store check failed: {exc}", file=stream)
+            ok = False
 
     return ok
+
+
+def _target_store_count(memory_path: str | None, collection: str | None) -> int:
+    """Count memories in the store the installer is configuring.
+
+    Opens the target store explicitly — verify is a smoke test, and creating
+    the directory the MCP server will use anyway is fine. Without a
+    memory_path, falls back to the server's own (env-configured) store."""
+    if memory_path is None:
+        return srv.get_store().count()
+    store = MemoryStore(path=os.path.expanduser(memory_path),
+                        collection=collection or "ai_houkai")
+    try:
+        return store.count()
+    finally:
+        store.client.close()
 
 
 # A client-agnostic description of when/how to use the memory tools. Each
@@ -91,6 +130,7 @@ MEMORY_GUIDE = textwrap.dedent("""
 
     - **remember(text, type, tags, importance)** — store a fact, decision, or preference
     - **recall(query, k)** — semantic search across stored memories
+    - **edit(memory_id, …)** — update a memory in place (keeps id, links, history)
     - **forget(memory_id)** — remove a specific memory
     - **list_recent()** — see the most recently created memories
 
@@ -101,6 +141,7 @@ MEMORY_GUIDE = textwrap.dedent("""
     | User states a preference or coding convention | `remember` with `type="feedback"` or `"procedural"` |
     | You learn something about the codebase | `remember` with `type="semantic"` |
     | Starting a new task | `recall` relevant context first |
+    | A stored fact is outdated or has a typo | `edit` it in place — don't forget+remember |
     | User corrects you | `remember` the correction, `forget` the wrong fact |
 
     ### Memory types

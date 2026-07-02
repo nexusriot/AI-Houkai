@@ -100,9 +100,13 @@ class AsyncMemoryStore:
         self._executor.shutdown(wait=True)
 
     def close(self) -> None:
-        """Synchronous close — use in non-async teardown."""
-        self.sync.client.close()
+        """Synchronous close — use in non-async teardown.
+
+        Drain the executor BEFORE closing the client: any queued job would
+        otherwise run against a closed ChromaDB connection. (aclose() gets
+        the same ordering for free — its close runs FIFO in the executor.)"""
         self._executor.shutdown(wait=True)
+        self.sync.client.close()
 
     async def __aenter__(self) -> "AsyncMemoryStore":
         return self
@@ -151,6 +155,24 @@ class AsyncMemoryStore:
 
     async def forget(self, memory_id: str) -> bool:
         return await self.run(self.sync.forget, memory_id)
+
+    async def edit(
+        self,
+        memory_id: str,
+        *,
+        text: str | None = None,
+        type: MemoryType | None = None,
+        tags: Iterable[str] | None = None,
+        importance: float | None = None,
+        polarity: int | None = None,
+        source: str | None = MemoryStore._UNSET,
+    ) -> Memory:
+        """Update fields of an existing memory in place — see MemoryStore.edit."""
+        return await self.run(
+            self.sync.edit, memory_id,
+            text=text, type=type, tags=tags, importance=importance,
+            polarity=polarity, source=source,
+        )
 
     async def nuke(self) -> int:
         """Delete every memory in the current collection. Returns the count deleted."""

@@ -10,7 +10,7 @@ How it works
   Claude Code CLI  ──MCP──  ai-houkai-mcp  ──  ChromaDB on disk
        │                          │
   ~/.claude/                 remember / recall / forget
-  settings.json              list_recent / stats
+  ~/.claude.json             list_recent / stats
   (or project .claude/)
 
 The actual install/verify/print logic lives in
@@ -25,7 +25,7 @@ Three ways to register the MCP server
   Option B — installer console script (after `pip install ai-houkai`):
       ai-houkai-install-claude-code --install
 
-  Option C — this example script (auto-patches ~/.claude/settings.json):
+  Option C — this example script (registers via `claude mcp add` or ~/.claude.json):
       python examples/06_claude_code.py --install
 """
 
@@ -39,7 +39,7 @@ import textwrap
 from ai_houkai.installers.claude_code import (
     ClaudeCodeInstaller,
     DEFAULT_MEMORY_PATH,
-    DEFAULT_SETTINGS_PATH,
+    DEFAULT_CONFIG_PATH,
 )
 from ai_houkai.memory_system import MemoryStore
 
@@ -105,7 +105,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--install", action="store_true",
-                    help=f"Write MCP block to {DEFAULT_SETTINGS_PATH}")
+                    help="Register the MCP server (claude mcp add, or ~/.claude.json directly)")
     ap.add_argument("--memory-path", default=DEFAULT_MEMORY_PATH,
                     metavar="PATH",
                     help=f"ChromaDB directory (default: {DEFAULT_MEMORY_PATH})")
@@ -120,7 +120,7 @@ def main() -> None:
     inst = ClaudeCodeInstaller(memory_path=args.memory_path)
 
     print(f"\nAI-Houkai · Claude Code integration")
-    print(f"  Settings file : {inst.settings_path}")
+    print(f"  Config file   : {inst.config_path}")
     print(f"  Memory path   : {inst.memory_path}")
     print(f"  MCP command   : {inst.mcp_command}")
 
@@ -137,8 +137,8 @@ def main() -> None:
         print("Paste into your project's CLAUDE.md to guide Claude Code.\n")
 
     if args.install:
-        path = inst.install()
-        print(f"  ✓ written: {path}")
+        written = inst.install()
+        print(f"  ✓ registered via: {written}")
         print(f"  Verify with: claude mcp list\n")
     elif not (args.verify or args.demo or args.claudemd):
         inst.print_config()
