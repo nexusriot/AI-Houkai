@@ -93,26 +93,23 @@ def edit(
 
     text_changed = new_text != mem.text
 
-    # Mutate in place, keeping the same id. Passing `documents` to Chroma's
-    # update re-embeds the text; everything else on the Memory (links,
-    # superseded_by, access_count, created_at, …) is preserved instead of
-    # being discarded by a forget()+remember() round-trip.
-    mem.text = new_text
-    mem.type = new_type
-    mem.importance = new_importance
-    mem.tags = new_tags
-    mem.source = new_source
-    mem.polarity = new_polarity
+    # store.edit() keeps the same id, re-embeds when the text changed,
+    # preserves links / superseded_by / access tracking, and journals the
+    # change so `journal tail` shows it and `journal undo` can reverse it.
+    with out.friendly_errors():
+        store.edit(
+            full_id,
+            text=new_text,
+            type=new_type,
+            tags=new_tags,
+            importance=new_importance,
+            polarity=new_polarity,
+            source=new_source,
+        )
 
     if text_changed:
-        store.collection.update(
-            ids=[full_id],
-            documents=[new_text],          # re-embed via the collection's EF
-            metadatas=[mem.to_metadata()],
-        )
         typer.echo(f"Updated (re-embedded) → {out.short_id(full_id)}")
     else:
-        store.collection.update(ids=[full_id], metadatas=[mem.to_metadata()])
         typer.echo(f"Updated metadata for {out.short_id(full_id)}")
 
 
@@ -142,8 +139,8 @@ def tag(
     for t in remove:
         tag_set.discard(t)
 
-    mem.tags = sorted(tag_set)
-    store.collection.update(ids=[full_id], metadatas=[mem.to_metadata()])
+    with out.friendly_errors():
+        mem = store.edit(full_id, tags=sorted(tag_set))
     typer.echo(f"{out.short_id(full_id)} tags: {', '.join(mem.tags) or '(none)'}")
 
 
@@ -167,14 +164,20 @@ def bump(
         raise typer.Exit(1)
 
     old = mem.importance
-    if delta.startswith("="):
-        new_val = float(delta[1:])
-    elif delta.startswith(("+", "-")):
-        new_val = old + float(delta)
-    else:
-        typer.echo("Error: delta must start with +, -, or =", err=True)
+    try:
+        if delta.startswith("="):
+            new_val = float(delta[1:])
+        elif delta.startswith(("+", "-")):
+            new_val = old + float(delta)
+        else:
+            raise ValueError
+    except ValueError:
+        typer.echo(
+            f"Error: delta must be +N, -N, or =N (e.g. +0.2) — got {delta!r}",
+            err=True,
+        )
         raise typer.Exit(1)
 
-    mem.importance = max(0.0, min(1.0, new_val))
-    store.collection.update(ids=[full_id], metadatas=[mem.to_metadata()])
+    with out.friendly_errors():
+        mem = store.edit(full_id, importance=new_val)
     typer.echo(f"{out.short_id(full_id)} importance: {old:.2f} → {mem.importance:.2f}")

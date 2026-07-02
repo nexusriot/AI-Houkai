@@ -10,8 +10,9 @@ from rich.console import Console
 from rich.table import Table
 
 from ai_houkai.cli import output as out
+from ai_houkai.memory_system import LINK_RELS
 
-_VALID_RELS = ("related", "refines", "example_of", "derived_from", "supersedes", "contradicts")
+_VALID_RELS = LINK_RELS  # single vocabulary, validated by the store
 
 
 def link(
@@ -28,7 +29,8 @@ def link(
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
-    store.link(src_id, dst_id, rel)
+    with out.friendly_errors():
+        store.link(src_id, dst_id, rel)
     typer.echo(f"Linked {out.short_id(src_id)} --[{rel}]--> {out.short_id(dst_id)}")
 
 
@@ -46,7 +48,8 @@ def unlink(
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
-    removed = store.unlink(src_id, dst_id, rel)
+    with out.friendly_errors():
+        removed = store.unlink(src_id, dst_id, rel)
     typer.echo(f"Removed {removed} link(s).")
 
 
@@ -66,7 +69,8 @@ def neighbors(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
-    results = store.neighbors(full_id, rel=rel, direction=direction, depth=depth)
+    with out.friendly_errors():
+        results = store.neighbors(full_id, rel=rel, direction=direction, depth=depth)
     if not results:
         typer.echo("No neighbors found.")
         return
@@ -109,9 +113,11 @@ def graph(
     g = store.subgraph(full_ids, depth=depth)
 
     if fmt == "json":
+        # Full ids in edges — nodes carry full ids, so 8-char prefixes would
+        # make the JSON unjoinable for machine consumers.
         print(json.dumps({
             "nodes": [out._mem_to_dict(m) for m in g.nodes.values()],
-            "edges": [{"src": s[:8], "dst": d[:8], "rel": r} for s, d, r in g.edges],
+            "edges": [{"src": s, "dst": d, "rel": r} for s, d, r in g.edges],
         }, indent=2))
         return
 

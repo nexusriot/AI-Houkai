@@ -1,33 +1,24 @@
 from __future__ import annotations
 
-import datetime
-import time
 from typing import Optional
 
 import typer
 
 from ai_houkai.cli import output as out
-
-_DURATION_MAP = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+from ai_houkai.timeparse import parse_timestamp
 
 
 def _parse_since(since: str) -> float:
+    """Same grammar as `recall --since` (ISO date in UTC, epoch, or '7d').
+    A private local-time parser here used to make the same date string
+    filter a different memory set than recall's."""
     if not since:
         return 0.0
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            dt = datetime.datetime.strptime(since, fmt)
-            return dt.timestamp()
-        except ValueError:
-            pass
-    unit = since[-1]
-    if unit in _DURATION_MAP:
-        try:
-            n = float(since[:-1])
-            return time.time() - n * _DURATION_MAP[unit]
-        except ValueError:
-            pass
-    raise typer.BadParameter(f"Unrecognised --since value: {since!r}")
+    try:
+        ts = parse_timestamp(since)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
+    return ts if ts is not None else 0.0
 
 
 def list_memories(
@@ -42,7 +33,10 @@ def list_memories(
 ) -> None:
     """List most recently created memories."""
     store = ctx.obj["store"]
-    memories = store.list_recent(limit=9999, include_superseded=include_superseded)
+    # Fetch everything: type/tag/since filter below, so a fixed fetch cap
+    # would silently drop older matches.
+    memories = store.list_recent(
+        limit=max(store.count(), 1), include_superseded=include_superseded)
 
     if type:
         memories = [m for m in memories if m.type == type]

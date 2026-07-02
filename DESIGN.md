@@ -66,10 +66,10 @@ Four cognitive operations model how humans manage long-term memory:
             ▼                                              ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                      MemoryStore                             │
-│   remember()  recall()  recall_pack()  auto_context_pack()   │
-│   forget()  nuke()  count()  list_recent()  link()  unlink() │
-│   neighbors()                                                │
-│   subgraph()  supersede()  restore()  find_conflicts()       │
+│   remember()  edit()  recall()  recall_pack()                │
+│   auto_context_pack()  forget()  nuke()  count()             │
+│   list_recent()  link()  unlink()  neighbors()  subgraph()   │
+│   supersede()  restore()  find_conflicts()  undo()           │
 └───────────────────────────┬──────────────────────────────────┘
                             │
             ┌───────────────┼────────────────┐
@@ -106,7 +106,10 @@ ai_houkai/                        pip package name: ai-houkai
 │   │                             ImportConflictError, Journal, JournalEntry,
 │   │                             DecayEngine, ReflectionEngine, build_summarizer,
 │   │                             AsyncMemoryStore, CompressedGroup,
-│   │                             extract_key_phrases, score_importance
+│   │                             extract_key_phrases, score_importance,
+│   │                             MEMORY_TYPES, LINK_RELS, RECALL_MODES,
+│   │                             FUSIONS, CONFLICT_POLICIES,
+│   │                             IMPORT_POLICIES, DIRECTIONS
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
 │   ├── async_store.py            AsyncMemoryStore — coroutine wrapper, single-threaded executor
 │   ├── journal.py                Journal — append-only JSONL audit log
@@ -126,7 +129,10 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 16 tools
+│   └── server.py                 FastMCP server — 17 tools
+├── http_server/
+│   ├── __init__.py
+│   └── server.py                 stdlib JSON HTTP/REST server (houkai serve)
 ├── cli/
 │   ├── __init__.py
 │   ├── __main__.py               python -m ai_houkai.cli
@@ -155,7 +161,7 @@ ai_houkai/                        pip package name: ai-houkai
 └── installers/
     ├── __init__.py               re-exports ClaudeCodeInstaller, CursorInstaller, OpenCodeInstaller
     ├── common.py                 shared command resolver, JSON patcher, verify_server, memory guide
-    ├── claude_code.py            ClaudeCodeInstaller — patches ~/.claude/settings.json
+    ├── claude_code.py            ClaudeCodeInstaller — claude mcp add / ~/.claude.json / .mcp.json
     ├── cursor.py                 CursorInstaller — patches ~/.cursor/mcp.json
     └── opencode.py               OpenCodeInstaller — patches ~/.config/opencode/opencode.json
 ```
@@ -239,6 +245,29 @@ Types affect two behaviours:
 - **Protection** — `DecayEngine` never prunes `procedural` memories by
   default (configurable via `protect_types`).
 
+### Enum vocabularies (validated in the store)
+
+The store is the single validation point for every enum-ish parameter, so
+all surfaces (CLI, HTTP, MCP, TUI) reject typos in one place instead of
+silently degrading (e.g. `mode="hybird"` used to fall through to semantic
+search; an unknown `on_conflict` used to scan and then discard the
+conflicts). The vocabularies are exported from `ai_houkai.memory_system`:
+
+| Constant | Values | Validated in |
+|---|---|---|
+| `MEMORY_TYPES` | `episodic, semantic, procedural, feedback` | `remember`, `edit`, `recall(type=)` |
+| `LINK_RELS` | `related, refines, derived_from, example_of, contradicts, supersedes` | `link`, `unlink`, `neighbors(rel=)` |
+| `RECALL_MODES` | `semantic, hybrid` | `recall`, `recall_pack`, `auto_context_pack` |
+| `FUSIONS` | `weighted, rrf` | `recall(fusion=)` |
+| `CONFLICT_POLICIES` | `ignore, warn, supersede, raise` | `MemoryStore(conflict_policy=)`, `remember(on_conflict=)` |
+| `IMPORT_POLICIES` | `skip, overwrite, rename, error` | `import_(on_conflict=)` |
+| `DIRECTIONS` | `out, in, both` | `neighbors(direction=)` |
+
+A bad value raises `ValueError` naming the parameter and the allowed
+vocabulary; `polarity` is likewise restricted to `-1/0/+1`. `link()` also
+rejects a `dst_id` that does not resolve — graph walkers skip unresolvable
+targets, so a dangling edge would be stored but permanently unreachable.
+
 ### Metadata serialisation
 
 ChromaDB metadata values must be scalar.  Tags are stored as a
@@ -312,18 +341,26 @@ be fine — HNSW ensures queries stay fast as collections grow.
                  ┌─────────────────────┐
                  │   ChromaDB HNSW     │◄── persists to disk
                  └────────┬────────────┘
-          ┌───────────────┼────────────────────┐
-          ▼               ▼                    ▼
-   recall(query)    list_recent()          forget(id)
-          │               │                    │
-     vector search   chronological        hard delete
-     metadata filter    sort              returns bool
-          │
+          ┌───────────────┼──────────────┬─────────────────┐
+          ▼               ▼              ▼                 ▼
+   recall(query)    list_recent()   edit(id, …)       forget(id)
+          │               │              │                 │
+     vector search   chronological  in-place update   hard delete
+     metadata filter    sort        re-embeds on      returns bool
+          │                         text change
           ▼
     _touch(memory)
     ├── last_accessed = now
     └── access_count += 1
 ```
+
+`edit()` updates fields of an existing memory **keeping its id**: omitted
+fields stay unchanged (`source` uses a sentinel so `source=None` explicitly
+clears it), text changes are re-embedded, and links / supersede state /
+access tracking / `created_at` all survive — unlike a `forget()` +
+`remember()` round-trip. The change is journaled (op `edit`, with
+before/after snapshots) and reversible via `undo()`; a call that changes
+nothing is a true no-op (no write, no journal entry).
 
 #### recall() filtering pipeline
 
@@ -588,13 +625,14 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose sixteen tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose seventeen tools:
 
 **Core tools**
 
 | Tool | Key parameters | Returns |
 |---|---|---|
 | `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored, importance}` or `{stored:false, conflicts:[…]}` |
+| `edit` | `memory_id`, `text?`, `type?`, `tags?`, `importance?`, `polarity?`, `source?` | `{ok, id, text, type, tags, importance, polarity, source}` or `{ok:false, error}` — in-place, journaled, undoable |
 | `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
 | `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `max_items?`, `include_superseded?`, `compress?`, `compress_threshold?`, `compress_min_group?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}], compressed_groups:[{ids,text,tokens,count}]}` |
 | `auto_context` | `task`, `token_budget?`, `max_phrases?`, `mode?` | `{text, queries, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}]}` |
@@ -621,14 +659,18 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `maintenance_tick` | `reflect_apply?` | `{summary, ran_decay, ran_reflect, decayed, reflected, decay_error, reflect_error}` |
+| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, decayed, reflected, reflect_applied, decay_error, reflect_error}` |
 | `journal_tail` | `n?`, `op?`, `since_seconds?` | `list[{ts,op,actor,id,summary,meta}]` (newest first) |
 | `export` | `path`, `include_vectors?`, `include_superseded?`, `type?`, `tag?`, `since?` | `{path, count, bytes, elapsed}` |
 | `import` | `path`, `on_conflict?`, `regenerate_vectors?`, `dry_run?` | `{ok, imported, skipped, overwritten, renamed, errors, vectors_regenerated}` |
 
 `maintenance_tick` honours the `[maintenance]` schedule from
 `~/.config/ai_houkai/config.toml` — jobs only run when their interval has
-elapsed, so MCP clients may call it freely (see §17).
+elapsed, **including dry-run reflection** (the schedule gates the work, not
+the writes), so MCP clients may call it freely (see §17). `reflect_apply`
+defaults to the config's `[maintenance.reflect] apply` setting; when it
+resolves to false, `reflected` is the number of summaries a real run
+*would* create and `reflect_applied` is `false`.
 
 Configuration via environment variables:
 
@@ -651,15 +693,17 @@ ai-houkai-mcp = "ai_houkai.mcp_server.server:run"
 
 ### Claude Code integration
 
-Claude Code reads `~/.claude/settings.json` (global) or
-`.claude/settings.json` (project-level) to discover MCP servers.
+Claude Code discovers MCP servers from `~/.claude.json` (user scope) or a
+project-level `.mcp.json` — **not** from `settings.json`, which has no
+`mcpServers` key. The supported registration interface is
+`claude mcp add --scope user|project`, and the installer prefers it.
 
 ```
 Claude Code CLI
     │
     │  reads at startup / per-invocation
     ▼
-~/.claude/settings.json
+~/.claude.json (user scope)  /  ./.mcp.json (project scope)
     │
     │  spawns subprocess
     ▼
@@ -696,18 +740,18 @@ python examples/06_claude_code.py --install
 from ai_houkai.installers import ClaudeCodeInstaller
 
 inst = ClaudeCodeInstaller(
-    memory_path   = "~/.ai_houkai",
-    collection    = "my_project",          # per-project namespace
-    settings_path = ".claude/settings.json"  # project-scoped install
+    memory_path = "~/.ai_houkai",
+    collection  = "my_project",          # per-project namespace
 )
-inst.install()
+inst.install()                   # `claude mcp add --scope user`, or ~/.claude.json
+inst.install(scope="project")    # project scope → ./.mcp.json
 inst.verify()
 print(inst.claudemd_snippet())
 ```
 
-The installer is a small dataclass (no global state, idempotent writes,
-JSON-merge into existing `mcpServers`) so it composes well with project
-scaffolding tooling.
+The installer is a small dataclass (no global state, idempotent
+registration, atomic JSON-merge into existing `mcpServers`) so it composes
+well with project scaffolding tooling.
 
 #### CLAUDE.md guidance
 
@@ -718,6 +762,7 @@ to use the tools autonomously — without the user needing to prompt:
 ## Memory (AI-Houkai MCP)
 - recall() before starting any task
 - remember() conventions, decisions, corrections
+- edit() to fix or refine an existing memory (keeps id, links, history)
 - forget() outdated facts
 ```
 
@@ -770,15 +815,16 @@ module means:
 ```python
 @dataclass
 class ClaudeCodeInstaller:
-    memory_path:   str = "~/.ai_houkai"
-    collection:    str = "claude_code"
-    settings_path: str = "~/.claude/settings.json"
-    server_name:   str = "ai-houkai"
-    extra_env:     dict = {}
+    memory_path: str = "~/.ai_houkai"
+    collection:  str = "claude_code"
+    config_path: str = "~/.claude.json"   # direct-write fallback (user scope)
+    server_name: str = "ai-houkai"
+    extra_env:   dict = {}
 
-    def build_mcp_block(self)      -> dict
+    def build_env(self)            -> dict
+    def build_mcp_block(self)      -> dict       # {"type": "stdio", ...}
     def build_settings_block(self) -> dict
-    def install(self)              -> str        # returns settings_path
+    def install(self, *, scope="user") -> str    # what was written (cmd or path)
     def print_config(self)         -> None
     def verify(self)               -> bool
     @staticmethod
@@ -787,12 +833,23 @@ class ClaudeCodeInstaller:
 
 ### Behaviour
 
-- **Idempotent**: re-running `install()` overwrites the `ai-houkai` entry
-  in `mcpServers` but preserves all other servers and top-level keys.
-- **Unparseable settings**: by default replaces a corrupted JSON file
+- **CLI-first**: when `claude` is on PATH, `install()` shells out to
+  `claude mcp remove` + `claude mcp add --scope user|project` — robust to
+  future config-layout changes. Without the CLI it merges the stdio block
+  into `~/.claude.json` (user) or `./.mcp.json` (project) directly.
+- **Idempotent**: re-running `install()` replaces the `ai-houkai` entry
+  but preserves all other servers and top-level keys.
+- **Atomic writes**: direct config edits go through write-to-temp +
+  `os.replace` (`common.write_json`) so a crash can never truncate the
+  user's client config.
+- **Unparseable config**: by default replaces a corrupted JSON file
   rather than aborting (toggle with `overwrite_unparseable=False`).
-- **Per-project install**: pass `settings_path=".claude/settings.json"`
-  to scope the registration to a single repo.
+- **No import side effects**: the MCP server module creates its store
+  lazily (`get_store()`, on first tool use), so importing the installers —
+  or `ai_houkai.mcp_server.server` itself — never materialises a stray
+  `./.chroma` or loads the embedding model. `verify()` reports the count of
+  the store actually being installed (`memory_path`/`collection`), not the
+  env-default one.
 - **Common shape**: all installers expose the same surface
   (`build_mcp_block` / `build_settings_block` / `install` / `print_config`
   / `verify` + a client-specific guidance snippet) so callers can dispatch
@@ -880,13 +937,14 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 523 tests across 22 files
+### 594 tests across 25 files
 
 | File | Tests | What it covers |
 |---|---|---|
-| `test_maintenance.py` | 57 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files |
+| `test_maintenance.py` | 62 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_pack.py` | 52 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
+| `test_validation.py` | 36 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
@@ -895,6 +953,7 @@ LLM API  ──►  assistant reply to user
 | `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
 | `test_cli.py` | 21 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
+| `test_edit.py` | 20 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
 | `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
 | `test_async_store.py` | 19 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
@@ -905,6 +964,7 @@ LLM API  ──►  assistant reply to user
 | `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
+| `test_installers.py` | 10 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
 
 ### Test isolation strategy
@@ -971,6 +1031,10 @@ store.neighbors(memory_id, rel=None,
 store.subgraph(memory_ids, depth=1)          # Graph(nodes, edges)
 ```
 
+`rel` must be one of `LINK_RELS` (§3) and `dst_id` must resolve — both are
+validated in the store, so a typo'd relation or a dangling target raises
+instead of silently creating an edge no graph walker can follow.
+
 ### Supersede (soft-delete)
 
 ```python
@@ -1012,6 +1076,9 @@ for b in candidates:
 | `warn` | `warnings.warn()` listing conflicts |
 | `supersede` | auto-supersede conflicting memories |
 | `raise` | raises `ConflictError(conflicts)` |
+
+Any other value raises `ValueError` (see `CONFLICT_POLICIES`, §3) — both in
+the constructor's `conflict_policy` and per-call `on_conflict`.
 
 ```python
 store = MemoryStore(conflict_policy="warn", conflict_threshold=0.85)
@@ -1298,9 +1365,9 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `show` | `show.py` | `store._get_by_id()` |
 | `forget` | `forget.py` | `store.forget()` |
 | `nuke` | `nuke.py` | `store.nuke()` — deletes all memories; confirms unless `--yes` |
-| `edit` | `edit.py` | `collection.update()` in place (re-embeds via `documents=` when text changed; id + links preserved) |
-| `tag` | `edit.py` | `collection.update()` metadata-only |
-| `bump` | `edit.py` | `collection.update()` metadata-only |
+| `edit` | `edit.py` | `store.edit()` in place (re-embeds when text changed; id + links preserved; journaled + undoable) |
+| `tag` | `edit.py` | `store.edit(tags=…)` — journaled + undoable |
+| `bump` | `edit.py` | `store.edit(importance=…)` — journaled + undoable |
 | `link` | `link.py` | `store.link()` |
 | `unlink` | `link.py` | `store.unlink()` |
 | `neighbors` | `link.py` | `store.neighbors()` |
@@ -1345,11 +1412,17 @@ raises `ValueError` on ambiguous or missing prefixes.
   it shows the count before prompting, and returns the number deleted.
 - `prune` and `reflect` default to **dry-run** — matching the underlying
   engine conventions — and require an explicit `--apply` flag to write.
-- `tag` and `bump` update only ChromaDB metadata; the embedding vector
-  is unchanged, keeping the semantic index consistent.
-- `edit` updates the record in place via `collection.update()`, keeping
-  the same id and all links. Passing `documents=` re-embeds the text when
-  it changed; metadata-only edits omit it and leave the vector untouched.
+- `tag` and `bump` update only metadata (via `store.edit()`); the embedding
+  vector is unchanged, keeping the semantic index consistent.
+- `edit` updates the record in place via `store.edit()`, keeping the same
+  id and all links; the text is re-embedded only when it changed. All three
+  curation commands are journaled (op `edit`) and reversible with
+  `houkai journal undo`.
+- **Clean errors**: store validation failures (bad enum value, unknown id,
+  self-link, supersede cycle) surface as a one-line `Error: …` + exit 1 via
+  `output.friendly_errors()`, never a traceback. `remember --on-conflict
+  raise` hitting a real conflict prints the conflicts and exits — the
+  policy outcome, not a crash.
 
 ### Config file
 
@@ -1399,13 +1472,23 @@ maintenance/
 `tick()` is the single unit of work and is **idempotent with respect to
 the schedule**: each job (decay, reflect) runs only if its configured
 interval (`decay_every`, default 24 h; `reflect_every`, default 7 d) has
-elapsed since the last successful run recorded in `MaintenanceState`.
+elapsed since the last run recorded in `MaintenanceState`.
 Callers may therefore invoke it as often as they like — from cron, from
 the foreground loop (`tick_interval`, default 5 min), from an MCP client
 via the `maintenance_tick` tool, or ad hoc.
 
+**The schedule gates the work, not the writes.** A reflection run stamps
+`last_reflect_at` even in dry-run mode: clustering is O(n²) and the
+summarizer may call an LLM, and both costs are paid on a dry-run too.
+(Before this rule, a dry-run-configured caller re-ran full reflection —
+LLM call included — on *every* tick, forever.) `TickResult.reflect_applied`
+records which mode ran, and `summary()` says `reflect would create N
+(dry-run)` vs `reflect created N`. Totals (`total_reflected`) only count
+persisted summaries.
+
 Errors in one job never block the other; they are captured in
 `TickResult.decay_error` / `reflect_error` and surfaced in `summary()`.
+A failed job does **not** advance its schedule — it retries next tick.
 
 ### Three deployment modes
 
@@ -1438,10 +1521,10 @@ One compact JSON object per line:
  "id": "72be7903-…", "before": {…}, "after": {…}, "meta": {"new_id": "…"}}
 ```
 
-- **op** — `remember | forget | supersede | restore | link | unlink |
+- **op** — `remember | forget | edit | supersede | restore | link | unlink |
   reflect | decay | import | export | undo`
-- **actor** — who performed it: `cli` / `mcp` / `reflection` / `decay` /
-  `import` / `lib`
+- **actor** — who performed it: `cli` / `mcp` / `http` / `reflection` /
+  `decay` / `import` / `lib`
 - **before / after** — full memory snapshots where applicable; these are
   what make `undo` possible.
 
@@ -1459,9 +1542,12 @@ One compact JSON object per line:
 
 `MemoryStore.undo(entry)` reverses a single entry where possible
 (`remember` → forget, `forget` → re-add from the `before` snapshot,
+`edit` → restore the `before` snapshot (re-embedding the text),
 `supersede`/`restore`/`link`/`unlink` → inverse op).  It refuses rather
 than clobbers: e.g. undoing a `forget` fails if the id already exists
-again.  Every successful undo is itself journalled with `op="undo"`.
+again, and undoing an `edit` or `unlink` fails if the memory (or a link
+endpoint) has since been forgotten.  Every successful undo is itself
+journalled with `op="undo"`.
 
 ---
 
@@ -1515,6 +1601,7 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 | `GET /memories` | `list_recent(limit, include_superseded)` |
 | `POST /memories` | `remember(...)` → 201, or 409 on `ConflictError` |
 | `GET /memories/{id}` | `_get_by_id` → 404 if absent |
+| `PATCH /memories/{id}` | `edit(...)` — in-place, journaled; 404 if absent, 400 on bad field |
 | `DELETE /memories/{id}` | `forget` → 404 if absent |
 | `GET /memories/{id}/neighbors` | `neighbors(rel, direction, depth)` |
 | `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until` |
@@ -1536,7 +1623,18 @@ Python API or MCP.
   `(method, compiled_regex, handler, needs_body)` rows. Each handler is a
   plain function `(store, match, query, body) -> (status, payload)`. One
   `_dispatch` method serves every verb (`do_GET = do_POST = … = _dispatch`).
-  A path that matches a row but not the verb returns `405`; no match is `404`.
+  `HEAD` is dispatched as `GET` with the response body suppressed, so
+  `HEAD /health` liveness probes work. A path that matches a row but not
+  the verb returns `405`; no match is `404`.
+- **Input coercion.** Query-string params go through `_as_int` / `_as_float`
+  / `_as_bool`; JSON-body params go through the matching `_body_int` /
+  `_body_float` / `_body_bool` twins, which accept JSON-native types and
+  numeric strings and raise `HttpError(400)` on anything else (a JSON
+  `"false"` is falsy, `null` falls back to the default). Store-level
+  validation errors (bad `mode` / `type` / `rel` / `polarity` /
+  `on_conflict`, self-link, supersede cycle) surface as
+  `400 {"error": "<message naming the allowed values>"}`; unknown ids are
+  `404`.
 - **Errors.** Handlers raise `HttpError(status, message)` for expected
   failures (400 bad input, 404 missing, 413 oversized body); any other
   exception is caught and rendered as
@@ -1547,9 +1645,10 @@ Python API or MCP.
   Request bodies are capped at 4 MiB and parsed as a JSON object.
 - **Auth.** Optional bearer token (`auth_token` arg / `AI_HOUKAI_HTTP_TOKEN`).
   When set, every route except `/health` requires
-  `Authorization: Bearer <token>`, compared with `hmac.compare_digest`
-  (constant-time, so a wrong token can't be recovered by timing), else `401`.
-  Binds `127.0.0.1` by default;
+  `Authorization: Bearer <token>`, compared with `hmac.compare_digest` over
+  UTF-8 **bytes** (constant-time, so a wrong token can't be recovered by
+  timing; the str overload would raise on a non-ASCII header and kill the
+  request thread instead of returning 401). Binds `127.0.0.1` by default;
   exposing `0.0.0.0` is left to a deliberate `--host` / env override behind a
   trusted network or reverse proxy.
 - **Attribution.** The server sets the store's actor to `"http"`, so journal

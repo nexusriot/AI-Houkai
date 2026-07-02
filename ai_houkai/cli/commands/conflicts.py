@@ -86,7 +86,8 @@ def supersede(
     except ValueError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
-    store.supersede(old, new)
+    with out.friendly_errors():
+        store.supersede(old, new)
     typer.echo(f"{out.short_id(old)} superseded by {out.short_id(new)}")
 
 

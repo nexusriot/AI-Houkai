@@ -107,7 +107,8 @@ class OpenCodeInstaller:
               "available to the agent.\n", file=stream)
 
     def verify(self, *, stream=sys.stdout) -> bool:
-        ok = verify_server(self.server_name, stream=stream)
+        ok = verify_server(self.server_name, memory_path=self.memory_path,
+                           collection=self.collection, stream=stream)
         if os.path.isfile(self.settings_path):
             cfg = load_json(self.settings_path)
             if self.server_name in cfg.get("mcp", {}):

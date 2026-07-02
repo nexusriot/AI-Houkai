@@ -158,11 +158,16 @@ print("""
       AI_HOUKAI_PATH        path for ChromaDB  (default: ./.chroma)
       AI_HOUKAI_COLLECTION  collection name    (default: ai_houkai)
 
-  Add to Claude Code (~/.claude/settings.json):
+  Add to Claude Code (preferred):
+      claude mcp add --scope user ai-houkai -- ai-houkai-mcp
+
+  Or manually (~/.claude.json user scope / project .mcp.json):
       {
         "mcpServers": {
-          "AI-Houkai": {
+          "ai-houkai": {
+            "type": "stdio",
             "command": "ai-houkai-mcp",
+            "args": [],
             "env": { "AI_HOUKAI_PATH": "/your/memory/path" }
           }
         }

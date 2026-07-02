@@ -36,6 +36,9 @@ class TickResult:
     reflected: int = 0
     decay_error: str | None = None
     reflect_error: str | None = None
+    # False when reflection ran in dry-run mode: `reflected` is then the
+    # number of summaries that WOULD be created, not that were created.
+    reflect_applied: bool = True
 
     def summary(self) -> str:
         parts: list[str] = []
@@ -47,9 +50,12 @@ class TickResult:
         if self.ran_reflect:
             if self.reflect_error:
                 parts.append(f"reflect FAILED: {self.reflect_error}")
+            elif not self.reflected:
+                parts.append("reflect nothing to reflect")
+            elif self.reflect_applied:
+                parts.append(f"reflect created {self.reflected}")
             else:
-                verb = "created" if self.reflected else "nothing to reflect"
-                parts.append(f"reflect {verb}" if not self.reflected else f"reflect created {self.reflected}")
+                parts.append(f"reflect would create {self.reflected} (dry-run)")
         return " | ".join(parts) if parts else "nothing to do"
 
 
@@ -146,6 +152,7 @@ class MaintenanceScheduler:
             next_at = state.next_run_at(state.last_reflect_at, self.reflect_every, now=t)
             if t >= next_at:
                 result.ran_reflect = True
+                result.reflect_applied = self.reflect_apply
                 try:
                     engine = ReflectionEngine(
                         self.store,
@@ -154,12 +161,14 @@ class MaintenanceScheduler:
                     )
                     created = engine.reflect(dry_run=not self.reflect_apply)
                     result.reflected = len(created)
-                    # Only advance the schedule when reflection actually
-                    # persisted summaries. A dry-run writes nothing, so
-                    # stamping last_reflect_at here would push the next real
-                    # run out by reflect_every and starve reflection forever.
+                    # The schedule gates the WORK, not the writes: clustering
+                    # is O(n²) and the summarizer may call an LLM, and both
+                    # happen on a dry-run too. Stamp last_reflect_at whenever
+                    # the job ran, or a dry-run-configured caller (daemon,
+                    # MCP maintenance_tick) re-pays that cost on every tick.
+                    # Totals still count persisted summaries only.
+                    state.last_reflect_at = t
                     if self.reflect_apply:
-                        state.last_reflect_at = t
                         state.total_reflected += result.reflected
                     logger.info(
                         "Reflect (%s): %d summaries",

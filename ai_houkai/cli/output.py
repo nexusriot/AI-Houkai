@@ -6,7 +6,10 @@ import json
 import os
 import sys
 import time
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
+
+import typer
 
 from ai_houkai.memory_system.store import Memory
 
@@ -16,6 +19,19 @@ from rich.text import Text
 from rich.panel import Panel
 
 _USE_RICH = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+@contextmanager
+def friendly_errors() -> Iterator[None]:
+    """Turn store validation errors (bad enum value, unknown id, self-link,
+    supersede cycle, …) into a clean one-line CLI error + exit 1 instead of
+    a traceback."""
+    try:
+        yield
+    except (ValueError, KeyError) as e:
+        msg = e.args[0] if e.args else str(e)
+        typer.echo(f"Error: {msg}", err=True)
+        raise typer.Exit(1)
 
 # Re-check at call time (can be overridden after import)
 def _is_tty() -> bool:

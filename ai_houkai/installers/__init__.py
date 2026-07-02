@@ -2,7 +2,7 @@
 AI-Houkai installers — register the MCP server with various clients.
 
 Submodules:
-    claude_code  — Claude Code CLI (`~/.claude/settings.json`)
+    claude_code  — Claude Code CLI (`claude mcp add` / `~/.claude.json` / `.mcp.json`)
     cursor       — Cursor editor (`~/.cursor/mcp.json`)
     opencode     — OpenCode agent (`~/.config/opencode/opencode.json`)
 

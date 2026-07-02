@@ -29,18 +29,19 @@ def recall(
         until_ts = parse_timestamp(until)
     except ValueError as exc:
         raise typer.BadParameter(str(exc))
-    results = store.recall(
-        query=query,
-        k=k,
-        type=type,
-        tag=tag,
-        min_importance=min_importance,
-        source=source,
-        since=since_ts,
-        until=until_ts,
-        mode=mode,
-        include_superseded=include_superseded,
-    )
+    with out.friendly_errors():
+        results = store.recall(
+            query=query,
+            k=k,
+            type=type,
+            tag=tag,
+            min_importance=min_importance,
+            source=source,
+            since=since_ts,
+            until=until_ts,
+            mode=mode,
+            include_superseded=include_superseded,
+        )
     if not results:
         typer.echo("No memories found.", err=True)
         return
