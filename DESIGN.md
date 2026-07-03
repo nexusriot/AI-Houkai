@@ -271,7 +271,9 @@ targets, so a dangling edge would be stored but permanently unreachable.
 ### Metadata serialisation
 
 ChromaDB metadata values must be scalar.  Tags are stored as a
-comma-joined string; `links` are JSON-encoded:
+comma-joined string (which is why `remember()`/`edit()` reject a comma
+inside a tag — it would silently split into two tags on the next read);
+`links` are JSON-encoded:
 
 ```python
 # write
@@ -937,35 +939,36 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 594 tests across 25 files
+### 621 tests across 26 files
 
 | File | Tests | What it covers |
 |---|---|---|
-| `test_maintenance.py` | 62 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating |
+| `test_maintenance.py` | 64 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_pack.py` | 52 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
-| `test_validation.py` | 36 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
+| `test_validation.py` | 44 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 | `test_reflection.py` | 23 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources |
-| `test_links.py` | 22 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
+| `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
-| `test_cli.py` | 21 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
-| `test_edit.py` | 20 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
+| `test_cli.py` | 22 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
+| `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
 | `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
-| `test_async_store.py` | 19 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
+| `test_async_store.py` | 20 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
 | `test_http_server.py` | 16 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 error handling, concurrency lock, `/health` topology-leak guard |
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
 | `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
-| `test_journal.py` | 13 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
+| `test_journal.py` | 15 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
 | `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
 | `test_installers.py` | 10 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
+| `test_mcp_server.py` | 6 | MCP tools in-process: lazy `get_store()` env honoring, `edit` tool result/error dicts, `maintenance_tick` config-default + explicit `reflect_apply` |
 
 ### Test isolation strategy
 
@@ -1034,6 +1037,14 @@ store.subgraph(memory_ids, depth=1)          # Graph(nodes, edges)
 `rel` must be one of `LINK_RELS` (§3) and `dst_id` must resolve — both are
 validated in the store, so a typo'd relation or a dangling target raises
 instead of silently creating an edge no graph walker can follow.
+
+Two memories may be joined by several differently-typed edges;
+`neighbors()` reports one `(memory, rel)` pair per edge while still
+visiting/expanding each node once. `subgraph()` tracks the best remaining
+hop budget per node (not a plain visited set), so diamond shapes expand
+fully — a node first reached at the depth limit is re-expanded when a
+shorter path reaches it with budget to spare. `unlink()` journals the
+removed rels, so undoing a rel=None unlink restores every edge it dropped.
 
 ### Supersede (soft-delete)
 
@@ -1476,6 +1487,13 @@ elapsed since the last run recorded in `MaintenanceState`.
 Callers may therefore invoke it as often as they like — from cron, from
 the foreground loop (`tick_interval`, default 5 min), from an MCP client
 via the `maintenance_tick` tool, or ad hoc.
+
+**Concurrent tickers serialise.** The whole load→run→save cycle holds an
+exclusive `flock` on `<state file>.lock`, so the daemon loop, a cron tick,
+and the MCP tool can share one state file without double-running a job or
+clobbering each other's timestamps: a blocked ticker waits, re-loads the
+fresh state, and sees the job as no longer due. (On non-POSIX platforms
+without `fcntl`, ticks run unlocked as before.)
 
 **The schedule gates the work, not the writes.** A reflection run stamps
 `last_reflect_at` even in dry-run mode: clustering is O(n²) and the

@@ -19,14 +19,17 @@ from ai_houkai.memory_system import AsyncMemoryStore, MemoryStore
 
 class TestEditStore:
     def test_edit_text_reembeds(self, store: MemoryStore):
-        m = store.remember("the capital of France is Berlin", tags=["geo"])
-        store.remember("completely unrelated cooking recipe")
+        m = store.remember("today the weather in the mountains was rainy",
+                           tags=["log"])
+        # Competitor deliberately CLOSER to the query than the stale text:
+        # if edit failed to re-embed, the stale "weather" embedding loses to
+        # the competitor and this test fails.
+        store.remember("Paris is a lovely European city")
         store.edit(m.id, text="the capital of France is Paris")
 
         got = store._get_by_id(m.id)
         assert got.text == "the capital of France is Paris"
-        # the new text must be findable semantically → embedding was refreshed
-        hits = store.recall("Paris France capital", k=1)
+        hits = store.recall("what is the capital of France?", k=1)
         assert hits and hits[0][0].id == m.id
 
     def test_edit_preserves_identity_and_graph(self, store: MemoryStore):
@@ -228,4 +231,17 @@ class TestEditHttp:
     def test_patch_empty_body_400(self, server, store):
         m = store.remember("http editable")
         status, _ = self._req(server, "PATCH", f"/memories/{m.id}", {})
+        assert status == 400
+
+    def test_patch_null_field_means_unchanged(self, server, store):
+        """null = leave unchanged (was: polarity null silently reset to 0)."""
+        m = store.remember("null semantics", polarity=1, importance=0.8)
+        status, body = self._req(server, "PATCH", f"/memories/{m.id}",
+                                 {"polarity": None, "importance": 0.9})
+        assert status == 200
+        assert body["polarity"] == 1          # untouched
+        assert body["importance"] == 0.9
+        # a body containing ONLY nulls is an explicit 400, not a silent no-op
+        status, _ = self._req(server, "PATCH", f"/memories/{m.id}",
+                              {"polarity": None})
         assert status == 400

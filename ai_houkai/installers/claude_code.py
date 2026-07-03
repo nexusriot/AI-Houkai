@@ -151,10 +151,13 @@ class ClaudeCodeInstaller:
             ["claude", "mcp", "remove", "--scope", scope, self.server_name],
             capture_output=True, text=True, timeout=15,
         )
-        cmd = ["claude", "mcp", "add", "--scope", scope]
+        # The server name MUST precede the --env options: `-e/--env <env...>`
+        # is variadic and would swallow a following bare name, leaving
+        # `commandOrUrl` missing and the add failing with rc=1.
+        cmd = ["claude", "mcp", "add", "--scope", scope, self.server_name]
         for key, value in self.build_env().items():
             cmd += ["--env", f"{key}={value}"]
-        cmd += [self.server_name, "--", self.mcp_command]
+        cmd += ["--", self.mcp_command]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(
@@ -173,10 +176,10 @@ class ClaudeCodeInstaller:
 
     def print_config(self, *, stream=sys.stdout) -> None:
         print(f"\nRegister with the Claude Code CLI (preferred):\n", file=stream)
-        print(f"    claude mcp add --scope user "
+        print(f"    claude mcp add --scope user {self.server_name} "
               f"--env AI_HOUKAI_PATH={self.memory_path} "
               f"--env AI_HOUKAI_COLLECTION={self.collection} "
-              f"{self.server_name} -- {self.mcp_command}\n", file=stream)
+              f"-- {self.mcp_command}\n", file=stream)
         print(f"Or paste this into the `mcpServers` block of {self.config_path} "
               f"(user scope)\nor a project's .mcp.json:\n", file=stream)
         print(json.dumps(self.build_settings_block(), indent=2), file=stream)

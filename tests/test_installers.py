@@ -86,7 +86,10 @@ def test_cli_install_invokes_claude_mcp_add(monkeypatch) -> None:
     # idempotency: stale entry removed first, then re-added
     assert calls[0][:4] == ["claude", "mcp", "remove", "--scope"]
     add = calls[1]
-    assert add[:5] == ["claude", "mcp", "add", "--scope", "user"]
+    assert add[:6] == ["claude", "mcp", "add", "--scope", "user", "ai-houkai"]
+    # the name MUST precede --env: the CLI's variadic -e/--env would
+    # otherwise swallow it and the add fails with rc=1
+    assert add.index("ai-houkai") < add.index("--env")
     assert "AI_HOUKAI_PATH=/mem" in add
     assert "AI_HOUKAI_COLLECTION=col" in add
     assert add[-2:-1] == ["--"]                     # command after separator
@@ -111,6 +114,13 @@ def test_write_json_atomic_and_roundtrip(tmp_path: Path) -> None:
     write_json(str(path), {"a": 1})
     assert load_json(str(path)) == {"a": 1}
     # no temp files left behind
+    assert [p.name for p in path.parent.iterdir()] == ["cfg.json"]
+
+    # atomicity: a crash mid-serialisation must leave the existing file
+    # untouched and clean up its temp file
+    with pytest.raises(TypeError):
+        write_json(str(path), {"bad": {1, 2, 3}})   # sets are unserialisable
+    assert load_json(str(path)) == {"a": 1}          # original intact
     assert [p.name for p in path.parent.iterdir()] == ["cfg.json"]
 
 

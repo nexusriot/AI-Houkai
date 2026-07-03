@@ -117,7 +117,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 594 tests across 25 files
+├── tests/                        # 621 tests across 26 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -1074,10 +1074,13 @@ houkai maintenance tick
 
 Run one tick synchronously: prune stale memories and (optionally) reflect.
 Jobs only execute when their configured interval has elapsed since the last
-run — safe to call as often as you like. This holds for **dry-run reflection
-too**: a dry-run still pays for clustering (and the LLM summarizer, if one
-is configured), so it advances the schedule like a real run; only the
-persisted-summaries total is reserved for `apply` runs.
+run — safe to call as often as you like, and safe to call **concurrently**:
+the tick cycle holds a cross-process file lock, so a cron tick racing the
+daemon (or the MCP tool) serialises instead of double-running a job. This
+also holds for **dry-run reflection**: a dry-run still pays for clustering
+(and the LLM summarizer, if one is configured), so it advances the schedule
+like a real run; only the persisted-summaries total is reserved for
+`apply` runs.
 
 Crontab example (daily at 03:00):
 

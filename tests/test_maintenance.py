@@ -488,3 +488,54 @@ class TestReflectScheduleGating:
         applied = TickResult(ran_reflect=True, reflected=2, reflect_applied=True)
         assert "created 2" in applied.summary()
         assert "dry-run" not in applied.summary()
+
+
+class TestTickCrossProcessLock:
+    """The tick cycle holds an exclusive file lock, so concurrent tickers
+    (daemon + cron + MCP tool on the same state file) serialise instead of
+    both observing a job as due and double-running it."""
+
+    def test_concurrent_ticks_run_decay_once(self, store, tmp_path):
+        pytest.importorskip("fcntl")
+        state_path = str(tmp_path / "state.json")
+
+        class _SlowDecay:
+            """Holds the lock long enough for the second ticker to pile up
+            behind it — without the lock both would load pristine state."""
+            def __init__(self, *a, **kw): pass
+            def prune(self, **kw):
+                time.sleep(0.5)
+                return []
+
+        original = sched_mod.DecayEngine
+        sched_mod.DecayEngine = _SlowDecay
+        try:
+            t = time.time()
+            results = []
+
+            def _tick():
+                sched = MaintenanceScheduler(
+                    store=store, decay_every=3_600, reflect_every=None,
+                    state_path=state_path,
+                )
+                results.append(sched.tick(now=t))
+
+            threads = [threading.Thread(target=_tick) for _ in range(2)]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=10)
+        finally:
+            sched_mod.DecayEngine = original
+
+        assert len(results) == 2
+        assert sum(1 for r in results if r.ran_decay) == 1
+
+    def test_lock_file_created_next_to_state(self, store, tmp_path):
+        pytest.importorskip("fcntl")
+        state_path = tmp_path / "state.json"
+        MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None,
+            state_path=str(state_path),
+        ).tick()
+        assert (tmp_path / "state.lock").exists()

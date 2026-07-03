@@ -18,14 +18,46 @@ Usage (programmatic)
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX platform — ticks run unlocked
+    fcntl = None  # type: ignore[assignment]
 
 from ai_houkai.memory_system import DecayEngine, ReflectionEngine
 from ai_houkai.maintenance.state import MaintenanceState
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _state_lock(state_path: str) -> Iterator[None]:
+    """Exclusive cross-process lock guarding the load→run→save tick cycle.
+
+    The daemon loop, a cron `houkai maintenance tick`, and the MCP
+    maintenance_tick tool may all target the same state file; without the
+    lock two concurrent tickers could both observe a job as due (double
+    decay run) and the later save would clobber the earlier one's
+    timestamps. A blocked ticker waits, re-loads the fresh state, and sees
+    the job as no longer due."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = Path(os.path.expanduser(state_path)).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 @dataclass
@@ -121,9 +153,15 @@ class MaintenanceScheduler:
 
         Accepts an optional ``now`` timestamp so tests can step time without
         sleeping.  Each job is wrapped in try/except so one failure never
-        prevents the other from running.
+        prevents the other from running.  The whole load→run→save cycle
+        holds a cross-process file lock, so concurrent tickers (daemon,
+        cron, MCP tool) serialise instead of double-running jobs.
         """
         t = now if now is not None else time.time()
+        with _state_lock(self.state_path):
+            return self._tick_locked(t)
+
+    def _tick_locked(self, t: float) -> TickResult:
         state = MaintenanceState.load(self.state_path)
         result = TickResult()
 

@@ -229,19 +229,22 @@ def _forget(store: MemoryStore, m, q, b):
 def _edit(store: MemoryStore, m, q, b):
     if not b:
         raise HttpError(400, "empty edit: provide at least one field")
+    # Uniform null semantics: null means "leave unchanged" for every field
+    # except `source`, where null explicitly clears (matching the store's
+    # sentinel-based edit()). An explicit [] clears tags.
     kwargs: dict[str, Any] = {}
-    if "text" in b:
+    if b.get("text") is not None:
         kwargs["text"] = b["text"]
-    if "type" in b:
+    if b.get("type") is not None:
         kwargs["type"] = b["type"]
-    if "tags" in b:
-        kwargs["tags"] = b["tags"] or []
-    if "importance" in b:
+    if b.get("tags") is not None:
+        kwargs["tags"] = b["tags"]
+    if b.get("importance") is not None:
         kwargs["importance"] = _body_float(b, "importance")
-    if "polarity" in b:
+    if b.get("polarity") is not None:
         kwargs["polarity"] = _body_int(b, "polarity", 0)
     if "source" in b:
-        kwargs["source"] = b["source"]  # null clears the source
+        kwargs["source"] = b["source"]
     if not kwargs:
         raise HttpError(400, "no editable fields in body")
     try:
