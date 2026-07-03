@@ -182,8 +182,6 @@ def test_undo_unlink_restores_all_parallel_rels(store: MemoryStore) -> None:
 
 def test_undo_unlink_legacy_entry_without_removed_rels(store: MemoryStore) -> None:
     """Entries journaled before removed_rels existed fall back to meta.rel."""
-    from ai_houkai.memory_system.journal import JournalEntry
-
     a = store.remember("legacy src")
     b = store.remember("legacy dst")
     store.link(a.id, b.id, rel="refines")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 import pytest_asyncio
@@ -183,15 +184,12 @@ class TestCloseOrdering:
     def test_close_drains_executor_before_closing_client(self, tmp_path):
         """Regression: close() used to close the Chroma client first, so a
         queued job could run against a closed connection."""
-        import time as _time
-        from ai_houkai.memory_system import AsyncMemoryStore
-
         astore = AsyncMemoryStore(
             path=str(tmp_path / "chroma"), collection="close_order")
         outcome = {}
 
         def slow_count():
-            _time.sleep(0.3)                    # still queued when close() starts
+            time.sleep(0.3)                    # still queued when close() starts
             outcome["count"] = astore.sync.count()
 
         astore._executor.submit(slow_count)
