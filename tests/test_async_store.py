@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 import pytest_asyncio
@@ -177,3 +178,20 @@ class TestAsyncConcurrency:
 
         hits = asyncio.get_event_loop().run_until_complete(_inner())
         assert len(hits) >= 1
+
+
+class TestCloseOrdering:
+    def test_close_drains_executor_before_closing_client(self, tmp_path):
+        """Regression: close() used to close the Chroma client first, so a
+        queued job could run against a closed connection."""
+        astore = AsyncMemoryStore(
+            path=str(tmp_path / "chroma"), collection="close_order")
+        outcome = {}
+
+        def slow_count():
+            time.sleep(0.3)                    # still queued when close() starts
+            outcome["count"] = astore.sync.count()
+
+        astore._executor.submit(slow_count)
+        astore.close()                          # must wait, then close client
+        assert outcome.get("count") == 0        # job ran against a live client

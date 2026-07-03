@@ -407,3 +407,21 @@ def test_nuke_requires_confirmation(tmp_path):
 
     result2 = _invoke(["list", "--format", "json"], store_path)
     assert len(json.loads(result2.output)) == 1
+
+
+def test_graph_json_edges_use_full_ids(tmp_path):
+    """Regression: edges carried 8-char id prefixes while nodes carried full
+    ids, making the JSON unjoinable for machine consumers."""
+    store_path = str(tmp_path / "chroma")
+    a = _first_uuid(_invoke(["remember", "graph json node a"], store_path).output)
+    b = _first_uuid(_invoke(["remember", "graph json node b"], store_path).output)
+    _invoke(["link", a, b, "--rel", "refines"], store_path)
+
+    result = _invoke(["graph", a, "--format", "json"], store_path)
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output[result.output.index("{"):])
+    node_ids = {n["id"] for n in data["nodes"]}
+    for edge in data["edges"]:
+        assert len(edge["src"]) == _UUID_LEN
+        assert len(edge["dst"]) == _UUID_LEN
+        assert edge["src"] in node_ids and edge["dst"] in node_ids

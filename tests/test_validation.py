@@ -125,11 +125,12 @@ def _req(base, method, path, body=None, headers=None):
 
 
 class TestHttpCoercion:
-    def test_recall_null_k_is_400(self, server, store):
+    def test_recall_null_k_falls_back_to_default(self, server, store):
         store.remember("something")
         status, body = _req(server, "POST", "/recall", {"query": "x", "k": None})
         # null k falls back to the default rather than a TypeError-500
         assert status == 200
+        assert len(body["results"]) == 1
 
     def test_recall_garbage_k_is_400(self, server, store):
         store.remember("something")
@@ -299,7 +300,9 @@ class TestCliValidation:
         res = self._run(path, ["supersede", a.id,
                                "00000000-0000-4000-8000-000000000000"])
         assert res.exit_code == 1
-        assert "Traceback" not in res.output
+        # positive assertion: the store's KeyError surfaced as a clean message
+        # (CliRunner never shows tracebacks, so absence alone proves nothing)
+        assert "not found" in res.output
 
     def test_list_since_epoch_accepted(self, cli_store):
         store, path = cli_store
@@ -307,3 +310,63 @@ class TestCliValidation:
         res = self._run(path, ["list", "--since", "1751443200",
                                "--format", "json"])
         assert res.exit_code == 0, res.output
+
+
+class TestTagValidation:
+    """Regression: tags are stored comma-joined, so ['a,b'] round-tripped
+    as ['a', 'b'] — commas are now rejected at write time."""
+
+    def test_remember_rejects_comma_tag(self, store: MemoryStore):
+        with pytest.raises(ValueError, match="comma"):
+            store.remember("tagged", tags=["a,b"])
+
+    def test_edit_rejects_comma_tag(self, store: MemoryStore):
+        m = store.remember("tagged ok", tags=["fine"])
+        with pytest.raises(ValueError, match="comma"):
+            store.edit(m.id, tags=["still,broken"])
+        assert store._get_by_id(m.id).tags == ["fine"]
+
+    def test_normal_tags_unaffected(self, store: MemoryStore):
+        m = store.remember("tagged fine", tags=["a-b", "c_d", "e.f"])
+        assert store._get_by_id(m.id).tags == ["a-b", "c_d", "e.f"]
+
+
+class TestHttpPackCoercionAndFields:
+    def test_recall_pack_body_coercion(self, server, store):
+        store.remember("packable fact one")
+        status, body = _req(server, "POST", "/recall_pack",
+                            {"query": "packable", "token_budget": "500",
+                             "max_items": None, "include_superseded": "false",
+                             "mode": None})
+        assert status == 200
+        assert body["budget"] == 500
+
+    def test_recall_pack_garbage_budget_is_400(self, server, store):
+        store.remember("packable fact two")
+        status, body = _req(server, "POST", "/recall_pack",
+                            {"query": "x", "token_budget": "lots"})
+        assert status == 400
+        assert "token_budget" in body["error"]
+
+    def test_mem_dict_includes_polarity_and_superseded_at(self, server, store):
+        a = store.remember("polar fact", polarity=1)
+        b = store.remember("newer polar fact")
+        store.supersede(old_id=a.id, new_id=b.id)
+        status, body = _req(server, "GET", f"/memories/{a.id}")
+        assert status == 200
+        assert body["polarity"] == 1
+        assert body["superseded_by"] == b.id
+        assert body["superseded_at"] is not None
+
+    def test_self_link_is_400_not_404(self, server, store):
+        a = store.remember("selfish")
+        status, body = _req(server, "POST", "/links",
+                            {"src_id": a.id, "dst_id": a.id})
+        assert status == 400
+        assert "itself" in body["error"]
+
+    def test_self_supersede_is_400_not_404(self, server, store):
+        a = store.remember("selfish two")
+        status, body = _req(server, "POST", "/supersede",
+                            {"old_id": a.id, "new_id": a.id})
+        assert status == 400

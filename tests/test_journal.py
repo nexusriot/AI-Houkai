@@ -161,3 +161,34 @@ def test_read_filters(store: MemoryStore) -> None:
     by_id = list(store.journal.read(memory_id=a.id))
     assert len(by_id) == 1
     assert by_id[0].op == "remember"
+
+
+def test_undo_unlink_restores_all_parallel_rels(store: MemoryStore) -> None:
+    """Regression: unlink(rel=None) removing several differently-typed edges
+    used to undo as a single 'related' link."""
+    a = store.remember("undo src")
+    b = store.remember("undo dst")
+    store.link(a.id, b.id, rel="related")
+    store.link(a.id, b.id, rel="example_of")
+    assert store.unlink(a.id, b.id, rel=None) == 2
+
+    entry = list(store.journal.read(op="unlink"))[-1]
+    assert entry.meta["removed_rels"] == ["related", "example_of"]
+    assert store.undo(entry) is True
+
+    restored = sorted(l.rel for l in store._get_by_id(a.id).links if l.to == b.id)
+    assert restored == ["example_of", "related"]
+
+
+def test_undo_unlink_legacy_entry_without_removed_rels(store: MemoryStore) -> None:
+    """Entries journaled before removed_rels existed fall back to meta.rel."""
+    a = store.remember("legacy src")
+    b = store.remember("legacy dst")
+    store.link(a.id, b.id, rel="refines")
+    store.unlink(a.id, b.id, rel="refines")
+    legacy = JournalEntry(
+        ts=1.0, op="unlink", actor="lib", id=a.id, before=None, after=None,
+        meta={"src_id": a.id, "dst_id": b.id, "rel": "refines", "removed": 1},
+    )
+    assert store.undo(legacy) is True
+    assert [l.rel for l in store._get_by_id(a.id).links if l.to == b.id] == ["refines"]

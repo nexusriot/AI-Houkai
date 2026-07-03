@@ -57,6 +57,17 @@ def _validate_choice(value: object, allowed: tuple[str, ...], param: str) -> Non
         )
 
 
+def _validate_tags(tags: list[str]) -> None:
+    """Tags are stored comma-joined in Chroma metadata, so a comma inside a
+    tag would silently split it into two on the next read."""
+    for t in tags:
+        if "," in t:
+            raise ValueError(
+                f"tags must not contain commas — got {t!r} "
+                f"(tags are stored as a comma-joined string)"
+            )
+
+
 @functools.lru_cache(maxsize=None)
 def _get_embed_fn(model_name: str):
     """Return a cached embedding function for *model_name*.
@@ -607,6 +618,8 @@ class MemoryStore:
             raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
         if on_conflict is not None:
             _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
+        tags = list(tags)
+        _validate_tags(tags)
         # importance=None → auto-score when an importance_fn is configured,
         # else keep the historical 0.5 default.
         if importance is None:
@@ -704,7 +717,9 @@ class MemoryStore:
         if importance is not None:
             mem.importance = max(0.0, min(1.0, float(importance)))
         if tags is not None:
-            mem.tags = list(tags)
+            new_tags = list(tags)
+            _validate_tags(new_tags)
+            mem.tags = new_tags
         if source is not self._UNSET:
             mem.source = source
         text_changed = False
@@ -1203,28 +1218,30 @@ class MemoryStore:
     def unlink(self, src_id: str, dst_id: str, rel: str | None = None) -> int:
         """Remove link(s) from src to dst. *rel=None* removes all rels.
         Returns number of links removed."""
-        removed = self._unlink_raw(src_id, dst_id, rel)
-        if removed > 0:
+        removed_rels = self._unlink_raw(src_id, dst_id, rel)
+        if removed_rels:
+            # removed_rels is what makes the entry undoable: a rel=None
+            # unlink may drop several differently-typed edges at once.
             self._journal(
                 "unlink", src_id,
-                meta={"src_id": src_id, "dst_id": dst_id,
-                      "rel": rel, "removed": removed},
+                meta={"src_id": src_id, "dst_id": dst_id, "rel": rel,
+                      "removed": len(removed_rels),
+                      "removed_rels": removed_rels},
             )
-        return removed
+        return len(removed_rels)
 
-    def _unlink_raw(self, src_id: str, dst_id: str, rel: str | None) -> int:
+    def _unlink_raw(self, src_id: str, dst_id: str, rel: str | None) -> list[str]:
+        """Remove matching links without journaling. Returns the removed rels."""
         if rel is not None:
             _validate_choice(rel, LINK_RELS, "rel")
         src = self._get_by_id(src_id)
         if src is None:
-            return 0
-        before = len(src.links)
-        if rel is None:
-            src.links = [l for l in src.links if l.to != dst_id]
-        else:
-            src.links = [l for l in src.links if not (l.to == dst_id and l.rel == rel)]
-        removed = before - len(src.links)
-        if removed > 0:
+            return []
+        removed = [l.rel for l in src.links
+                   if l.to == dst_id and (rel is None or l.rel == rel)]
+        if removed:
+            src.links = [l for l in src.links
+                         if not (l.to == dst_id and (rel is None or l.rel == rel))]
             self.collection.update(ids=[src_id], metadatas=[src.to_metadata()])
         return removed
 
@@ -1261,22 +1278,30 @@ class MemoryStore:
                             if lnk.to in visited:
                                 continue
                             target = self._get_by_id(lnk.to)
-                            if target is not None:
-                                result.append((target, lnk.rel))
-                                visited.add(lnk.to)
-                                next_frontier.append(lnk.to)
+                            if target is None:
+                                continue
+                            # Two memories may be joined by several
+                            # differently-typed edges — report each rel,
+                            # but visit/expand the node only once.
+                            for parallel in mem.links:
+                                if parallel.to == lnk.to and (
+                                        rel is None or parallel.rel == rel):
+                                    result.append((target, parallel.rel))
+                            visited.add(lnk.to)
+                            next_frontier.append(lnk.to)
                 if direction in ("in", "both"):
                     for candidate in self._get_all_memories():
                         if candidate.id in visited:
                             continue
-                        for lnk in candidate.links:
-                            if lnk.to == mid:
-                                if rel is not None and lnk.rel != rel:
-                                    continue
-                                result.append((candidate, lnk.rel))
-                                visited.add(candidate.id)
-                                next_frontier.append(candidate.id)
-                                break
+                        matched_rels = [
+                            lnk.rel for lnk in candidate.links
+                            if lnk.to == mid and (rel is None or lnk.rel == rel)
+                        ]
+                        if matched_rels:
+                            for r in matched_rels:
+                                result.append((candidate, r))
+                            visited.add(candidate.id)
+                            next_frontier.append(candidate.id)
             frontier = next_frontier
             if not frontier:
                 break
@@ -1292,16 +1317,23 @@ class MemoryStore:
         """Return a Graph of memories reachable from *memory_ids* within *depth* hops."""
         nodes: dict[str, Memory] = {}
         edges: list[tuple[str, str, str]] = []
-        visited: set[str] = set()
+        # Best remaining budget seen per node — a plain visited set would
+        # truncate diamonds: a node first reached with 0 remaining hops was
+        # never expanded again when a shorter path reached it with budget
+        # to spare (e.g. a→b→c, a→c, c→d at depth 2 lost c→d and d).
+        best_remaining: dict[str, int] = {}
 
         def _visit(mid: str, remaining: int) -> None:
-            if mid in visited:
+            prev = best_remaining.get(mid)
+            if prev is not None and prev >= remaining:
                 return
-            visited.add(mid)
-            mem = self._get_by_id(mid)
+            best_remaining[mid] = remaining
+            mem = nodes.get(mid)
             if mem is None:
-                return
-            nodes[mid] = mem
+                fetched = self._get_by_id(mid)
+                if fetched is None:
+                    return
+                nodes[mid] = mem = fetched
             if remaining > 0:
                 for lnk in mem.links:
                     edge = (mid, lnk.to, lnk.rel)
@@ -1621,18 +1653,24 @@ class MemoryStore:
             return bool(removed)
 
         if entry.op == "unlink":
+            src = entry.meta.get("src_id", entry.id)
+            dst = entry.meta.get("dst_id", "")
+            # A rel=None unlink may have removed several differently-typed
+            # edges; meta["removed_rels"] records them. Entries written
+            # before that field existed fall back to the single rel.
+            rels = entry.meta.get("removed_rels") \
+                or [entry.meta.get("rel") or "related"]
+            added_any = False
             try:
-                added = self._link_raw(
-                    entry.meta.get("src_id", entry.id),
-                    entry.meta.get("dst_id", ""),
-                    entry.meta.get("rel") or "related",
-                )
+                for r in rels:
+                    if self._link_raw(src, dst, r):
+                        added_any = True
             except KeyError:
                 return False  # an endpoint has since been forgotten
-            if added:
+            if added_any:
                 self._journal("undo", entry.id,
                               meta={"of": entry.ts, "of_op": entry.op})
-            return added
+            return added_any
 
         # reflect / decay / import / export / undo themselves: not undoable
         return False

@@ -133,7 +133,7 @@ def verify() -> None:
         mod = importlib.util.module_from_spec(spec)  # type: ignore
         spec.loader.exec_module(mod)  # type: ignore
 
-        count = mod.store.count()
+        count = mod.get_store().count()
         print(f"  ✓  MCP server importable  |  memory count = {count}")
 
         tools = ["remember", "recall", "forget", "list_recent", "stats"]
