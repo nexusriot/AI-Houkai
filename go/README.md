@@ -88,7 +88,7 @@ houkai install                          # patches ~/.claude/settings.json
 houkai install --project                # → ./.claude/settings.json
 ```
 
-After restarting Claude Code, fifteen `mcp__ai-houkai__*` tools become
+After restarting Claude Code, seventeen `mcp__ai-houkai__*` tools become
 available. Cursor and OpenCode are supported too — see
 [Other MCP clients](#other-mcp-clients).
 
@@ -135,7 +135,7 @@ Notes:
 - Restart Claude Code (or run `/mcp` and re-add the server) for it to pick
   up the change. To verify the binary works in isolation, run
   `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ai-houkai-mcp`
-  — you should see the fifteen tool definitions on stdout.
+  — you should see the seventeen tool definitions on stdout.
 
 To print the exact block the installer would write without touching any
 file, run `houkai install --print`.
@@ -264,7 +264,7 @@ houkai install <client> --verify  # smoke-test binary + registration
 ### Capturing memories
 
 ```bash
-# simplest — defaults to type=episodic, importance=0.5
+# simplest — defaults to type=semantic, importance=0.5 (default_type in config.toml)
 houkai remember "Vlad prefers tabs over spaces in Go"
 
 # tagged + higher importance
@@ -492,6 +492,7 @@ Endpoints (all JSON in / JSON out):
 | `GET /memories?limit=&include_superseded=`             | recent memories                                  |
 | `POST /memories`                                       | store a memory (`remember`) → 201, or 409        |
 | `GET /memories/{id}`                                   | fetch one                                        |
+| `PATCH /memories/{id}`                                 | edit fields in place (journaled)                 |
 | `DELETE /memories/{id}`                                | forget one                                       |
 | `GET /memories/{id}/neighbors?rel=&direction=&depth=`  | linked memories                                  |
 | `GET\|POST /recall`                                    | search — supports `source`, `since`, `until`     |
@@ -656,10 +657,10 @@ internal/
   embed/            Embedder interface + Ollama/OpenAI/DigitalOcean clients
   decay/            Time-based pruning engine
   reflect/          Episodic → semantic clustering
-  maintenance/      Background daemon (prune + reflect on a ticker)
+  maintenance/      Schedule-gated prune + reflect ticks (flock-guarded state)
   ingest/           Deterministic chunking for bulk ingestion
   tui/              Bubble Tea memory browser (navigator + view-models)
-  mcpserver/        16 MCP tool definitions
+  mcpserver/        17 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
   installer/        config patchers for Claude Code, Cursor, OpenCode
   version/          ldflags-injected build info
@@ -702,14 +703,32 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The Go port exposes **16 MCP tools** — `remember`, `recall`, `recall_pack`,
-`auto_context`, `forget`, `list_recent`, `stats`, `link`, `unlink`,
+The Go port exposes **17 MCP tools** — `remember`, `recall`, `recall_pack`,
+`auto_context`, `forget`, `edit`, `list_recent`, `stats`, `link`, `unlink`,
 `neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`,
 `export`, `import`. This matches the Python reference port, including the
 advanced retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`,
 diversity/MMR, `dedup_threshold`, `min_cosine`, `touch`, `explain`, and
 `recall_pack` compression) and the `auto_context` fan-out tool. The tools
 keep the same names and behaviour, so existing clients keep working.
+
+Behavioural parity notes (all matching Python):
+
+- The default memory type is **`semantic`** everywhere — the store, MCP
+  `remember`, HTTP `POST /memories`, and the CLI's `default_type` config
+  default. Rows persisted without a type also read back as `semantic`.
+- Enum-ish inputs (`type`, `rel`, `mode`, `fusion`, `on_conflict`,
+  `direction`, import policy) are validated against closed vocabularies;
+  polarity must be -1/0/+1 and tags must not contain commas. Bad values are
+  rejected with a descriptive error (HTTP maps them to `400`) instead of
+  silently degrading.
+- `importance` distinguishes *unset* from an explicit `0`: omitting it uses
+  the configured default (or the auto-importance heuristic), while an
+  explicit value — including `0` — is honoured and clamped to `[0, 1]`.
+- `edit` (MCP tool, `PATCH /memories/{id}`, and the CLI `edit`/`tag`/`bump`
+  commands) updates fields in place, preserves links/supersede state/access
+  tracking, re-embeds on text changes, and is journaled so `journal undo`
+  can reverse it.
 
 The audit journal is enabled by default in both ports and uses the same
 JSONL line format, so a journal written by one binary can be read by the

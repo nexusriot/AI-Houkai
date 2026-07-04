@@ -51,7 +51,9 @@ def recent_view(store: MemoryStore, limit: int = 200) -> View:
 
 
 def search_view(store: MemoryStore, query: str, k: int = 50) -> View:
-    results = store.recall(query, k=k)
+    # touch=False: browsing the TUI must not inflate access stats — recall
+    # reinforcement (frequency_weight) would otherwise reward every keystroke.
+    results = store.recall(query, k=k, touch=False)
     return View(
         kind="search",
         title=f"Search: {query!r} ({len(results)})",

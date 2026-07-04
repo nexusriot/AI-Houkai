@@ -6,7 +6,7 @@ Run with:
 
 Tools exposed (17):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
-    edit(memory_id, text?, type?, tags?, importance?, polarity?, source?)
+    edit(memory_id, text?, type?, tags?, importance?, polarity?, source?, clear_source?)
     recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?)
     recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?, compress?, compress_threshold?, compress_min_group?)
     auto_context(task, token_budget?, max_phrases?, mode?)
@@ -36,7 +36,11 @@ from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.cli.config import load_maintenance
 from ai_houkai.memory_system import MemoryStore
 from ai_houkai.memory_system.importance import score_importance
-from ai_houkai.memory_system.store import ConflictError, HybridWeights, extract_key_phrases
+from ai_houkai.memory_system.store import (
+    ConflictError,
+    ImportConflictError,
+    extract_key_phrases,
+)
 from ai_houkai.memory_system.summarizers import build_summarizer
 from ai_houkai.timeparse import parse_timestamp
 
@@ -291,6 +295,7 @@ def edit(
     importance: float | None = None,
     polarity: int | None = None,
     source: str | None = None,
+    clear_source: bool = False,
 ) -> dict[str, Any]:
     """Update fields of an existing memory in place, keeping its id.
 
@@ -298,7 +303,12 @@ def edit(
     supersede state, and access tracking are preserved (do NOT forget+remember
     to fix a typo — that loses them). The change is journaled and undoable.
     type: episodic | semantic | procedural | feedback.
+    clear_source: true removes the provenance string (an omitted `source`
+    otherwise means "leave unchanged"); do not combine with `source`.
     """
+    if clear_source and source is not None:
+        return {"ok": False,
+                "error": "pass either source or clear_source, not both"}
     kwargs: dict[str, Any] = {}
     if text is not None:
         kwargs["text"] = text
@@ -312,6 +322,8 @@ def edit(
         kwargs["polarity"] = polarity
     if source is not None:
         kwargs["source"] = source
+    if clear_source:
+        kwargs["source"] = None
     try:
         mem = get_store().edit(memory_id, **kwargs)
     except (KeyError, ValueError) as e:
@@ -464,9 +476,24 @@ def maintenance_tick(
         create, writes nothing). Omit to use the config file's
         [maintenance.reflect] apply setting (default False).
 
+    When [maintenance].enabled = false in the config, nothing runs and the
+    result reports enabled=false.
+
     Returns a summary dict with counts and any errors.
     """
     mcfg = load_maintenance()
+    if not mcfg.enabled:
+        return {
+            "enabled": False,
+            "summary": "maintenance disabled ([maintenance].enabled = false)",
+            "ran_decay": False,
+            "ran_reflect": False,
+            "decayed": 0,
+            "reflected": 0,
+            "reflect_applied": False,
+            "decay_error": None,
+            "reflect_error": None,
+        }
     if reflect_apply is None:
         reflect_apply = mcfg.reflect_apply
     sched = MaintenanceScheduler(
@@ -481,10 +508,12 @@ def maintenance_tick(
         frequency_weight=mcfg.frequency_weight,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=reflect_apply,
+        reflect_consolidate=mcfg.reflect_consolidate,
         summarizer=build_summarizer(mcfg.summarizer),
     )
     result = sched.tick()
     return {
+        "enabled": True,
         "summary": result.summary(),
         "ran_decay": result.ran_decay,
         "ran_reflect": result.ran_reflect,
@@ -564,7 +593,7 @@ def import_(
             regenerate_vectors=regenerate_vectors,
             dry_run=dry_run,
         )
-    except (ImportError, FileNotFoundError) as e:
+    except (ImportError, ImportConflictError, FileNotFoundError) as e:
         return {"ok": False, "error": str(e)}
     return {
         "ok": True,

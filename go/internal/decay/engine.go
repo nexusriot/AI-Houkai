@@ -3,7 +3,6 @@ package decay
 import (
 	"context"
 	"math"
-	"sort"
 	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
@@ -56,11 +55,6 @@ func New(store Storable, decayRate, minScore float32, protectTypes []memory.Memo
 	}
 }
 
-// Score returns the decay score for a single memory.
-func (e *Engine) Score(m memory.Memory) float32 {
-	return e.scoreAt(m, time.Now())
-}
-
 func (e *Engine) scoreAt(m memory.Memory, now time.Time) float32 {
 	lastAccess := time.Unix(int64(m.LastAccessed), 0)
 	days := float32(now.Sub(lastAccess).Hours() / 24)
@@ -73,28 +67,6 @@ func (e *Engine) scoreAt(m memory.Memory, now time.Time) float32 {
 		base *= 1 + e.FrequencyWeight*float32(math.Log1p(float64(count)))
 	}
 	return base
-}
-
-type ScoredMemory struct {
-	memory.Memory
-	DecayScore float32
-}
-
-// ScoreAll returns all memories with their decay scores, sorted descending.
-func (e *Engine) ScoreAll(ctx context.Context) ([]ScoredMemory, error) {
-	mems, err := e.store.ListRecent(ctx, 0, false)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	scored := make([]ScoredMemory, len(mems))
-	for i, m := range mems {
-		scored[i] = ScoredMemory{Memory: m, DecayScore: e.scoreAt(m, now)}
-	}
-	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].DecayScore > scored[j].DecayScore
-	})
-	return scored, nil
 }
 
 // Prune removes memories below MinScore (unless protected). Returns pruned IDs.

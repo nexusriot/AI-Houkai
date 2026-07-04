@@ -281,7 +281,7 @@ func TestRecallPackReturnsBlock(t *testing.T) {
 func TestAutoContextEndpoint(t *testing.T) {
 	ts, store := newTestServer(t, "")
 	ctx := context.Background()
-	store.Remember(ctx, "deployment pipeline runbook and rollback", memory.RememberOpts{Type: memory.Procedural, Importance: 0.9})
+	store.Remember(ctx, "deployment pipeline runbook and rollback", memory.RememberOpts{Type: memory.Procedural, Importance: memory.Float32Ptr(0.9)})
 
 	body := bytes.NewBufferString(`{"task":"the deployment pipeline failed","token_budget":800}`)
 	resp, err := http.Post(ts.URL+"/auto_context", "application/json", body)

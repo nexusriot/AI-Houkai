@@ -152,19 +152,18 @@ func TestLinkUnknownSrcIs404(t *testing.T) {
 	}
 }
 
-// TestLinkUnknownDstSucceeds pins the CURRENT behavior: linkRaw only checks the
-// source memory exists, so a link to a non-existent destination is accepted
-// (returns 200). This is a latent bug (dangling edges are allowed) — recorded
-// in bugs_found; the test asserts today's behavior so the suite stays green.
-func TestLinkUnknownDstSucceeds(t *testing.T) {
+// A link to a non-existent destination is rejected: graph walkers skip
+// targets that don't resolve, so a dangling edge would be stored but
+// unreachable (matches Python, which raises for an unknown dst).
+func TestLinkUnknownDstRejected(t *testing.T) {
 	ts, _ := newTestServer(t, "")
 	a := rememberHTTP(t, ts.URL, `{"text":"real memory here","type":"semantic"}`)
 	resp := postJSON(t, ts.URL, "/links", fmt.Sprintf(`{"src_id":%q,"dst_id":"does-not-exist"}`, a))
-	if resp.StatusCode != 200 {
-		t.Errorf("link to unknown dst = %d, want 200 (current behavior)", resp.StatusCode)
+	if resp.StatusCode != 404 {
+		t.Errorf("link to unknown dst = %d, want 404", resp.StatusCode)
 	}
-	if body := decode(t, resp); body["ok"] != true {
-		t.Errorf("link-to-unknown-dst body = %v, want ok:true", body)
+	if body := decode(t, resp); body["error"] == nil {
+		t.Errorf("link-to-unknown-dst body = %v, want an error message", body)
 	}
 }
 

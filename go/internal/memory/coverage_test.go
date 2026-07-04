@@ -161,20 +161,25 @@ func TestNeighborsInAndBoth(t *testing.T) {
 		t.Errorf("Neighbors(b, both) should include a, got %+v", both)
 	}
 
-	// A rel filter that does not match must exclude the incoming edge.
-	none, err := store.Neighbors(ctx, b, "nonexistent", "in", 1)
+	// A valid rel filter that does not match must exclude the incoming edge.
+	none, err := store.Neighbors(ctx, b, RelContradicts, "in", 1)
 	if err != nil {
 		t.Fatalf("Neighbors in filtered: %v", err)
 	}
 	if len(none) != 0 {
 		t.Errorf("rel filter should exclude non-matching incoming edge, got %+v", none)
 	}
+
+	// An unknown rel is rejected outright (closed vocabulary).
+	if _, err := store.Neighbors(ctx, b, "nonexistent", "in", 1); !IsValidationError(err) {
+		t.Errorf("Neighbors(rel=nonexistent) err = %v, want ValidationError", err)
+	}
 }
 
 func TestUpdateMemoryMetadataOnly(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	id, _, _, _ := mustRemember(t, store, "original text here", RememberOpts{Importance: 0.4})
+	id, _, _, _ := mustRemember(t, store, "original text here", RememberOpts{Importance: Float32Ptr(0.4)})
 
 	m, err := store.GetByID(ctx, id)
 	if err != nil {

@@ -12,9 +12,10 @@ Routes (all JSON in / JSON out):
     DELETE /memories/{id}                  forget one memory
     GET    /memories/{id}/neighbors?rel=&direction=&depth=
                                            linked memories
-    GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=
+    GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=&overfetch=
     POST   /recall                         same, via JSON body
     POST   /recall_pack                    token-budgeted context block
+    POST   /auto_context                   multi-angle context block (auto_context_pack)
     POST   /links        {src_id,dst_id,rel?}      add a directed link
     POST   /unlink       {src_id,dst_id,rel?}      remove link(s)
     POST   /supersede    {old_id,new_id}           soft-delete + supersede link
@@ -41,7 +42,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from ai_houkai.memory_system import MemoryStore
-from ai_houkai.memory_system.store import ConflictError
+from ai_houkai.memory_system.store import ConflictError, extract_key_phrases
 from ai_houkai.timeparse import parse_timestamp
 
 
@@ -156,6 +157,23 @@ def _body_bool(body: dict[str, Any], key: str, default: bool = False) -> bool:
     raise HttpError(400, f"{key}: {v!r} is not a valid boolean")
 
 
+def _body_tags(body: dict[str, Any], key: str = "tags") -> list[str]:
+    """Coerce a JSON tags value to a list of strings.
+
+    A lone string becomes a one-element list — passing it through raw would
+    iterate the string and store every character as its own tag. Anything
+    other than a string / list of strings is a 400.
+    """
+    v = body.get(key)
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list) and all(isinstance(t, str) for t in v):
+        return v
+    raise HttpError(400, f"{key}: must be a string or a list of strings")
+
+
 def _time(value: Any) -> Optional[float]:
     try:
         return parse_timestamp(value)
@@ -194,7 +212,7 @@ def _remember(store: MemoryStore, m, q, b):
         mem = store.remember(
             text=text,
             type=b.get("type", "semantic"),
-            tags=b.get("tags") or [],
+            tags=_body_tags(b),
             importance=_body_float(b, "importance"),
             source=b.get("source"),
             polarity=_body_int(b, "polarity", 0),
@@ -238,7 +256,7 @@ def _edit(store: MemoryStore, m, q, b):
     if b.get("type") is not None:
         kwargs["type"] = b["type"]
     if b.get("tags") is not None:
-        kwargs["tags"] = b["tags"]
+        kwargs["tags"] = _body_tags(b)
     if b.get("importance") is not None:
         kwargs["importance"] = _body_float(b, "importance")
     if b.get("polarity") is not None:
@@ -278,6 +296,7 @@ def _recall_params(q, b):
             "since": _time(get("since")),
             "until": _time(get("until")),
             "mode": get("mode") or "semantic",
+            "overfetch": _body_int(b, "overfetch", 4),
             "include_superseded": _body_bool(b, "include_superseded"),
         }
     query = _qs_one(q, "query")
@@ -293,6 +312,7 @@ def _recall_params(q, b):
         "since": _time(_qs_one(q, "since")),
         "until": _time(_qs_one(q, "until")),
         "mode": _qs_one(q, "mode") or "semantic",
+        "overfetch": _as_int(_qs_one(q, "overfetch"), 4),
         "include_superseded": _as_bool(_qs_one(q, "include_superseded")),
     }
 
@@ -301,6 +321,25 @@ def _recall(store: MemoryStore, m, q, b):
     p = _recall_params(q, b)
     hits = store.recall(**p)
     return 200, {"results": [_hit_dict(mem, s) for mem, s in hits]}
+
+
+def _pack_payload(res: Any) -> dict[str, Any]:
+    """Shared response shape for /recall_pack and /auto_context."""
+    return {
+        "text": res.text,
+        "used_tokens": res.used_tokens,
+        "budget": res.budget,
+        "truncated": res.truncated,
+        "items": [
+            {**_mem_dict(p.memory), "score": round(p.score, 4), "tokens": p.tokens}
+            for p in res.items
+        ],
+        "compressed_groups": [
+            {"ids": [mem.id for mem in cg.memories], "text": cg.text,
+             "tokens": cg.tokens, "count": len(cg.memories)}
+            for cg in res.compressed_groups
+        ],
+    }
 
 
 def _recall_pack(store: MemoryStore, m, q, b):
@@ -314,20 +353,37 @@ def _recall_pack(store: MemoryStore, m, q, b):
         since=_time(b.get("since")),
         until=_time(b.get("until")),
         mode=b.get("mode") or "hybrid",
+        fusion=b.get("fusion") or "weighted",
+        diversity=_body_float(b, "diversity"),
+        dedup_threshold=_body_float(b, "dedup_threshold"),
+        min_cosine=_body_float(b, "min_cosine"),
         max_items=_body_int(b, "max_items", 50),
         include_superseded=_body_bool(b, "include_superseded"),
         header=b.get("header", "## Relevant memory"),
+        compress=_body_bool(b, "compress"),
+        compress_threshold=_body_float(b, "compress_threshold") or 0.30,
+        compress_min_group=_body_int(b, "compress_min_group", 2),
     )
-    return 200, {
-        "text": res.text,
-        "used_tokens": res.used_tokens,
-        "budget": res.budget,
-        "truncated": res.truncated,
-        "items": [
-            {**_mem_dict(p.memory), "score": round(p.score, 4), "tokens": p.tokens}
-            for p in res.items
-        ],
-    }
+    return 200, _pack_payload(res)
+
+
+def _auto_context(store: MemoryStore, m, q, b):
+    task = _require(b, "task")
+    res = store.auto_context_pack(
+        task=task,
+        token_budget=_body_int(b, "token_budget", 800),
+        max_phrases=_body_int(b, "max_phrases", 3),
+        mode=b.get("mode") or "hybrid",
+        min_cosine=_body_float(b, "min_cosine"),
+        header=b.get("header", "## Relevant memory"),
+        compress=_body_bool(b, "compress"),
+        compress_threshold=_body_float(b, "compress_threshold") or 0.30,
+        compress_min_group=_body_int(b, "compress_min_group", 2),
+    )
+    payload = _pack_payload(res)
+    payload["queries"] = [task] + extract_key_phrases(
+        task, _body_int(b, "max_phrases", 3))
+    return 200, payload
 
 
 def _link(store: MemoryStore, m, q, b):
@@ -382,6 +438,7 @@ _ROUTES: list[Route] = [
     ("GET",    re.compile(r"^/recall$"),                         _recall,      False),
     ("POST",   re.compile(r"^/recall$"),                         _recall,      True),
     ("POST",   re.compile(r"^/recall_pack$"),                    _recall_pack, True),
+    ("POST",   re.compile(r"^/auto_context$"),                   _auto_context, True),
     ("POST",   re.compile(r"^/links$"),                          _link,        True),
     ("POST",   re.compile(r"^/unlink$"),                         _unlink,      True),
     ("POST",   re.compile(r"^/supersede$"),                      _supersede,   True),
@@ -572,7 +629,8 @@ def run() -> None:
     serve(
         host=os.environ.get("AI_HOUKAI_HTTP_HOST", "127.0.0.1"),
         port=int(os.environ.get("AI_HOUKAI_HTTP_PORT", "8077")),
-        path=os.environ.get("AI_HOUKAI_PATH", "./.chroma"),
+        # expanduser: AI_HOUKAI_PATH=~/mem must not create a literal ./~ dir
+        path=os.path.expanduser(os.environ.get("AI_HOUKAI_PATH", "./.chroma")),
         collection=os.environ.get("AI_HOUKAI_COLLECTION", "ai_houkai"),
         auth_token=os.environ.get("AI_HOUKAI_HTTP_TOKEN") or None,
     )

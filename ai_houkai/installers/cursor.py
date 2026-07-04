@@ -12,7 +12,7 @@ Library use:
 
     from ai_houkai.installers import CursorInstaller
 
-    inst = CursorInstaller(memory_path="~/.ai_houkai")
+    inst = CursorInstaller(memory_path="~/.ai_houkai/.chroma")
     inst.install()                # patch ~/.cursor/mcp.json
     inst.print_config()           # preview the JSON block
     inst.verify()                 # smoke-test the server
@@ -45,7 +45,10 @@ from ai_houkai.installers.common import (
 
 GLOBAL_CONFIG_PATH  = os.path.expanduser("~/.cursor/mcp.json")
 PROJECT_CONFIG_PATH = os.path.join(".cursor", "mcp.json")
-DEFAULT_MEMORY_PATH = os.path.expanduser("~/.ai_houkai")
+# `.chroma` leaf matches the CLI default (~/.ai_houkai/.chroma) so `houkai
+# list` sees installed-client memories, and the store's journal.log lands in
+# ~/.ai_houkai/ instead of $HOME (it is written to the store path's parent).
+DEFAULT_MEMORY_PATH = os.path.expanduser("~/.ai_houkai/.chroma")
 DEFAULT_COLLECTION  = "cursor"
 SERVER_NAME         = "ai-houkai"
 

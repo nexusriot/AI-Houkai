@@ -30,7 +30,7 @@ func NewOpenAICompatible(apiKey, model, baseURL string) *OpenAIEmbedder {
 		APIKey:  apiKey,
 		Model:   model,
 		BaseURL: baseURL,
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: embedTimeout},
 	}
 }
 

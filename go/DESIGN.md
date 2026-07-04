@@ -253,24 +253,28 @@ boundary as Python's `tui/data.py` vs `tui/app.py`:
   synchronous (embedding a search query blocks the UI briefly — same
   trade-off as the Python version).
 
-### `internal/maintenance` — background daemon
+### `internal/maintenance` — scheduled ticks
 
-Goroutine ticker that calls `decay.Prune` (and optionally `reflect.Reflect`)
-on an interval. Cancel the parent `context.Context` to stop. Currently
-**unused by both binaries** — present so callers embedding the library can
-opt in, and so `maintenance_tick` can be a synchronous MCP tool that exposes
-the same logic on-demand. Worth wiring into `ai-houkai-mcp` later as an
-optional `--daemon` flag.
+One synchronous entry point: `maintenance.Tick(ctx, store, store, cfg,
+statePath, now)` runs a decay prune and (optionally) a reflection pass, then
+persists `State` (last-run timestamps + totals) to a JSON state file. Jobs
+are gated on a schedule (`DecayEvery` / `ReflectEvery`, seconds since the
+job's last recorded run — mirroring Python's `MaintenanceScheduler`), and the
+whole load→run→save cycle holds an exclusive **flock on `<state>.lock`** so a
+daemon loop, a cron `houkai maintenance tick`, and the MCP `maintenance_tick`
+tool can all target the same state file without double-running jobs. The CLI
+drives it via `houkai maintenance` (`tick`/`run`/`start`/`stop`/`status`) and
+`ai-houkai-mcp` wires the same config through `mcpserver.SetMaintenance`.
 
 ### `internal/mcpserver` — MCP surface
 
-Wraps `mark3labs/mcp-go`. Sixteen tools:
+Wraps `mark3labs/mcp-go`. Seventeen tools:
 
 ```
 remember        recall          recall_pack     auto_context    forget
-list_recent     stats           link            unlink          neighbors
-find_conflicts  supersede       maintenance_tick  journal_tail  export
-import
+edit            list_recent     stats           link            unlink
+neighbors       find_conflicts  supersede       maintenance_tick
+journal_tail    export          import
 ```
 
 Every handler converts inputs via `req.GetString/GetFloat/...`, calls the
@@ -278,7 +282,7 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-These 16 tools mirror the Python tool names so existing MCP clients keep
+These 17 tools mirror the Python tool names so existing MCP clients keep
 working, and the surface is back at full parity: the `auto_context` tool and
 the advanced `recall` / `recall_pack` parameters (`fusion=rrf`, diversity/MMR,
 `dedup_threshold`, `min_cosine`, `touch`, `explain`, `recall_pack`
@@ -293,10 +297,15 @@ binary payloads (the gzipped bytes) are kept off the JSON wire. `recall` /
 seconds, an ISO date/datetime, or a relative span like `"7d"`), and
 `maintenance_tick` accepts `frequency_weight` for recall reinforcement.
 
-`remember` treats a missing `importance` as 0 = unset, so the store's
-`ImportanceFn` (enabled via `default_importance = "auto"` or
-`AI_HOUKAI_AUTO_IMPORTANCE=1`) can auto-score it; the response echoes the
-resolved `importance`. `maintenance_tick`'s reflection step uses the
+`remember` passes `importance` through as a pointer: a missing value is
+`nil` = unset, so the store's `ImportanceFn` (enabled via
+`default_importance = "auto"` or `AI_HOUKAI_AUTO_IMPORTANCE=1`) can
+auto-score it, while an explicit value — **including `0`** — is honoured and
+clamped to `[0, 1]`; the response echoes the resolved `importance`. The
+default memory type is `semantic` (matching Python), and enum inputs are
+validated in the store, so a typo like `mode="hybird"` comes back as a
+descriptive error instead of silently degrading. `maintenance_tick` is
+schedule-gated through `SetMaintenance` (see `internal/maintenance`). `maintenance_tick`'s reflection step uses the
 summarizer spec injected at startup via `SetSummarizerSpec` (from the
 `summarizer` config key).
 
@@ -490,7 +499,7 @@ install or Homebrew tap distribution:
 - The maintenance daemon is exposed via the `houkai maintenance` command
   group (`tick` for a one-shot cron pass, `run` for a foreground loop, and
   `start`/`stop`/`status` for a detached pidfile-managed daemon that persists
-  a small JSON state file). It can also be embedded via `maintenance.Start`.
+  a small JSON state file). It can also be embedded via `maintenance.Tick`.
 
 ## Adding a new MCP tool
 

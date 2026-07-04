@@ -2,12 +2,12 @@ package memory
 
 // Standard relation vocabulary.
 const (
-	RelSupersedes   = "supersedes"
-	RelRefines      = "refines"
-	RelDerivedFrom  = "derived_from"
-	RelExampleOf    = "example_of"
-	RelContradicts  = "contradicts"
-	RelRelated      = "related"
+	RelSupersedes  = "supersedes"
+	RelRefines     = "refines"
+	RelDerivedFrom = "derived_from"
+	RelExampleOf   = "example_of"
+	RelContradicts = "contradicts"
+	RelRelated     = "related"
 )
 
 // addLink appends a link to m if not already present (idempotent by to+rel).

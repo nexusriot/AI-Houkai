@@ -47,12 +47,17 @@ class HoukaiTui(App):
         Binding("escape", "dismiss_search", show=False),
     ]
 
+    # How long the second X has to arrive; matches the warning toast timeout
+    # so the armed state never outlives the visible prompt.
+    NUKE_CONFIRM_SECONDS = 5.0
+
     def __init__(self, store: MemoryStore, collection: str = "") -> None:
         super().__init__()
         self.store = store
         self.nav = Navigator(store)
         self.sub_title = collection
         self._nuke_pending = False
+        self._nuke_timer = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -119,7 +124,7 @@ class HoukaiTui(App):
         self.query_one("#list", DataTable).focus()
 
     def action_neighbors(self) -> None:
-        self._nuke_pending = False
+        self._disarm_nuke()
         mem = self._selected_memory()
         if mem is None:
             return
@@ -131,16 +136,22 @@ class HoukaiTui(App):
         self._show_view(view)
 
     def action_back(self) -> None:
-        self._nuke_pending = False
+        self._disarm_nuke()
         self._show_view(self.nav.back())
 
     def action_recent(self) -> None:
-        self._nuke_pending = False
+        self._disarm_nuke()
         self._show_view(self.nav.open_recent())
+
+    def _disarm_nuke(self) -> None:
+        self._nuke_pending = False
+        if self._nuke_timer is not None:
+            self._nuke_timer.stop()
+            self._nuke_timer = None
 
     def action_nuke(self) -> None:
         if self._nuke_pending:
-            self._nuke_pending = False
+            self._disarm_nuke()
             deleted = self.store.nuke()
             self.notify(f"Nuked {deleted} memories.", severity="information")
             self._show_view(self.nav.open_recent())
@@ -150,8 +161,12 @@ class HoukaiTui(App):
                 self.notify("Collection is already empty.", severity="information")
                 return
             self._nuke_pending = True
+            # Disarm when the toast expires — a stray X minutes later must
+            # not nuke the store on the strength of a long-forgotten prompt.
+            self._nuke_timer = self.set_timer(
+                self.NUKE_CONFIRM_SECONDS, self._disarm_nuke)
             self.notify(
                 f"About to nuke all {count} memories. Press X again to confirm.",
                 severity="warning",
-                timeout=5,
+                timeout=self.NUKE_CONFIRM_SECONDS,
             )

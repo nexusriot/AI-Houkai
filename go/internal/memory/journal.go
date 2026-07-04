@@ -27,13 +27,13 @@ type JournalOp = string
 
 // JournalEntry is one line in the journal.
 type JournalEntry struct {
-	TS     float64                `json:"ts"`
-	Op     JournalOp              `json:"op"`
-	Actor  string                 `json:"actor"`
-	ID     string                 `json:"id"`
-	Before map[string]any         `json:"before,omitempty"`
-	After  map[string]any         `json:"after,omitempty"`
-	Meta   map[string]any         `json:"meta"`
+	TS     float64        `json:"ts"`
+	Op     JournalOp      `json:"op"`
+	Actor  string         `json:"actor"`
+	ID     string         `json:"id"`
+	Before map[string]any `json:"before,omitempty"`
+	After  map[string]any `json:"after,omitempty"`
+	Meta   map[string]any `json:"meta"`
 }
 
 // Summary returns a short human-readable description of the entry.

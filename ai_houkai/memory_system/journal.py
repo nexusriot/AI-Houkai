@@ -124,30 +124,38 @@ class Journal:
 
     def _rotate(self) -> None:
         stamp = time.strftime("%Y%m%dT%H%M%S")
-        archive = self.path.with_name(f"{self.path.stem}-{stamp}.log.gz")
-        if archive.exists():
-            archive = self.path.with_name(f"{self.path.stem}-{stamp}-{os.getpid()}.log.gz")
-        # Read+compress, then truncate the active file. A crash mid-rotation
-        # leaves both files; the next start ignores the half-written archive
-        # (gzip readers will fail; the active file is unaffected).
-        with open(self.path, "rb") as src, gzip.open(archive, "wb") as dst:
+        base = f"{self.path.stem}-{stamp}"
+        rotated = self.path.with_name(f"{base}.log")
+        archive = self.path.with_name(f"{base}.log.gz")
+        if rotated.exists() or archive.exists():
+            base = f"{base}-{os.getpid()}"
+            rotated = self.path.with_name(f"{base}.log")
+            archive = self.path.with_name(f"{base}.log.gz")
+        # Rename first (atomic), then compress the renamed file. Appends that
+        # land during/after the rename open the path fresh and so go to a new
+        # active file — the old compress-then-truncate order silently dropped
+        # any entry appended between the copy and the truncate. A crash
+        # mid-compression leaves the plain rotated file behind; read() still
+        # includes it, so no entries are lost either way.
+        os.rename(self.path, rotated)
+        with open(rotated, "rb") as src, gzip.open(archive, "wb") as dst:
             while True:
                 chunk = src.read(1024 * 1024)
                 if not chunk:
                     break
                 dst.write(chunk)
-        # Truncate in place so any concurrent writer's fd remains valid.
-        with open(self.path, "w", encoding="utf-8"):
-            pass
+        rotated.unlink()
 
     def _prune_archives(self) -> None:
         cutoff = time.time() - self.keep_days * 86_400
-        for p in self.path.parent.glob(f"{self.path.stem}-*.log.gz"):
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink()
-            except OSError:
-                continue
+        # `-*.log` covers plain rotated files orphaned by a crash mid-compression.
+        for pattern in (f"{self.path.stem}-*.log.gz", f"{self.path.stem}-*.log"):
+            for p in self.path.parent.glob(pattern):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    continue
 
     def read(
         self,
@@ -167,7 +175,12 @@ class Journal:
         """
         files: list[Path] = []
         if include_archives:
-            files.extend(sorted(self.path.parent.glob(f"{self.path.stem}-*.log.gz")))
+            # Plain `-*.log` files are rotations orphaned by a crash before
+            # compression finished — their entries are still valid history.
+            files.extend(sorted(
+                list(self.path.parent.glob(f"{self.path.stem}-*.log.gz"))
+                + list(self.path.parent.glob(f"{self.path.stem}-*.log"))
+            ))
         if self.path.exists():
             files.append(self.path)
 

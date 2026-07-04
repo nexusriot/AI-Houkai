@@ -125,7 +125,7 @@ func TestRememberUsesImportanceFn(t *testing.T) {
 	}
 
 	// Explicit value still wins.
-	m2, _, _, err := store.Remember(ctx, "Never do that other thing", RememberOpts{Importance: 0.2})
+	m2, _, _, err := store.Remember(ctx, "Never do that other thing", RememberOpts{Importance: Float32Ptr(0.2)})
 	if err != nil {
 		t.Fatal(err)
 	}

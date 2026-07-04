@@ -69,11 +69,6 @@ func RenderPrompt(memories []memory.Memory) string {
 	return fmt.Sprintf(PromptTemplate, strings.Join(lines, "\n"))
 }
 
-// DefaultSummarizer is the built-in extractive summarizer.
-func DefaultSummarizer(ctx context.Context, ms []memory.Memory) (string, error) {
-	return defaultSummarizer(ctx, ms)
-}
-
 var httpClient = &http.Client{Timeout: summarizerTimeout}
 
 func postJSON(ctx context.Context, url string, headers map[string]string, payload any) (map[string]any, error) {

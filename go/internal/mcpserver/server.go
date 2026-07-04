@@ -3,20 +3,19 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/nexusriot/ai-houkai/internal/decay"
+	"github.com/nexusriot/ai-houkai/internal/maintenance"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
 	"github.com/nexusriot/ai-houkai/internal/timeparse"
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 16 tools.
+// New wires up the MCP server with all 17 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -27,6 +26,7 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addRecallPack(s, store)
 	addAutoContext(s, store)
 	addForget(s, store)
+	addEdit(s, store)
 	addListRecent(s, store)
 	addStats(s, store, path, collection)
 	addLink(s, store)
@@ -99,25 +99,30 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 	tool := mcp.NewTool("remember",
 		mcp.WithDescription("Store a new memory. Returns {id, stored} or {stored:false, conflicts:[…]}."),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Memory content")),
-		mcp.WithString("type", mcp.Description("episodic|semantic|procedural|feedback (default: episodic)")),
+		mcp.WithString("type", mcp.Description("episodic|semantic|procedural|feedback (default: semantic)")),
 		mcp.WithArray("tags", mcp.Description("Topic labels")),
 		mcp.WithNumber("importance", mcp.Description("0.0–1.0; omit for the default (0.5, or a heuristic score when the server runs with AI_HOUKAI_AUTO_IMPORTANCE=1)")),
 		mcp.WithString("source", mcp.Description("Provenance label")),
-		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede|raise")),
+		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede|raise (default: store policy)")),
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
 	)
-	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(tool, rememberHandler(store))
+}
+
+// rememberHandler is exposed for tests.
+func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		text, err := req.RequireString("text")
 		if err != nil {
 			return errResult(err), nil
 		}
 		opts := memory.RememberOpts{
-			Type: memory.MemoryType(req.GetString("type", string(memory.Episodic))),
-			Tags: req.GetStringSlice("tags", nil),
-			// 0 = unset → store default or configured ImportanceFn.
-			Importance: float32(req.GetFloat("importance", 0)),
+			Type:       memory.MemoryType(req.GetString("type", string(memory.Semantic))),
+			Tags:       req.GetStringSlice("tags", nil),
+			Importance: optFloat32(req, "importance"), // nil = unset → store default / ImportanceFn
 			Source:     req.GetString("source", ""),
 			Polarity:   req.GetInt("polarity", 0),
+			OnConflict: memory.ConflictPolicy(req.GetString("on_conflict", "")),
 		}
 		m, stored, conflicts, err := store.Remember(ctx, text, opts)
 		if err != nil {
@@ -130,7 +135,7 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 			return jsonText(map[string]any{"stored": false, "conflicts": conflicts}), nil
 		}
 		return jsonText(map[string]any{"id": m.ID, "stored": true, "importance": m.Importance}), nil
-	})
+	}
 }
 
 func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
@@ -365,6 +370,71 @@ func addForget(s *server.MCPServer, store *memory.MemoryStore) {
 	})
 }
 
+func addEdit(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("edit",
+		mcp.WithDescription("Update fields of an existing memory in place, keeping its id. "+
+			"Omitted fields stay unchanged. Text changes are re-embedded; links, supersede state, "+
+			"and access tracking are preserved (do NOT forget+remember to fix a typo — that loses "+
+			"them). The change is journaled and undoable."),
+		mcp.WithString("memory_id", mcp.Required(), mcp.Description("Memory UUID or 8-char prefix")),
+		mcp.WithString("text", mcp.Description("New memory text (re-embedded)")),
+		mcp.WithString("type", mcp.Description("episodic|semantic|procedural|feedback")),
+		mcp.WithArray("tags", mcp.Description("Replacement tag list (empty list clears)")),
+		mcp.WithNumber("importance", mcp.Description("0.0–1.0")),
+		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
+		mcp.WithString("source", mcp.Description("Provenance label (empty string clears)")),
+	)
+	s.AddTool(tool, editHandler(store))
+}
+
+// editHandler is exposed for tests.
+func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("memory_id")
+		if err != nil {
+			return errResult(err), nil
+		}
+		var opts memory.EditOpts
+		args := req.GetArguments()
+		if v, ok := args["text"].(string); ok {
+			opts.Text = &v
+		}
+		if v, ok := args["type"].(string); ok {
+			mt := memory.MemoryType(v)
+			opts.Type = &mt
+		}
+		if _, ok := args["tags"]; ok {
+			tags := req.GetStringSlice("tags", nil)
+			if tags == nil {
+				tags = []string{}
+			}
+			opts.Tags = tags
+		}
+		opts.Importance = optFloat32(req, "importance")
+		if v, ok := args["polarity"].(float64); ok {
+			p := int(v)
+			opts.Polarity = &p
+		}
+		if v, ok := args["source"].(string); ok {
+			opts.Source = &v
+		}
+		m, err := store.Edit(ctx, id, opts)
+		if err != nil {
+			return jsonText(map[string]any{"ok": false, "error": err.Error()}), nil
+		}
+		return jsonText(map[string]any{
+			"ok":         true,
+			"id":         m.ID,
+			"text":       m.Text,
+			"type":       string(m.Type),
+			"tags":       m.Tags,
+			"importance": m.Importance,
+			"polarity":   m.Polarity,
+			"source":     m.Source,
+		}), nil
+	}
+}
+
 func addListRecent(s *server.MCPServer, store *memory.MemoryStore) {
 	tool := mcp.NewTool("list_recent",
 		mcp.WithDescription("List recently created memories."),
@@ -530,41 +600,69 @@ func addSupersede(s *server.MCPServer, store *memory.MemoryStore) {
 	})
 }
 
+// maintOpts holds the schedule configuration for the maintenance_tick tool,
+// wired in by the host process via SetMaintenance. When unset, the tool runs
+// ungated (no state file → every job is due, nothing is persisted).
+var maintOpts struct {
+	cfg       maintenance.Config
+	statePath string
+	set       bool
+}
+
+// SetMaintenance configures the schedule (decay_every/reflect_every gates)
+// and state path used by the maintenance_tick tool, mirroring Python's
+// config-driven MaintenanceScheduler.
+func SetMaintenance(cfg maintenance.Config, statePath string) {
+	maintOpts.cfg = cfg
+	maintOpts.statePath = statePath
+	maintOpts.set = true
+}
+
 func addMaintenanceTick(s *server.MCPServer, store *memory.MemoryStore) {
 	tool := mcp.NewTool("maintenance_tick",
-		mcp.WithDescription("Run a maintenance pass: prune decayed memories and optionally reflect."),
-		mcp.WithNumber("decay_rate", mcp.Description("Decay rate λ (default: 0.1)")),
-		mcp.WithNumber("min_score", mcp.Description("Prune threshold (default: 0.05)")),
-		mcp.WithNumber("frequency_weight", mcp.Description("Reinforcement: how strongly recall count resists decay (default: 0 = off)")),
-		mcp.WithBoolean("reflect", mcp.Description("Also run reflection (default: false)")),
-		mcp.WithString("consolidate", mcp.Description("Consolidate sources after reflection: none|soft|hard (default: none)")),
+		mcp.WithDescription("Run one maintenance tick: prune stale memories via decay and optionally "+
+			"consolidate episodic clusters via reflection. Jobs are gated on the configured schedule "+
+			"(decay_every/reflect_every) — they only run when their interval has elapsed since the "+
+			"last recorded run, so the tool is safe to call frequently."),
+		mcp.WithNumber("decay_rate", mcp.Description("Decay rate λ (default: from config, 0.1)")),
+		mcp.WithNumber("min_score", mcp.Description("Prune threshold (default: from config, 0.05)")),
+		mcp.WithNumber("frequency_weight", mcp.Description("Reinforcement: how strongly recall count resists decay (default: from config, 0 = off)")),
+		mcp.WithBoolean("reflect", mcp.Description("Also run reflection when due (default: from config, false)")),
+		mcp.WithString("consolidate", mcp.Description("Consolidate sources after reflection: none|soft|hard (default: from config, none)")),
 	)
-	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		decayRate := float32(req.GetFloat("decay_rate", 0.1))
-		minScore := float32(req.GetFloat("min_score", 0.05))
-		frequencyWeight := float32(req.GetFloat("frequency_weight", 0))
-		doReflect := req.GetBool("reflect", false)
-		consolidate := reflectpkg.ConsolidateModeFromString(req.GetString("consolidate", "none"))
+	s.AddTool(tool, maintenanceTickHandler(store))
+}
 
-		de := decay.New(store, decayRate, minScore, nil, frequencyWeight)
-		pruned, err := de.Prune(ctx, false)
-		if err != nil {
-			return errResult(fmt.Errorf("prune: %w", err)), nil
+// maintenanceTickHandler is exposed for tests.
+func maintenanceTickHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		cfg := maintOpts.cfg
+		if !maintOpts.set {
+			cfg = maintenance.Config{DecayRate: 0.1, MinScore: 0.05}
+		}
+		if cfg.Summarizer == nil {
+			cfg.Summarizer = buildSummarizer()
+		}
+		// Per-call overrides on top of the configured schedule.
+		cfg.DecayRate = float32(req.GetFloat("decay_rate", float64(cfg.DecayRate)))
+		cfg.MinScore = float32(req.GetFloat("min_score", float64(cfg.MinScore)))
+		cfg.FrequencyWeight = float32(req.GetFloat("frequency_weight", float64(cfg.FrequencyWeight)))
+		cfg.Reflect = req.GetBool("reflect", cfg.Reflect)
+		if v := req.GetString("consolidate", ""); v != "" {
+			cfg.Consolidate = reflectpkg.ConsolidateModeFromString(v)
 		}
 
-		result := map[string]any{"pruned": len(pruned)}
-
-		if doReflect {
-			re := reflectpkg.New(store, 0, 0, buildSummarizer())
-			created, err := re.Reflect(ctx, false, consolidate)
-			if err != nil {
-				return errResult(fmt.Errorf("reflect: %w", err)), nil
-			}
-			result["reflected"] = len(created)
+		res := maintenance.Tick(ctx, store, store, cfg, maintOpts.statePath, float64(time.Now().Unix()))
+		if res.Err != nil {
+			return errResult(res.Err), nil
 		}
-
-		return jsonText(result), nil
-	})
+		return jsonText(map[string]any{
+			"ran_decay":   res.RanDecay,
+			"ran_reflect": res.RanReflect,
+			"pruned":      res.Pruned,
+			"reflected":   res.Reflected,
+		}), nil
+	}
 }
 
 func addJournalTail(s *server.MCPServer, store *memory.MemoryStore) {
@@ -660,7 +758,6 @@ func addImport(s *server.MCPServer, store *memory.MemoryStore) {
 		if err != nil {
 			return jsonText(map[string]any{"ok": false, "error": err.Error()}), nil
 		}
-		_ = fmt.Sprintf // keep fmt referenced
 		return jsonText(map[string]any{
 			"ok":                  true,
 			"imported":            summary.Imported,

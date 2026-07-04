@@ -2,7 +2,6 @@ package cli
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,15 +58,14 @@ func newRememberCmd() *cobra.Command {
 				memType = cfg.DefaultType
 			}
 
-			// Explicit -i wins; --auto-importance (or default_importance =
-			// "auto" in config) scores heuristically; else config default.
-			imp := importance
-			if !cmd.Flags().Changed("importance") {
-				if autoImportance || cfg.DefaultImportance.Auto {
-					imp = memory.ScoreImportance(text, memory.MemoryType(memType), tags)
-				} else {
-					imp = cfg.DefaultImportance.Value
-				}
+			// Explicit -i wins (including 0); --auto-importance (or
+			// default_importance = "auto" in config) scores heuristically;
+			// else nil = unset → the store default from config applies.
+			var imp *float32
+			if cmd.Flags().Changed("importance") {
+				imp = memory.Float32Ptr(importance)
+			} else if autoImportance || cfg.DefaultImportance.Auto {
+				imp = memory.Float32Ptr(memory.ScoreImportance(text, memory.MemoryType(memType), tags))
 			}
 			opts := memory.RememberOpts{
 				Type:       memory.MemoryType(memType),
@@ -96,7 +94,7 @@ func newRememberCmd() *cobra.Command {
 	// Shorthands match Python (and the export command): -t = type, -g = tag.
 	cmd.Flags().StringSliceVarP(&tags, "tag", "g", nil, "Tags (comma-separated or repeated)")
 	cmd.Flags().Float32VarP(&importance, "importance", "i", 0.5, "Importance 0.0–1.0")
-	cmd.Flags().StringVarP(&memType, "type", "t", "episodic", "Memory type (default from config default_type)")
+	cmd.Flags().StringVarP(&memType, "type", "t", "", "Memory type: episodic|semantic|procedural|feedback (default from config default_type, \"semantic\")")
 	cmd.Flags().StringVar(&source, "source", "", "Provenance label")
 	cmd.Flags().IntVar(&polarity, "polarity", 0, "Polarity: -1, 0, or 1")
 	cmd.Flags().StringVar(&onConflict, "on-conflict", "", "Conflict policy for this write: ignore|warn|supersede|raise")
@@ -375,10 +373,13 @@ func newEditCmd() *cobra.Command {
 			frontPart, bodyPart, _ := strings.Cut(string(raw), "---")
 			newText := strings.TrimSpace(bodyPart)
 			textChanged := newText != m.Text
-			m.Text = newText
 
-			// Parse front-matter, skipping comment lines. The body may contain
-			// markdown headings, so only the front matter drops '#' lines.
+			// Parse front-matter into EditOpts, skipping comment lines. The
+			// body may contain markdown headings, so only the front matter
+			// drops '#' lines. store.Edit keeps the id, re-embeds when the
+			// text changed, preserves links / superseded_by / access
+			// tracking, and journals the change so `journal undo` works.
+			opts := memory.EditOpts{Text: &newText}
 			for _, line := range strings.Split(frontPart, "\n") {
 				if strings.HasPrefix(line, "#") || !strings.Contains(line, ":") {
 					continue
@@ -388,35 +389,32 @@ func newEditCmd() *cobra.Command {
 				switch k {
 				case "type":
 					if v != "" {
-						m.Type = memory.MemoryType(v)
+						mt := memory.MemoryType(v)
+						opts.Type = &mt
 					}
 				case "importance":
 					if f, err := strconv.ParseFloat(v, 32); err == nil {
-						if f < 0 {
-							f = 0
-						} else if f > 1 {
-							f = 1
-						}
-						m.Importance = float32(f)
+						opts.Importance = memory.Float32Ptr(float32(f))
 					}
 				case "tags":
-					var tags []string
+					tags := []string{}
 					for _, t := range strings.Split(v, ",") {
 						if t = strings.TrimSpace(t); t != "" {
 							tags = append(tags, t)
 						}
 					}
-					m.Tags = tags
+					opts.Tags = tags
 				case "source":
-					m.Source = v
+					src := v
+					opts.Source = &src
 				case "polarity":
 					if n, err := strconv.Atoi(v); err == nil {
-						m.Polarity = n
+						opts.Polarity = &n
 					}
 				}
 			}
 
-			if err := store.UpdateMemory(cmd.Context(), m, textChanged); err != nil {
+			if _, err := store.Edit(cmd.Context(), m.ID, opts); err != nil {
 				return err
 			}
 			if textChanged {
@@ -456,8 +454,18 @@ func newTagCmd() *cobra.Command {
 			for t := range tagSet {
 				tags = append(tags, t)
 			}
-			m.Tags = tags
-			return store.UpdateMemory(cmd.Context(), m, false)
+			sort.Strings(tags) // deterministic order, matching Python
+			// store.Edit journals the change so `journal undo` can reverse it.
+			m, err = store.Edit(cmd.Context(), m.ID, memory.EditOpts{Tags: tags})
+			if err != nil {
+				return err
+			}
+			label := strings.Join(m.Tags, ", ")
+			if label == "" {
+				label = "(none)"
+			}
+			fmt.Printf("%s tags: %s\n", fmtID(m.ID), label)
+			return nil
 		},
 	}
 	cmd.Flags().StringSliceVar(&add, "add", nil, "Tags to add")
@@ -492,13 +500,11 @@ func newBumpCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("invalid importance delta %q: %w", delta, err)
 			}
-			if newVal < 0 {
-				newVal = 0
-			} else if newVal > 1 {
-				newVal = 1
-			}
-			m.Importance = float32(newVal)
-			if err := store.UpdateMemory(cmd.Context(), m, false); err != nil {
+			// store.Edit clamps to [0, 1] and journals the change so
+			// `journal undo` can reverse it.
+			m, err = store.Edit(cmd.Context(), m.ID,
+				memory.EditOpts{Importance: memory.Float32Ptr(float32(newVal))})
+			if err != nil {
 				return err
 			}
 			fmt.Printf("%s importance: %.2f → %.2f\n", fmtID(m.ID), old, m.Importance)
@@ -696,7 +702,16 @@ func newRestoreCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
-			return store.Restore(cmd.Context(), args[0])
+			restored, err := store.Restore(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			if restored {
+				fmt.Printf("%s restored.\n", fmtID(args[0]))
+			} else {
+				fmt.Fprintf(os.Stderr, "%s was not superseded.\n", fmtID(args[0]))
+			}
+			return nil
 		},
 	}
 }
@@ -1197,18 +1212,4 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// wrapStore wraps *memory.MemoryStore to satisfy decay.Storable + reflect.Storable.
-// Both interfaces share ListRecent+Forget; reflect.Storable also needs Remember+Link+AllRaw.
-// *memory.MemoryStore satisfies both directly — this is just a type alias for clarity.
-
-// decayStore adapts *memory.MemoryStore for decay.Storable.
-type decayStore struct{ s *memory.MemoryStore }
-
-func (d decayStore) ListRecent(ctx context.Context, limit int, incSup bool) ([]memory.Memory, error) {
-	return d.s.ListRecent(ctx, limit, incSup)
-}
-func (d decayStore) Forget(ctx context.Context, id string) (bool, error) {
-	return d.s.Forget(ctx, id)
 }

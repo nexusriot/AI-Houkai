@@ -6,7 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
+
+// embedTimeout caps a single embedding HTTP call so a hung server cannot
+// stall a store operation forever.
+const embedTimeout = 60 * time.Second
 
 // OllamaEmbedder calls the local Ollama /api/embed endpoint.
 type OllamaEmbedder struct {
@@ -20,7 +25,7 @@ func NewOllama(baseURL, model string) *OllamaEmbedder {
 	return &OllamaEmbedder{
 		BaseURL: baseURL,
 		Model:   model,
-		client:  &http.Client{},
+		client:  &http.Client{Timeout: embedTimeout},
 	}
 }
 
@@ -28,8 +33,8 @@ func (o *OllamaEmbedder) Dim() int { return o.dim }
 
 func (o *OllamaEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	type req struct {
-		Model  string   `json:"model"`
-		Input  []string `json:"input"`
+		Model string   `json:"model"`
+		Input []string `json:"input"`
 	}
 	type resp struct {
 		Embeddings [][]float32 `json:"embeddings"`

@@ -191,3 +191,95 @@ def test_import_journals_each_row(store: MemoryStore, tmp_path: Path) -> None:
             assert e.actor == "import"
     finally:
         target.client.close()
+
+
+def test_import_error_policy_is_atomic(store: MemoryStore, tmp_path: Path) -> None:
+    """on_conflict="error" must pre-scan: a raised conflict leaves the target
+    store completely untouched (no partial import of the non-colliding rows)."""
+    kept = store.remember(text="already here")
+    out = tmp_path / "atomic.ahkai"
+    store.export(out)
+    store.remember(text="brand new row")
+    out2 = tmp_path / "atomic2.ahkai"
+    store.export(out2)  # colliding row (kept) + one new row
+
+    target = _new_store(tmp_path, "atomic")
+    try:
+        # Seed the collision, then snapshot the state.
+        target.import_(out)
+        assert target.count() == 1
+        with pytest.raises(ImportConflictError):
+            target.import_(out2, on_conflict="error")
+        assert target.count() == 1              # the new row was NOT written
+        assert target._get_by_id(kept.id) is not None
+        imports = [e for e in target.journal.read() if e.op == "import"]
+        assert len(imports) == 1                # only the seeding import
+    finally:
+        target.client.close()
+
+
+def test_import_error_policy_detects_duplicate_ids_within_file(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    mem = store.remember(text="dup me")
+    out = tmp_path / "dup.ahkai"
+    store.export(out)
+    # Append a second row with the same id.
+    with gzip.open(out, "rt") as f:
+        lines = f.readlines()
+    lines.append(lines[1])
+    with gzip.open(out, "wt") as f:
+        f.writelines(lines)
+
+    target = _new_store(tmp_path, "dup")
+    try:
+        with pytest.raises(ImportConflictError):
+            target.import_(out, on_conflict="error")
+        assert target.count() == 0              # nothing written at all
+    finally:
+        target.client.close()
+    assert mem.id  # silence unused warning
+
+
+def test_vectorless_export_importable_across_models(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    """A vectorless file re-embeds on import anyway, so a model mismatch must
+    not require regenerate_vectors."""
+    store.remember(text="portable fact")
+    out = tmp_path / "nv.ahkai"
+    store.export(out, include_vectors=False)
+    # Forge a different source model, as if exported elsewhere.
+    with gzip.open(out, "rt") as f:
+        lines = f.readlines()
+    header = json.loads(lines[0])
+    header["source"]["embedding_model"] = "some-other-model"
+    lines[0] = json.dumps(header) + "\n"
+    with gzip.open(out, "wt") as f:
+        f.writelines(lines)
+
+    target = _new_store(tmp_path, "nv")
+    try:
+        res = target.import_(out)               # no regenerate_vectors needed
+        assert res.imported == 1
+        assert res.vectors_regenerated is True
+        assert target.count() == 1
+        hits = target.recall("portable", k=1)
+        assert hits and hits[0][0].text == "portable fact"
+    finally:
+        target.client.close()
+
+
+def test_vectorless_import_same_model_reports_regenerated(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    store.remember(text="no vectors here")
+    out = tmp_path / "nv2.ahkai"
+    store.export(out, include_vectors=False)
+    target = _new_store(tmp_path, "nv2")
+    try:
+        res = target.import_(out)
+        assert res.imported == 1
+        assert res.vectors_regenerated is True  # rows carried no vectors
+    finally:
+        target.client.close()

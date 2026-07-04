@@ -429,3 +429,21 @@ class TestPackMinCosine:
         pack = store.recall_pack("favourite pizza toppings", token_budget=500, min_cosine=0.9)
         assert len(pack) == 0
         assert pack.text == ""
+
+
+class TestAutoContextTouch:
+    def test_touch_false_leaves_access_stats(self, store: MemoryStore):
+        mem = store.remember("Deploys run through the release pipeline.",
+                             type="procedural")
+        store.auto_context_pack("deploy the release", token_budget=500,
+                                touch=False)
+        after = store._get_by_id(mem.id)
+        assert after.access_count == 0
+
+    def test_touch_default_bumps_access_stats(self, store: MemoryStore):
+        mem = store.remember("Deploys run through the release pipeline.",
+                             type="procedural")
+        pack = store.auto_context_pack("deploy the release", token_budget=500)
+        assert pack.items                      # it actually recalled something
+        after = store._get_by_id(mem.id)
+        assert after.access_count >= 1

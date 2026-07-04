@@ -122,7 +122,9 @@ func (b *ChromemBackend) UpdateMetadata(ctx context.Context, id string, meta map
 	for k, v := range meta {
 		doc.Metadata[k] = v
 	}
-	_ = b.collection.Delete(ctx, nil, nil, id)
+	// AddDocuments upserts on id, so no Delete first — a Delete+Add pair left
+	// a window where a crash (or a failed Add) lost the document entirely,
+	// and this path runs on every recall touch.
 	return b.collection.AddDocuments(ctx, []chromem.Document{doc}, 1)
 }
 
@@ -202,7 +204,9 @@ func (b *ChromemBackend) CopyCollection(ctx context.Context, src, dst string) (i
 	return len(docs), nil
 }
 
-// cosine similarity utility (also used by reflection engine via package access).
+// CosineSim returns the cosine similarity of two vectors (0 when lengths
+// differ or either vector is all-zero). Shared by the memory and reflect
+// packages.
 func CosineSim(a, b []float32) float32 {
 	if len(a) != len(b) {
 		return 0

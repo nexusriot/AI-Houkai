@@ -425,3 +425,171 @@ def test_graph_json_edges_use_full_ids(tmp_path):
         assert len(edge["src"]) == _UUID_LEN
         assert len(edge["dst"]) == _UUID_LEN
         assert edge["src"] in node_ids and edge["dst"] in node_ids
+
+
+def test_config_expands_tilde_from_env(monkeypatch, tmp_path):
+    from ai_houkai.cli import config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", tmp_path / "missing.toml")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AI_HOUKAI_PATH", "~/env-store/.chroma")
+    cfg = cfg_mod.load()
+    assert cfg.store_path == str(tmp_path / "env-store" / ".chroma")
+    assert "~" not in cfg.store_path
+
+
+def test_config_expands_tilde_from_config_file(monkeypatch, tmp_path):
+    from ai_houkai.cli import config as cfg_mod
+
+    toml = tmp_path / "config.toml"
+    toml.write_text('store_path = "~/file-store/.chroma"\n')
+    monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", toml)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("AI_HOUKAI_PATH", raising=False)
+    cfg = cfg_mod.load()
+    assert cfg.store_path == str(tmp_path / "file-store" / ".chroma")
+
+
+def test_cli_store_option_expands_tilde(monkeypatch, tmp_path):
+    """`houkai --store '~/x'` (quoted, so the shell didn't expand it) must not
+    create a literal ./~ directory."""
+    import ai_houkai.cli.main as main_mod
+
+    captured = {}
+
+    def fake_store(*, path, collection, actor):
+        captured["path"] = path
+        raise RuntimeError("stop before touching chroma")
+
+    monkeypatch.setattr(main_mod, "MemoryStore", fake_store)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("AI_HOUKAI_PATH", raising=False)
+    runner.invoke(app, ["--store", "~/tilde/chroma", "list"])
+    assert captured["path"] == str(tmp_path / "tilde" / "chroma")
+
+
+def test_maintenance_config_consolidate_parsing(monkeypatch, tmp_path):
+    from ai_houkai.cli import config as cfg_mod
+
+    toml = tmp_path / "config.toml"
+
+    def load_with(consolidate_line: str):
+        toml.write_text("[maintenance.reflect]\n" + consolidate_line)
+        monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", toml)
+        return cfg_mod.load_maintenance()
+
+    assert load_with("").reflect_consolidate is True            # default: soft
+    assert load_with('consolidate = "none"').reflect_consolidate is False
+    assert load_with('consolidate = "soft"').reflect_consolidate is True
+    assert load_with('consolidate = "hard"').reflect_consolidate == "hard"
+    with pytest.raises(ValueError, match="consolidate"):
+        load_with('consolidate = "sideways"')
+
+
+def test_maintenance_config_enabled_defaults_true(monkeypatch, tmp_path):
+    from ai_houkai.cli import config as cfg_mod
+
+    monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", tmp_path / "missing.toml")
+    assert cfg_mod.load_maintenance().enabled is True
+
+    toml = tmp_path / "config.toml"
+    toml.write_text("[maintenance]\nenabled = false\n")
+    monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", toml)
+    assert cfg_mod.load_maintenance().enabled is False
+
+
+def test_maintenance_tick_noops_when_disabled(tmp_path, monkeypatch):
+    import ai_houkai.cli.commands.maintenance as maint_mod
+    from ai_houkai.cli.config import MaintenanceConfig
+
+    def fake_mcfg():
+        return MaintenanceConfig(
+            enabled=False, decay_every=1, reflect_every=1, tick_interval=300,
+            log_path=str(tmp_path / "m.log"),
+            state_path=str(tmp_path / "m.state.json"),
+            pid_path=str(tmp_path / "m.pid"), decay_rate=0.1, min_score=0.05,
+            protect_types=("procedural",), frequency_weight=0.0,
+            min_cluster_size=2, reflect_apply=True, summarizer=None,
+        )
+
+    monkeypatch.setattr(maint_mod, "load_maintenance", fake_mcfg)
+    store_path = str(tmp_path / "chroma")
+    result = _invoke(["maintenance", "tick"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "disabled" in result.output
+    assert "Running maintenance tick" not in result.output
+
+
+def test_prune_defaults_come_from_config(tmp_path, monkeypatch):
+    import ai_houkai.cli.commands.decay as decay_mod
+    from ai_houkai.cli.config import MaintenanceConfig
+
+    def fake_mcfg():
+        return MaintenanceConfig(
+            enabled=True, decay_every=None, reflect_every=None, tick_interval=300,
+            log_path="", state_path="", pid_path="",
+            decay_rate=0.1, min_score=0.99,          # everything is at risk
+            protect_types=(), frequency_weight=0.0,
+            min_cluster_size=3, reflect_apply=False, summarizer=None,
+        )
+
+    monkeypatch.setattr(decay_mod, "load_maintenance", fake_mcfg)
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "fresh but doomed", "-i", "0.5"], store_path)
+
+    # Config min_score=0.99 → the fresh memory is a prune candidate.
+    result = _invoke(["prune"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "Prune candidates (1)" in result.output
+
+    # An explicit flag still wins over the config value.
+    result2 = _invoke(["prune", "--min-score", "0.0000001"], store_path)
+    assert result2.exit_code == 0, result2.output
+    assert "Nothing to prune." in result2.output
+
+
+def test_ingest_journals_as_ingest_actor(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    doc = tmp_path / "notes.md"
+    doc.write_text("A paragraph long enough to survive the min-chars filter.\n")
+    result = _invoke(["ingest", str(doc), "--yes"], store_path)
+    assert result.exit_code == 0, result.output
+
+    store = MemoryStore(path=store_path, collection="cli_test")
+    try:
+        entries = [e for e in store.journal.read() if e.op == "remember"]
+        assert entries
+        assert all(e.actor == "ingest" for e in entries)
+    finally:
+        store.client.close()
+
+
+def test_ingest_bad_type_is_friendly_error(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    doc = tmp_path / "notes.md"
+    doc.write_text("A paragraph long enough to survive the min-chars filter.\n")
+    result = _invoke(["ingest", str(doc), "--type", "bogus", "--yes"], store_path)
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_auto_context_text(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "The deploy pipeline runs through GitHub Actions",
+             "--type", "procedural"], store_path)
+    result = _invoke(["auto-context", "deploy the api to production",
+                      "--budget", "500"], store_path)
+    assert result.exit_code == 0, result.output
+    assert "## Relevant memory" in result.output
+
+
+def test_auto_context_json(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "The deploy pipeline runs through GitHub Actions",
+             "--type", "procedural"], store_path)
+    result = _invoke(["auto-context", "deploy the api", "-f", "json"], store_path)
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert set(data) >= {"text", "used_tokens", "budget", "truncated", "items"}
+    assert data["items"]

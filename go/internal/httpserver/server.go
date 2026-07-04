@@ -10,6 +10,7 @@
 //	                                       recent memories (list_recent)
 //	POST   /memories                       store a memory (remember)
 //	GET    /memories/{id}                  fetch one memory
+//	PATCH  /memories/{id}                  edit fields in place (journaled)
 //	DELETE /memories/{id}                  forget one memory
 //	GET    /memories/{id}/neighbors?rel=&direction=&depth=
 //	                                       linked memories
@@ -34,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -80,6 +82,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /memories", s.wrap(s.list))
 	mux.HandleFunc("POST /memories", s.wrap(s.remember))
 	mux.HandleFunc("GET /memories/{id}", s.wrap(s.getOne))
+	mux.HandleFunc("PATCH /memories/{id}", s.wrap(s.edit))
 	mux.HandleFunc("DELETE /memories/{id}", s.wrap(s.forget))
 	mux.HandleFunc("GET /memories/{id}/neighbors", s.wrap(s.neighbors))
 	mux.HandleFunc("GET /recall", s.wrap(s.recall))
@@ -200,6 +203,12 @@ func (s *Server) wrap(fn apiFunc) http.HandlerFunc {
 				writeJSON(w, he.status, map[string]any{"error": he.msg})
 				return
 			}
+			// Store-level validation (bad mode/type/rel/polarity …) is caller
+			// error, not an internal fault (mirrors Python's ValueError → 400).
+			if memory.IsValidationError(err) {
+				writeJSON(w, 400, map[string]any{"error": err.Error()})
+				return
+			}
 			writeJSON(w, 500, map[string]any{"error": fmt.Sprintf("%T: %v", err, err)})
 			return
 		}
@@ -261,9 +270,9 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	opts := memory.RememberOpts{
-		Type:       memory.MemoryType(bodyStr(b, "type", string(memory.Episodic))),
+		Type:       memory.MemoryType(bodyStr(b, "type", string(memory.Semantic))),
 		Tags:       bodyStrSlice(b, "tags"),
-		Importance: float32(bodyFloat(b, "importance", 0)),
+		Importance: bodyFloatPtr(b, "importance"), // nil = unset → store default
 		Source:     bodyStr(b, "source", ""),
 		Polarity:   int(bodyFloat(b, "polarity", 0)),
 		OnConflict: memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
@@ -291,6 +300,68 @@ func (s *Server) getOne(r *http.Request) (int, any, error) {
 	}
 	if err != nil {
 		return 0, nil, err
+	}
+	return 200, memDict(mem), nil
+}
+
+// edit updates fields of a memory in place (PATCH /memories/{id}).
+// Uniform null semantics mirror Python: null / omitted means "leave
+// unchanged" for every field except `source`, where an explicit null clears.
+// An explicit [] clears tags.
+func (s *Server) edit(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(b) == 0 {
+		return 0, nil, errStatus(400, "empty edit: provide at least one field")
+	}
+	var opts memory.EditOpts
+	fields := 0
+	if v, ok := b["text"].(string); ok {
+		opts.Text = &v
+		fields++
+	}
+	if v, ok := b["type"].(string); ok {
+		mt := memory.MemoryType(v)
+		opts.Type = &mt
+		fields++
+	}
+	if raw, present := b["tags"]; present && raw != nil {
+		if arr, ok := raw.([]any); ok {
+			tags := make([]string, 0, len(arr))
+			for _, t := range arr {
+				if ts, ok := t.(string); ok {
+					tags = append(tags, ts)
+				}
+			}
+			opts.Tags = tags
+			fields++
+		}
+	}
+	if p := bodyFloatPtr(b, "importance"); p != nil {
+		opts.Importance = p
+		fields++
+	}
+	if raw, present := b["polarity"]; present && raw != nil {
+		n := int(bodyFloat(b, "polarity", 0))
+		opts.Polarity = &n
+		fields++
+	}
+	if _, present := b["source"]; present {
+		src, _ := b["source"].(string) // null → "" (clears)
+		opts.Source = &src
+		fields++
+	}
+	if fields == 0 {
+		return 0, nil, errStatus(400, "no editable fields in body")
+	}
+	mem, err := s.store.Edit(r.Context(), r.PathValue("id"), opts)
+	if err != nil {
+		if errors.Is(err, memory.ErrNotFound) {
+			return 0, nil, errStatus(404, "memory not found")
+		}
+		return 0, nil, err // validation → 400 via wrap
 	}
 	return 200, memDict(mem), nil
 }
@@ -361,8 +432,7 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	header := bodyStr(b, "header", "## Relevant memory")
-	res, err := s.store.RecallPack(r.Context(), query, memory.PackOpts{
+	packOpts := memory.PackOpts{
 		TokenBudget:       int(bodyFloat(b, "token_budget", 800)),
 		Type:              memory.MemoryType(bodyStr(b, "type", "")),
 		Tag:               bodyStr(b, "tag", ""),
@@ -373,7 +443,6 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeHybrid))),
 		MaxItems:          int(bodyFloat(b, "max_items", 50)),
 		IncludeSuperseded: bodyBool(b, "include_superseded"),
-		Header:            &header,
 		Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
 		Diversity:         bodyFloatPtr(b, "diversity"),
 		DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
@@ -381,7 +450,13 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
-	})
+	}
+	// header: absent → default; explicit "" → no header line (PackOpts.Header
+	// contract). bodyStr can't express the empty string, so probe the map.
+	if v, ok := b["header"].(string); ok {
+		packOpts.Header = &v
+	}
+	res, err := s.store.RecallPack(r.Context(), query, packOpts)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -458,7 +533,10 @@ func (s *Server) link(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	if err := s.store.Link(r.Context(), src, dst, bodyStr(b, "rel", memory.RelRelated)); err != nil {
-		return 0, nil, errStatus(404, "%s", err.Error())
+		if errors.Is(err, memory.ErrNotFound) {
+			return 0, nil, errStatus(404, "%s", err.Error())
+		}
+		return 0, nil, err // validation → 400 via wrap
 	}
 	return 200, map[string]any{"ok": true}, nil
 }
@@ -497,7 +575,10 @@ func (s *Server) supersede(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	if err := s.store.Supersede(r.Context(), oldID, newID); err != nil {
-		return 0, nil, errStatus(404, "%s", err.Error())
+		if errors.Is(err, memory.ErrNotFound) {
+			return 0, nil, errStatus(404, "%s", err.Error())
+		}
+		return 0, nil, err // validation (self/cycle) → 400 via wrap
 	}
 	return 200, map[string]any{"ok": true}, nil
 }
@@ -614,7 +695,10 @@ func conflictPayload(cs []memory.Conflict) map[string]any {
 }
 
 func round4(f float32) float64 {
-	return float64(int64(f*10000+0.5)) / 10000
+	// math.Round, not int64(x+0.5) truncation — the latter rounds negative
+	// scores (e.g. a min_cosine explain value) toward zero instead of to the
+	// nearest step.
+	return math.Round(float64(f)*1e4) / 1e4
 }
 
 func clip(s string, n int) string {

@@ -64,6 +64,13 @@ type MaintenanceConfig struct {
 	StatePath    string                 `toml:"state_path"`    // default: <store-dir>/maintenance_state.json
 	PidPath      string                 `toml:"pid_path"`      // default: <store-dir>/maintenance.pid
 	LogPath      string                 `toml:"log_path"`      // default: <store-dir>/maintenance.log
+
+	// Schedule gates, in seconds since the job's last recorded run (mirrors
+	// Python's decay_every / reflect_every). A tick only runs a job when its
+	// interval has elapsed — safe to call frequently. 0 = run on every tick;
+	// < 0 = job disabled. Defaults: decay 24h, reflect 7d.
+	DecayEverySecs   int `toml:"decay_every_secs"`
+	ReflectEverySecs int `toml:"reflect_every_secs"`
 }
 
 // MaintPaths returns the resolved state/pid/log paths, defaulting to files
@@ -100,7 +107,7 @@ func defaultConfig() Config {
 	return Config{
 		StorePath:         filepath.Join(home, ".ai_houkai", ".chroma"),
 		Collection:        "ai_houkai",
-		DefaultType:       "episodic",
+		DefaultType:       "semantic",
 		DefaultImportance: ImportanceDefault{Value: 0.5},
 		Editor:            "",
 		EmbedProvider:     "ollama",
@@ -116,7 +123,9 @@ func defaultConfig() Config {
 				ProtectTypes:    []string{"procedural"},
 				FrequencyWeight: 0.0,
 			},
-			IntervalSecs: 3600,
+			IntervalSecs:     3600,
+			DecayEverySecs:   86_400,  // 24h, matching Python's decay_every
+			ReflectEverySecs: 604_800, // 7d, matching Python's reflect_every
 		},
 	}
 }

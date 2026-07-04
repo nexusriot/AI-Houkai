@@ -278,6 +278,36 @@ class AsyncMemoryStore:
             compress_min_group=compress_min_group,
         )
 
+    async def auto_context_pack(
+        self,
+        task: str,
+        *,
+        token_budget: int = 800,
+        max_phrases: int = 3,
+        mode: Literal["semantic", "hybrid"] = "hybrid",
+        min_cosine: float | None = None,
+        header: str = "## Relevant memory",
+        token_counter: Callable[[str], int] | None = None,
+        touch: bool = True,
+        compress: bool = False,
+        compress_threshold: float = 0.30,
+        compress_min_group: int = 2,
+    ) -> PackResult:
+        return await self.run(
+            self.sync.auto_context_pack,
+            task,
+            token_budget=token_budget,
+            max_phrases=max_phrases,
+            mode=mode,
+            min_cosine=min_cosine,
+            header=header,
+            token_counter=token_counter,
+            touch=touch,
+            compress=compress,
+            compress_threshold=compress_threshold,
+            compress_min_group=compress_min_group,
+        )
+
     async def list_recent(
         self,
         limit: int = 20,

@@ -76,7 +76,7 @@ AI-Houkai/
 │   │   └── commands/
 │   │       ├── remember.py       # houkai remember
 │   │       ├── recall.py         # houkai recall
-│   │       ├── pack.py           # houkai pack
+│   │       ├── pack.py           # houkai pack / auto-context
 │   │       ├── list_cmd.py       # houkai list
 │   │       ├── show.py           # houkai show
 │   │       ├── forget.py         # houkai forget
@@ -117,7 +117,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 621 tests across 26 files
+├── tests/                        # 681 tests across 26 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -263,10 +263,11 @@ The constructor takes the same arguments as `MemoryStore`. Use `await store.aclo
 (or the `async with` block) to flush and shut the executor down; `store.close()`
 is the synchronous equivalent for non-async teardown. The underlying sync store
 is reachable as `store.sync`, and any not-yet-wrapped method can be offloaded via
-`await store.run(store.sync.<method>, ...)`. `recall`/`recall_pack` accept the
-same tuning params as the sync store (`fusion`, `diversity`, `dedup_threshold`,
-`min_cosine`, `touch`, `explain`; `recall_pack` also `compress`/
-`compress_threshold`/`compress_min_group`) and forward them through.
+`await store.run(store.sync.<method>, ...)`. `recall`/`recall_pack`/
+`auto_context_pack` accept the same tuning params as the sync store (`fusion`,
+`diversity`, `dedup_threshold`, `min_cosine`, `touch`, `explain`; the pack
+methods also `compress`/`compress_threshold`/`compress_min_group`) and forward
+them through.
 
 > **Note:** the constructor itself runs synchronously — building the store loads
 > the embedding model, so construct it before entering your hot path (or wrap the
@@ -326,6 +327,11 @@ houkai pack  "deploy" --source runbook --since 30d --budget 500
 houkai pack "how do we deploy and test" --budget 800
 houkai pack "deploy" --budget 500 > context.md      # clean block, no summary
 houkai pack "deploy" --format json                  # block + per-item scores/tokens
+
+# Multi-angle packing: fan recall out over the task plus extracted key
+# phrases, dedupe, and pack (wraps auto_context_pack; same output shape)
+houkai auto-context "deploy the api to production" --budget 800
+houkai auto-context "deploy the api" --max-phrases 3 --min-cosine 0.3 -f json
 
 # List recent memories
 houkai list
@@ -577,8 +583,9 @@ Endpoints (all JSON in / JSON out):
 | `PATCH /memories/{id}` | edit fields in place (journaled, undoable) |
 | `DELETE /memories/{id}` | forget one |
 | `GET /memories/{id}/neighbors?rel=&direction=&depth=` | linked memories |
-| `GET\|POST /recall` | search — supports `source`, `since`, `until` filters |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until` filters and `overfetch` |
 | `POST /recall_pack` | token-budgeted context block |
+| `POST /auto_context` | multi-angle context block (`auto_context_pack`) |
 | `POST /links` · `POST /unlink` | manage the link graph |
 | `POST /supersede` · `POST /conflicts` | curation |
 
@@ -587,6 +594,7 @@ curl -s localhost:8077/health
 curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
 curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
 curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
+curl -s localhost:8077/auto_context -d '{"task":"deploy the api to production"}'
 curl -s -X PATCH localhost:8077/memories/<id> -d '{"importance":0.9}'
 ```
 
@@ -617,10 +625,16 @@ non-ASCII header gets a clean `401`). Unhandled errors return
 `500 {"error":"internal server error","request_id":"<hex>"}` — no exception
 type, message, or traceback is leaked to the client.
 
-**Stable surface:** the new ranking/compression controls
-(`fusion`/`diversity`/`dedup_threshold`/`min_cosine`/`touch`/`explain` and
-`compress*`) are available via the Python API and MCP tools only — the HTTP
-`/recall` and `/recall_pack` endpoints expose just the stable param set.
+**Ranking/compression knobs over HTTP:** `/recall` accepts `overfetch`;
+`/recall_pack` additionally accepts `fusion` (`weighted`|`rrf`), `diversity`,
+`dedup_threshold`, `min_cosine`, and the compression trio
+`compress`/`compress_threshold`/`compress_min_group` (responses include a
+`compressed_groups` list). `/auto_context` takes `task` (required) plus
+`token_budget`, `max_phrases`, `mode`, `min_cosine`, `header`, and the same
+compression trio; its response adds the fan-out `queries`. String `tags` in
+`POST /memories` / `PATCH /memories/{id}` are coerced to a one-element list
+(anything other than a string or list of strings is a `400`). `touch`/
+`explain` remain Python-API-only.
 
 ---
 
@@ -628,7 +642,7 @@ type, message, or traceback is leaked to the client.
 
 A full Go port lives in [`go/`](go/) — two static binaries (`houkai` CLI +
 `ai-houkai-mcp` MCP server), no Python runtime, packaged as a Debian `.deb`
-and macOS tarballs. It is at parity on the core surface: the same 15 MCP
+and macOS tarballs. It is at parity on the core surface: the same seventeen MCP
 tools, hybrid retrieval, decay/reflection with LLM summarizers, context
 packing, bulk ingest, collections, importance auto-assignment, installers for
 Claude Code / Cursor / OpenCode, and a Bubble Tea TUI. The Python-side phase
@@ -763,7 +777,7 @@ into `~/.claude.json` directly:
       "command": "ai-houkai-mcp",
       "args": [],
       "env": {
-        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_PATH": "~/.ai_houkai/.chroma",
         "AI_HOUKAI_COLLECTION": "claude_code"
       }
     }
@@ -777,7 +791,7 @@ module — drop it into your own scripts:
 ```python
 from ai_houkai.installers import ClaudeCodeInstaller
 
-ClaudeCodeInstaller(memory_path="~/.ai_houkai").install()
+ClaudeCodeInstaller(memory_path="~/.ai_houkai/.chroma").install()
 ```
 
 #### Recommended CLAUDE.md addition
@@ -863,6 +877,8 @@ description, dedupes by id, and packs the result within a token budget.
 the text is re-embedded only when it changed. The change is journaled and
 reversible, so agents should `edit` to fix or refine a stored fact instead
 of a `forget` + `remember` round-trip (which would discard the graph).
+Omitted fields stay unchanged; pass `clear_source=true` to remove the
+provenance string (a `source` of `null` means "leave unchanged").
 
 Environment variables:
 
@@ -913,7 +929,7 @@ Cursor uses the same `mcpServers` schema as Claude. The written block:
     "ai-houkai": {
       "command": "ai-houkai-mcp",
       "env": {
-        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_PATH": "~/.ai_houkai/.chroma",
         "AI_HOUKAI_COLLECTION": "cursor"
       }
     }
@@ -946,7 +962,7 @@ OpenCode uses its own `mcp` schema (note the `command` array and `environment`):
       "command": ["ai-houkai-mcp"],
       "enabled": true,
       "environment": {
-        "AI_HOUKAI_PATH": "~/.ai_houkai",
+        "AI_HOUKAI_PATH": "~/.ai_houkai/.chroma",
         "AI_HOUKAI_COLLECTION": "opencode"
       }
     }
@@ -963,8 +979,8 @@ Both installers are reusable library classes, mirroring `ClaudeCodeInstaller`:
 ```python
 from ai_houkai.installers import CursorInstaller, OpenCodeInstaller
 
-CursorInstaller(memory_path="~/.ai_houkai").install()
-OpenCodeInstaller(memory_path="~/.ai_houkai", settings_path="opencode.json").install()
+CursorInstaller(memory_path="~/.ai_houkai/.chroma").install()
+OpenCodeInstaller(memory_path="~/.ai_houkai/.chroma", settings_path="opencode.json").install()
 ```
 
 ---
@@ -1114,7 +1130,8 @@ Add a `[maintenance]` section to `~/.config/ai_houkai/config.toml`:
 
 ```toml
 [maintenance]
-enabled       = true
+enabled       = true      # master switch (default). false → tick/run/start
+                          # and the MCP maintenance_tick are no-ops
 decay_every   = "24h"     # or "off" to disable decay
 reflect_every = "7d"      # or "off" to disable reflection
 tick_interval = "5m"      # how often the loop wakes to check schedules
@@ -1128,15 +1145,29 @@ frequency_weight = 0.0   # >0 → frequently-recalled memories resist decay
 [maintenance.reflect]
 min_cluster_size = 3
 apply            = false   # set true to write reflection summaries
+consolidate      = "soft"  # none | soft (default) | hard — what happens to the
+                           # source episodics when a summary is written
 summarizer       = "ollama:llama3.1"   # optional; default extractive (no LLM)
 ```
 
 Supported duration units: `s` · `m` · `h` · `d` · `w`.
 Default `decay_every = "24h"`, `reflect_every = "7d"`, `tick_interval = "5m"`.
 
+> **enabled = false** turns every scheduled-maintenance surface into a clear
+> no-op: `houkai maintenance tick|run` print that maintenance is disabled,
+> `houkai maintenance start` refuses to daemonize, and the MCP
+> `maintenance_tick` tool returns `{"enabled": false, ...}` without running
+> anything. `houkai prune` / `houkai reflect` stay available for manual runs.
+
 > **reflect.apply = false** (default): reflection runs in observe-only mode —
 > it logs how many summaries *would* be created but writes nothing.  Flip to
 > `true` once you're happy with the clusters.
+
+> **reflect.consolidate** controls the source episodics when `apply = true`:
+> `soft` (default) supersedes them under the new summary — without this a
+> scheduled reflection would re-create the same summaries every interval;
+> `hard` deletes them permanently; `none` leaves them untouched (expect
+> duplicate summaries on repeat runs).
 
 ### Programmatic usage
 

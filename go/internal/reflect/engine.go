@@ -130,7 +130,7 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 			if seed.Polarity != 0 && other.Polarity != 0 && seed.Polarity != other.Polarity {
 				continue
 			}
-			sim := cosineSim(seed.embedding, other.embedding)
+			sim := vector.CosineSim(seed.embedding, other.embedding)
 			if sim >= e.SimilarityThreshold {
 				assigned[j] = true
 				cluster = append(cluster, other.Memory)
@@ -205,7 +205,7 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 		newMem, _, _, err := e.store.Remember(ctx, text, memory.RememberOpts{
 			Type:       memory.Semantic,
 			Tags:       tags,
-			Importance: avgImp,
+			Importance: memory.Float32Ptr(avgImp),
 			Source:     "reflection",
 		})
 		if err != nil {
@@ -239,24 +239,10 @@ func defaultSummarizer(_ context.Context, ms []memory.Memory) (string, error) {
 	body := strings.Join(parts, " | ")
 	prefix := fmt.Sprintf("[Reflection ×%d] ", len(ms))
 	full := prefix + body
-	if len(full) > 512 {
-		full = full[:512]
+	// Truncate by runes, not bytes, so a multi-byte character is never split
+	// (Python slices by characters).
+	if r := []rune(full); len(r) > 512 {
+		full = string(r[:512])
 	}
 	return full, nil
-}
-
-func cosineSim(a, b []float32) float32 {
-	if len(a) != len(b) {
-		return 0
-	}
-	var dot, na, nb float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
-	}
-	if na == 0 || nb == 0 {
-		return 0
-	}
-	return float32(dot / (math.Sqrt(na) * math.Sqrt(nb)))
 }

@@ -14,7 +14,7 @@ func remember3Polarities(t *testing.T, store *MemoryStore) {
 	ctx := context.Background()
 	for _, p := range []int{1, 0, -1} {
 		if _, ok, _, err := store.Remember(ctx, "the sky is blue today", RememberOpts{
-			Type: Semantic, Importance: 0.5, Polarity: p,
+			Type: Semantic, Importance: Float32Ptr(0.5), Polarity: p,
 		}); err != nil || !ok {
 			t.Fatalf("Remember polarity=%d: ok=%v err=%v", p, ok, err)
 		}

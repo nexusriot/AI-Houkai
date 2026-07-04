@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	"github.com/nexusriot/ai-houkai/internal/vector"
@@ -179,16 +180,108 @@ func TestStopDaemonNoPid(t *testing.T) {
 	}
 }
 
-func TestDefaultConfig(t *testing.T) {
-	c := DefaultConfig()
-	if c.Interval <= 0 {
-		t.Fatalf("DefaultConfig().Interval = %v, want > 0", c.Interval)
+func TestJobDue(t *testing.T) {
+	// every < 0 disables the job outright.
+	if jobDue(0, -1, 1000) {
+		t.Fatal("jobDue(every=-1) = true, want false (disabled)")
 	}
-	if c.DecayRate <= 0 {
-		t.Fatalf("DefaultConfig().DecayRate = %v, want > 0", c.DecayRate)
+	// A job that never ran is immediately due.
+	if !jobDue(0, 3600, 1000) {
+		t.Fatal("jobDue(lastAt=0) = false, want true (never ran)")
 	}
-	if c.Reflect {
-		t.Fatal("DefaultConfig().Reflect = true, want false")
+	// every == 0 runs on every tick.
+	if !jobDue(999, 0, 1000) {
+		t.Fatal("jobDue(every=0) = false, want true (ungated)")
+	}
+	// Gated: not due before the interval elapses, due at/after it.
+	if jobDue(1000, 100, 1099) {
+		t.Fatal("jobDue before interval elapsed = true, want false")
+	}
+	if !jobDue(1000, 100, 1100) {
+		t.Fatal("jobDue at interval boundary = false, want true")
+	}
+}
+
+func TestTickScheduleGates(t *testing.T) {
+	// A tick whose jobs are gated (interval not yet elapsed) must skip both
+	// jobs and leave the recorded timestamps untouched.
+	store := newStore(t)
+	ctx := context.Background()
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	if err := (State{LastDecayAt: 1000, LastReflectAt: 1000}).Save(statePath); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	cfg := Config{
+		DecayRate: 0.1, MinScore: 0.05, Reflect: true,
+		DecayEvery: 86_400, ReflectEvery: 604_800,
+	}
+	res := Tick(ctx, store, store, cfg, statePath, 1500) // 500s later — nothing due
+	if res.Err != nil {
+		t.Fatalf("Tick: %v", res.Err)
+	}
+	if res.RanDecay || res.RanReflect {
+		t.Fatalf("gated tick ran jobs: decay=%v reflect=%v, want false/false", res.RanDecay, res.RanReflect)
+	}
+	st := LoadState(statePath)
+	if st.LastDecayAt != 1000 || st.LastReflectAt != 1000 {
+		t.Fatalf("gated tick moved timestamps: %+v", st)
+	}
+
+	// Once the decay interval elapses the decay job runs (reflect still gated).
+	res = Tick(ctx, store, store, cfg, statePath, 1000+86_400)
+	if res.Err != nil {
+		t.Fatalf("Tick 2: %v", res.Err)
+	}
+	if !res.RanDecay {
+		t.Fatal("decay job should be due after decay_every elapsed")
+	}
+	if res.RanReflect {
+		t.Fatal("reflect job should still be gated")
+	}
+}
+
+func TestTickTakesStateLock(t *testing.T) {
+	// The tick cycle must hold a flock on <state>.lock so concurrent tickers
+	// (daemon + cron + MCP) serialise instead of double-running jobs.
+	store := newStore(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+
+	res := Tick(ctx, store, store, Config{DecayRate: 0.1, MinScore: 0.05}, statePath, 42)
+	if res.Err != nil {
+		t.Fatalf("Tick: %v", res.Err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state.lock")); err != nil {
+		t.Fatalf("state.lock not created next to state file: %v", err)
+	}
+
+	// While the lock is held by someone else, lockState must block — verify by
+	// taking it ourselves and confirming a second tick completes only after
+	// release.
+	unlock, err := lockState(statePath)
+	if err != nil {
+		t.Fatalf("lockState: %v", err)
+	}
+	done := make(chan TickResult, 1)
+	go func() {
+		done <- Tick(ctx, store, store, Config{DecayRate: 0.1, MinScore: 0.05}, statePath, 43)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Tick completed while the state lock was held")
+	case <-time.After(100 * time.Millisecond):
+		// still blocked — expected
+	}
+	unlock()
+	select {
+	case res := <-done:
+		if res.Err != nil {
+			t.Fatalf("Tick after unlock: %v", res.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Tick did not complete after the lock was released")
 	}
 }
 
@@ -202,7 +295,7 @@ func TestTickPrunePersistsState(t *testing.T) {
 	for _, txt := range []string{"alpha fact", "beta fact", "gamma fact"} {
 		if _, _, _, err := store.Remember(ctx, txt, memory.RememberOpts{
 			Type:       memory.Semantic,
-			Importance: 0.9,
+			Importance: memory.Float32Ptr(0.9),
 		}); err != nil {
 			t.Fatalf("Remember: %v", err)
 		}
@@ -240,7 +333,7 @@ func TestTickAccumulatesDecayTotal(t *testing.T) {
 	store := newStore(t)
 	ctx := context.Background()
 	if _, _, _, err := store.Remember(ctx, "kept memory", memory.RememberOpts{
-		Type: memory.Semantic, Importance: 0.99,
+		Type: memory.Semantic, Importance: memory.Float32Ptr(0.99),
 	}); err != nil {
 		t.Fatalf("Remember: %v", err)
 	}
@@ -289,7 +382,7 @@ func TestTickReflect(t *testing.T) {
 		"kubernetes orchestrates the deployment pods",
 	} {
 		if _, _, _, err := store.Remember(ctx, txt, memory.RememberOpts{
-			Type: memory.Episodic, Importance: 0.6,
+			Type: memory.Episodic, Importance: memory.Float32Ptr(0.6),
 		}); err != nil {
 			t.Fatalf("Remember: %v", err)
 		}
@@ -297,7 +390,7 @@ func TestTickReflect(t *testing.T) {
 
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	const now = 1_700_000_500.0
-	cfg := Config{DecayRate: 0.1, MinScore: 0.05, Reflect: true, Consolidate: false}
+	cfg := Config{DecayRate: 0.1, MinScore: 0.05, Reflect: true}
 
 	res := Tick(ctx, store, store, cfg, statePath, now)
 	if res.Err != nil {

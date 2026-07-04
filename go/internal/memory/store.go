@@ -2,11 +2,13 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -123,19 +125,40 @@ func (s *MemoryStore) journalEntry(op, id string, before, after, meta map[string
 	})
 }
 
-// Remember stores a new memory and returns it.
+// Remember stores a new memory and returns it. The text is stripped of
+// surrounding whitespace before storage (matching Python).
 func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
+	text = strings.TrimSpace(text)
 	if opts.Type == "" {
-		opts.Type = Episodic
+		opts.Type = Semantic
 	}
-	// Importance 0 means "unset" → auto-score when an ImportanceFn is
-	// configured, else keep the configured default.
-	if opts.Importance == 0 {
-		if s.cfg.ImportanceFn != nil {
-			opts.Importance = s.cfg.ImportanceFn(text, opts.Type, opts.Tags)
-		} else {
-			opts.Importance = s.cfg.DefaultImportance
+	if err := validateChoice(string(opts.Type), MemoryTypes, "type"); err != nil {
+		return Memory{}, false, nil, err
+	}
+	if err := validatePolarity(opts.Polarity); err != nil {
+		return Memory{}, false, nil, err
+	}
+	if opts.OnConflict != "" {
+		if err := validateChoice(string(opts.OnConflict), ConflictPolicies, "on_conflict"); err != nil {
+			return Memory{}, false, nil, err
 		}
+	}
+	if err := validateTags(opts.Tags); err != nil {
+		return Memory{}, false, nil, err
+	}
+
+	// Importance nil means "unset" → auto-score when an ImportanceFn is
+	// configured, else keep the configured default. An explicit value —
+	// including 0 — is honoured, clamped to [0, 1].
+	var importance float32
+	if opts.Importance == nil {
+		if s.cfg.ImportanceFn != nil {
+			importance = s.cfg.ImportanceFn(text, opts.Type, opts.Tags)
+		} else {
+			importance = s.cfg.DefaultImportance
+		}
+	} else {
+		importance = clamp01(*opts.Importance)
 	}
 
 	now := float64(time.Now().Unix())
@@ -144,7 +167,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		Text:         text,
 		Type:         opts.Type,
 		Tags:         opts.Tags,
-		Importance:   opts.Importance,
+		Importance:   importance,
 		CreatedAt:    now,
 		LastAccessed: now,
 		AccessCount:  0,
@@ -158,43 +181,16 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		m.Tags = []string{}
 	}
 
-	// Conflict check. A per-call OnConflict overrides the store default.
-	policy := s.cfg.ConflictPolicy
-	if opts.OnConflict != "" {
-		policy = opts.OnConflict
-	}
-	if policy != PolicyIgnore {
-		vecs, err := s.embedder.Embed(ctx, []string{text})
-		if err != nil {
-			return Memory{}, false, nil, err
-		}
-
-		hits, err := s.backend.Query(ctx, vecs[0], 12)
-		if err != nil {
-			return Memory{}, false, nil, err
-		}
-		candidates := hitsToMemoriesWithScore(hits)
-		conflicts := detectConflicts(m, candidates, s.cfg.ConflictThreshold, s.cfg.ConflictFn)
-
-		if len(conflicts) > 0 {
-			switch policy {
-			case PolicyWarn:
-				log.Printf("ai-houkai: %d conflict(s) detected for new memory", len(conflicts))
-			case PolicyRaise:
-				return Memory{}, false, conflicts, &ConflictError{Conflicts: conflicts}
-			case PolicySupersede:
-				for _, c := range conflicts {
-					_ = s.doSupersede(ctx, c.B.ID, m.ID)
-				}
-			}
-		}
-	}
-
+	// Embed once — the same vector serves the insert and the conflict scan.
 	vecs, err := s.embedder.Embed(ctx, []string{text})
 	if err != nil {
 		return Memory{}, false, nil, err
 	}
 
+	// Add FIRST, then detect conflicts (matching Python): PolicySupersede can
+	// link the stored memories both ways, and PolicyRaise rolls the insert
+	// back so a failed Add can never leave old memories superseded_by an id
+	// that was never created.
 	err = s.backend.Add(ctx, []vector.Item{{
 		ID:        m.ID,
 		Content:   text,
@@ -205,14 +201,48 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		return Memory{}, false, nil, err
 	}
 	s.journalEntry("remember", m.ID, nil, m.ToDict(), nil)
+
+	// Conflict check. A per-call OnConflict overrides the store default.
+	policy := s.cfg.ConflictPolicy
+	if opts.OnConflict != "" {
+		policy = opts.OnConflict
+	}
+	if policy != PolicyIgnore {
+		hits, err := s.backend.Query(ctx, vecs[0], 12)
+		if err != nil {
+			// The memory is stored; surface the scan failure (like Python,
+			// where an exception after collection.add leaves the row in).
+			return m, true, nil, fmt.Errorf("conflict scan: %w", err)
+		}
+		conflicts := detectConflicts(m, hitsToMemoriesWithScore(hits), s.cfg.ConflictThreshold, s.cfg.ConflictFn)
+
+		if len(conflicts) > 0 {
+			switch policy {
+			case PolicyWarn:
+				log.Printf("ai-houkai: %d conflict(s) detected for new memory", len(conflicts))
+			case PolicySupersede:
+				for _, c := range conflicts {
+					_ = s.doSupersede(ctx, c.B.ID, m.ID)
+				}
+			case PolicyRaise:
+				// Roll back the just-added memory — the caller is told it was
+				// not stored, so it must not linger in the backend.
+				_, _ = s.Forget(ctx, m.ID)
+				return Memory{}, false, conflicts, &ConflictError{Conflicts: conflicts}
+			}
+		}
+	}
+
 	return m, true, nil, nil
 }
 
 // RememberOpts are optional fields for Remember.
 type RememberOpts struct {
-	Type       MemoryType
-	Tags       []string
-	Importance float32
+	Type MemoryType
+	Tags []string
+	// Importance nil = unset (auto-score / store default); an explicit value
+	// — including 0 — is honoured and clamped to [0, 1]. Use Float32Ptr.
+	Importance *float32
 	Source     string
 	Polarity   int
 	// OnConflict overrides the store's configured conflict policy for this
@@ -222,14 +252,31 @@ type RememberOpts struct {
 
 // Recall returns up to k memories matching query.
 func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts RecallOpts) ([]MemoryWithScore, error) {
+	if opts.Mode == "" {
+		opts.Mode = ModeSemantic
+	}
+	if err := validateChoice(string(opts.Mode), RecallModes, "mode"); err != nil {
+		return nil, err
+	}
+	if opts.Fusion == "" {
+		opts.Fusion = FusionWeighted
+	}
+	if err := validateChoice(string(opts.Fusion), Fusions, "fusion"); err != nil {
+		return nil, err
+	}
+	if opts.Type != "" {
+		if err := validateChoice(string(opts.Type), MemoryTypes, "type"); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Diversity != nil && (*opts.Diversity < 0 || *opts.Diversity > 1) {
-		return nil, fmt.Errorf("diversity must be in [0, 1]")
+		return nil, validationErrorf("diversity must be in [0, 1]")
 	}
 	if opts.DedupThreshold != nil && (*opts.DedupThreshold < 0 || *opts.DedupThreshold > 1) {
-		return nil, fmt.Errorf("dedup_threshold must be in [0, 1]")
+		return nil, validationErrorf("dedup_threshold must be in [0, 1]")
 	}
 	if opts.MinCosine != nil && (*opts.MinCosine < -1 || *opts.MinCosine > 1) {
-		return nil, fmt.Errorf("min_cosine must be in [-1, 1]")
+		return nil, validationErrorf("min_cosine must be in [-1, 1]")
 	}
 	count, err := s.backend.Count(ctx)
 	if err != nil {
@@ -405,6 +452,81 @@ func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
 	return true, nil
 }
 
+// EditOpts selects the fields Edit changes. Nil pointers leave a field
+// unchanged. Tags: nil = unchanged, an empty non-nil slice clears. Source:
+// nil = unchanged, a pointer to "" clears (the Go analogue of Python's
+// sentinel-vs-None tri-state).
+type EditOpts struct {
+	Text       *string
+	Type       *MemoryType
+	Tags       []string
+	Importance *float32 // clamped to [0, 1]
+	Polarity   *int
+	Source     *string
+}
+
+// Edit updates fields of an existing memory in place, keeping its id.
+//
+// Text changes re-embed the document. Links, superseded_by, created_at, and
+// access tracking are preserved — unlike a Forget+Remember round-trip. The
+// change is journaled (op "edit", with before/after snapshots) and reversible
+// via Undo. A call that changes nothing is a no-op: no write, no journal
+// entry.
+//
+// Returns ErrNotFound (wrapped) if the memory does not exist and a
+// ValidationError on a bad type / polarity / tags / empty text.
+func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) (Memory, error) {
+	mem, err := s.GetByID(ctx, memoryID)
+	if err != nil {
+		return Memory{}, fmt.Errorf("memory_id %q: %w", memoryID, err)
+	}
+	before := mem.ToDict()
+
+	if opts.Type != nil {
+		if err := validateChoice(string(*opts.Type), MemoryTypes, "type"); err != nil {
+			return Memory{}, err
+		}
+		mem.Type = *opts.Type
+	}
+	if opts.Polarity != nil {
+		if err := validatePolarity(*opts.Polarity); err != nil {
+			return Memory{}, err
+		}
+		mem.Polarity = *opts.Polarity
+	}
+	if opts.Importance != nil {
+		mem.Importance = clamp01(*opts.Importance)
+	}
+	if opts.Tags != nil {
+		if err := validateTags(opts.Tags); err != nil {
+			return Memory{}, err
+		}
+		mem.Tags = append([]string{}, opts.Tags...)
+	}
+	if opts.Source != nil {
+		mem.Source = *opts.Source
+	}
+	textChanged := false
+	if opts.Text != nil {
+		newText := strings.TrimSpace(*opts.Text)
+		if newText == "" {
+			return Memory{}, validationErrorf("text must be non-empty")
+		}
+		textChanged = newText != mem.Text
+		mem.Text = newText
+	}
+
+	after := mem.ToDict()
+	if reflect.DeepEqual(after, before) {
+		return mem, nil // nothing to do — keep the journal quiet
+	}
+	if err := s.UpdateMemory(ctx, mem, textChanged); err != nil {
+		return Memory{}, err
+	}
+	s.journalEntry("edit", mem.ID, before, after, nil)
+	return mem, nil
+}
+
 // ListRecent returns up to limit memories sorted by created_at desc.
 func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded bool) ([]Memory, error) {
 	items, err := s.backend.All(ctx)
@@ -504,50 +626,86 @@ func (s *MemoryStore) Link(ctx context.Context, srcID, dstID, rel string) error 
 	return nil
 }
 
-// linkRaw adds a link without journaling. Returns true iff a new edge was inserted.
+// linkRaw adds a link without journaling. Returns true iff a new edge was
+// inserted. Rejects unknown rels, self-links, and dangling endpoints (graph
+// walkers skip targets that don't resolve, so a dangling edge would be stored
+// but unreachable — matching Python).
 func (s *MemoryStore) linkRaw(ctx context.Context, srcID, dstID, rel string) (bool, error) {
+	if err := validateChoice(rel, LinkRels, "rel"); err != nil {
+		return false, err
+	}
 	if srcID == dstID {
-		return false, fmt.Errorf("cannot link a memory to itself")
+		return false, validationErrorf("cannot link a memory to itself")
 	}
 	src, err := s.GetByID(ctx, srcID)
 	if err != nil {
-		return false, fmt.Errorf("link src: %w", err)
+		return false, fmt.Errorf("src_id %q: %w", srcID, err)
+	}
+	dst, err := s.GetByID(ctx, dstID)
+	if err != nil {
+		return false, fmt.Errorf("dst_id %q: %w", dstID, err)
+	}
+	if src.ID == dst.ID {
+		return false, validationErrorf("cannot link a memory to itself")
 	}
 	for _, l := range src.Links {
-		if l.To == dstID && l.Rel == rel {
+		if l.To == dst.ID && l.Rel == rel {
 			return false, nil
 		}
 	}
-	addLink(&src, dstID, rel)
+	addLink(&src, dst.ID, rel)
 	return true, s.backend.UpdateMetadata(ctx, src.ID, MemoryToMetadata(src))
 }
 
 func (s *MemoryStore) Unlink(ctx context.Context, srcID, dstID, rel string) (int, error) {
-	removed, err := s.unlinkRaw(ctx, srcID, dstID, rel)
+	removedRels, err := s.unlinkRaw(ctx, srcID, dstID, rel)
 	if err != nil {
 		return 0, err
 	}
-	if removed > 0 {
+	if len(removedRels) > 0 {
+		// removed_rels is what makes the entry undoable: a rel="" unlink may
+		// drop several differently-typed edges at once.
 		s.journalEntry("unlink", srcID, nil, nil, map[string]any{
-			"src_id": srcID, "dst_id": dstID, "rel": rel, "removed": removed,
+			"src_id": srcID, "dst_id": dstID, "rel": rel,
+			"removed": len(removedRels), "removed_rels": removedRels,
 		})
 	}
-	return removed, nil
+	return len(removedRels), nil
 }
 
-// unlinkRaw removes link(s) without journaling.
-func (s *MemoryStore) unlinkRaw(ctx context.Context, srcID, dstID, rel string) (int, error) {
-	src, err := s.GetByID(ctx, srcID)
-	if err != nil {
-		return 0, fmt.Errorf("unlink src: %w", err)
-	}
-	removed := removeLinks(&src, dstID, rel)
-	if removed > 0 {
-		if err := s.backend.UpdateMetadata(ctx, src.ID, MemoryToMetadata(src)); err != nil {
-			return 0, err
+// unlinkRaw removes matching link(s) without journaling and returns the
+// removed rels. A missing src is a no-op (matching Python).
+func (s *MemoryStore) unlinkRaw(ctx context.Context, srcID, dstID, rel string) ([]string, error) {
+	if rel != "" {
+		if err := validateChoice(rel, LinkRels, "rel"); err != nil {
+			return nil, err
 		}
 	}
-	return removed, nil
+	src, err := s.GetByID(ctx, srcID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("src_id %q: %w", srcID, err)
+	}
+	// Links store full ids; resolve a dst prefix when possible.
+	dst := dstID
+	if d, err := s.GetByID(ctx, dstID); err == nil {
+		dst = d.ID
+	}
+	var removedRels []string
+	for _, l := range src.Links {
+		if l.To == dst && (rel == "" || l.Rel == rel) {
+			removedRels = append(removedRels, l.Rel)
+		}
+	}
+	if len(removedRels) > 0 {
+		removeLinks(&src, dst, rel)
+		if err := s.backend.UpdateMetadata(ctx, src.ID, MemoryToMetadata(src)); err != nil {
+			return nil, err
+		}
+	}
+	return removedRels, nil
 }
 
 type NeighborResult struct {
@@ -555,33 +713,55 @@ type NeighborResult struct {
 	Rel string `json:"rel"`
 }
 
+// Neighbors returns (memory, rel) pairs reachable from memID via links.
+// Two memories may be joined by several differently-typed edges — each rel is
+// reported as its own pair, but the node is visited/expanded only once
+// (matching Python).
 func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction string, depth int) ([]NeighborResult, error) {
+	if err := validateChoice(direction, Directions, "direction"); err != nil {
+		return nil, err
+	}
+	if rel != "" {
+		if err := validateChoice(rel, LinkRels, "rel"); err != nil {
+			return nil, err
+		}
+	}
 	if depth <= 0 {
 		depth = 1
 	}
-	visited := map[string]bool{memID: true}
+	// Links store full ids; resolve a starting prefix when possible.
+	root := memID
+	if m, err := s.GetByID(ctx, memID); err == nil {
+		root = m.ID
+	}
+	visited := map[string]bool{root: true}
 	var results []NeighborResult
-	queue := []string{memID}
+	queue := []string{root}
 
 	for d := 0; d < depth && len(queue) > 0; d++ {
 		var next []string
 		for _, qid := range queue {
-			m, err := s.GetByID(ctx, qid)
-			if err != nil {
-				continue
-			}
 			// Outgoing links.
 			if direction == "out" || direction == "both" {
-				for _, l := range m.Links {
-					if rel != "" && l.Rel != rel {
-						continue
-					}
-					if visited[l.To] {
-						continue
-					}
-					nb, err := s.GetByID(ctx, l.To)
-					if err == nil {
-						results = append(results, NeighborResult{Memory: nb, Rel: l.Rel})
+				m, err := s.GetByID(ctx, qid)
+				if err == nil {
+					for _, l := range m.Links {
+						if rel != "" && l.Rel != rel {
+							continue
+						}
+						if visited[l.To] {
+							continue
+						}
+						nb, err := s.GetByID(ctx, l.To)
+						if err != nil {
+							continue
+						}
+						// Report one pair per parallel edge to this target.
+						for _, parallel := range m.Links {
+							if parallel.To == l.To && (rel == "" || parallel.Rel == rel) {
+								results = append(results, NeighborResult{Memory: nb, Rel: parallel.Rel})
+							}
+						}
 						visited[l.To] = true
 						next = append(next, l.To)
 					}
@@ -595,16 +775,18 @@ func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction strin
 					if visited[other.ID] {
 						continue
 					}
+					var matched []string
 					for _, l := range other.Links {
-						if l.To == qid {
-							if rel != "" && l.Rel != rel {
-								continue
-							}
-							results = append(results, NeighborResult{Memory: other, Rel: l.Rel})
-							visited[other.ID] = true
-							next = append(next, other.ID)
-							break
+						if l.To == qid && (rel == "" || l.Rel == rel) {
+							matched = append(matched, l.Rel)
 						}
+					}
+					if len(matched) > 0 {
+						for _, r := range matched {
+							results = append(results, NeighborResult{Memory: other, Rel: r})
+						}
+						visited[other.ID] = true
+						next = append(next, other.ID)
 					}
 				}
 			}
@@ -614,36 +796,50 @@ func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction strin
 	return results, nil
 }
 
+// Subgraph returns the graph of memories reachable from the seed ids within
+// depth hops, following OUTGOING links (matching Python's subgraph). Every
+// seed is expanded; zero seeds yield an empty graph. A per-node "best
+// remaining budget" is tracked instead of a plain visited set so diamonds are
+// not truncated: a node first reached with 0 remaining hops is expanded again
+// when a shorter path reaches it with budget to spare.
 func (s *MemoryStore) Subgraph(ctx context.Context, ids []string, depth int) (Graph, error) {
 	var g Graph
-	nodeSet := make(map[string]bool)
-	for _, id := range ids {
-		nodeSet[id] = true
-	}
-	nbs, err := s.Neighbors(ctx, ids[0], "", "both", depth)
-	if err != nil {
-		return g, err
-	}
-	for _, nb := range nbs {
-		nodeSet[nb.ID] = true
-	}
+	bestRemaining := map[string]int{}
+	inNodes := map[string]bool{}
+	type edgeKey struct{ from, to, rel string }
+	edgeSeen := map[edgeKey]bool{}
 
-	for id := range nodeSet {
-		m, err := s.GetByID(ctx, id)
-		if err == nil {
+	var visit func(mid string, remaining int)
+	visit = func(mid string, remaining int) {
+		m, err := s.GetByID(ctx, mid)
+		if err != nil {
+			return
+		}
+		if prev, ok := bestRemaining[m.ID]; ok && prev >= remaining {
+			return
+		}
+		bestRemaining[m.ID] = remaining
+		if !inNodes[m.ID] {
+			inNodes[m.ID] = true
 			g.Nodes = append(g.Nodes, m)
 		}
-	}
-	for _, node := range g.Nodes {
-		for _, l := range node.Links {
-			if nodeSet[l.To] {
-				g.Edges = append(g.Edges, struct {
-					From string
-					To   string
-					Rel  string
-				}{From: node.ID, To: l.To, Rel: l.Rel})
+		if remaining > 0 {
+			for _, l := range m.Links {
+				k := edgeKey{m.ID, l.To, l.Rel}
+				if !edgeSeen[k] {
+					edgeSeen[k] = true
+					g.Edges = append(g.Edges, struct {
+						From string
+						To   string
+						Rel  string
+					}{From: m.ID, To: l.To, Rel: l.Rel})
+				}
+				visit(l.To, remaining-1)
 			}
 		}
+	}
+	for _, mid := range ids {
+		visit(mid, depth)
 	}
 	return g, nil
 }
@@ -717,54 +913,76 @@ func (s *MemoryStore) findConflictsAll(ctx context.Context, threshold float32) (
 	return conflicts, nil
 }
 
+// Supersede marks oldID as superseded by newID and adds a single 'supersedes'
+// link on the NEW memory pointing at the old one (matching Python — the old
+// memory carries no edge). Rejects self-supersede, unknown ids, and cycles;
+// re-superseding by the same id is an idempotent no-op.
 func (s *MemoryStore) Supersede(ctx context.Context, oldID, newID string) error {
 	return s.doSupersede(ctx, oldID, newID)
 }
 
 func (s *MemoryStore) doSupersede(ctx context.Context, oldID, newID string) error {
+	if oldID == newID {
+		return validationErrorf("cannot supersede a memory with itself")
+	}
 	old, err := s.GetByID(ctx, oldID)
 	if err != nil {
-		return fmt.Errorf("supersede old: %w", err)
+		return fmt.Errorf("old_id %q: %w", oldID, err)
 	}
+	newMem, err := s.GetByID(ctx, newID)
+	if err != nil {
+		return fmt.Errorf("new_id %q: %w", newID, err)
+	}
+	if old.ID == newMem.ID {
+		return validationErrorf("cannot supersede a memory with itself")
+	}
+	if newMem.SupersededBy == old.ID {
+		return validationErrorf("cycle: %s is already superseded by %s", newMem.ID, old.ID)
+	}
+	if old.SupersededBy == newMem.ID {
+		return nil // idempotent
+	}
+
 	before := old.ToDict()
-	now := nowFloat()
-	old.SupersededBy = newID
-	old.SupersededAt = now
-	addLink(&old, newID, RelSupersedes)
+	old.SupersededBy = newMem.ID
+	old.SupersededAt = nowFloat()
 	if err := s.backend.UpdateMetadata(ctx, old.ID, MemoryToMetadata(old)); err != nil {
 		return err
 	}
-	// Add reverse link on new memory.
-	newMem, err := s.GetByID(ctx, newID)
-	if err == nil {
-		addLink(&newMem, oldID, RelSupersedes)
-		_ = s.backend.UpdateMetadata(ctx, newMem.ID, MemoryToMetadata(newMem))
+	if _, err := s.linkRaw(ctx, newMem.ID, old.ID, RelSupersedes); err != nil {
+		return err
 	}
-	s.journalEntry("supersede", oldID, before, old.ToDict(),
-		map[string]any{"old_id": oldID, "new_id": newID})
+	s.journalEntry("supersede", old.ID, before, old.ToDict(),
+		map[string]any{"old_id": old.ID, "new_id": newMem.ID})
 	return nil
 }
 
-func (s *MemoryStore) Restore(ctx context.Context, memID string) error {
+// Restore clears the superseded_by marker on a memory (undo a supersede) and
+// removes the superseder's 'supersedes' edge. Returns false when the memory
+// does not exist or is not superseded (matching Python).
+func (s *MemoryStore) Restore(ctx context.Context, memID string) (bool, error) {
 	m, err := s.GetByID(ctx, memID)
 	if err != nil {
-		return err
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
 	if m.SupersededBy == "" {
-		return nil
+		return false, nil
 	}
 	before := m.ToDict()
 	superseder := m.SupersededBy
 	m.SupersededBy = ""
 	m.SupersededAt = 0
 	if err := s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(m)); err != nil {
-		return err
+		return false, err
 	}
 	// Remove the "supersedes" edge from the superseder, matching Python.
-	_, _ = s.unlinkRaw(ctx, superseder, memID, RelSupersedes)
-	s.journalEntry("restore", memID, before, m.ToDict(),
+	_, _ = s.unlinkRaw(ctx, superseder, m.ID, RelSupersedes)
+	s.journalEntry("restore", m.ID, before, m.ToDict(),
 		map[string]any{"superseder_id": superseder})
-	return nil
+	return true, nil
 }
 
 // touchMany bumps access tracking for several memories, mirroring Python's

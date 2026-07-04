@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,15 +24,44 @@ func maintCfg(cfg Config) maintenance.Config {
 	if err != nil {
 		summ = nil // reflect.New falls back to the extractive summarizer
 	}
+	consolidate := reflectpkg.ConsolidateNone
+	if cfg.Maintenance.Consolidate {
+		consolidate = reflectpkg.ConsolidateSoft
+	}
 	return maintenance.Config{
 		Interval:        interval,
 		DecayRate:       cfg.Maintenance.Decay.DecayRate,
 		MinScore:        cfg.Maintenance.Decay.MinScore,
 		Reflect:         cfg.Maintenance.Reflect,
-		Consolidate:     cfg.Maintenance.Consolidate,
+		Consolidate:     consolidate,
+		DecayEvery:      float64(cfg.Maintenance.DecayEverySecs),
+		ReflectEvery:    float64(cfg.Maintenance.ReflectEverySecs),
 		FrequencyWeight: cfg.Maintenance.Decay.FrequencyWeight,
 		Summarizer:      summ,
 	}
+}
+
+// MaintenanceRuntime resolves the maintenance.Config and state path for cfg —
+// used by the MCP entry point to wire the schedule-gated maintenance_tick.
+func MaintenanceRuntime(cfg Config) (maintenance.Config, string) {
+	statePath, _, _ := cfg.MaintPaths()
+	return maintCfg(cfg), statePath
+}
+
+// tickSummary renders a TickResult as a one-line human summary, mirroring
+// Python's TickResult.summary(): gated-out jobs are reported as skipped.
+func tickSummary(res maintenance.TickResult) string {
+	var parts []string
+	if res.RanDecay {
+		parts = append(parts, fmt.Sprintf("decay pruned %d", res.Pruned))
+	}
+	if res.RanReflect {
+		parts = append(parts, fmt.Sprintf("reflect created %d", res.Reflected))
+	}
+	if len(parts) == 0 {
+		return "nothing to do (jobs not due yet)"
+	}
+	return strings.Join(parts, " | ")
 }
 
 func fmtTS(ts float64) string {
@@ -65,7 +95,7 @@ func newMaintTickCmd() *cobra.Command {
 			cfg := cfgFromCtx(cmd.Context())
 			statePath, _, _ := cfg.MaintPaths()
 			res := maintenance.Tick(cmd.Context(), store, store, maintCfg(cfg), statePath, float64(time.Now().Unix()))
-			fmt.Printf("Tick complete: pruned %d, reflected %d\n", res.Pruned, res.Reflected)
+			fmt.Printf("Tick complete: %s\n", tickSummary(res))
 			return res.Err
 		},
 	}
@@ -90,7 +120,7 @@ func newMaintRunCmd() *cobra.Command {
 				if res.Err != nil {
 					log.Printf("maintenance tick error: %v", res.Err)
 				} else {
-					log.Printf("maintenance tick: pruned %d, reflected %d", res.Pruned, res.Reflected)
+					log.Printf("maintenance tick: %s", tickSummary(res))
 				}
 			}
 			runOne() // one immediate pass on startup

@@ -7,6 +7,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from ai_houkai.memory_system import Journal, JournalEntry, MemoryStore
 
 
@@ -192,3 +194,97 @@ def test_undo_unlink_legacy_entry_without_removed_rels(store: MemoryStore) -> No
     )
     assert store.undo(legacy) is True
     assert [l.rel for l in store._get_by_id(a.id).links if l.to == b.id] == ["refines"]
+
+
+def test_undo_edit_restores_previous_state(store: MemoryStore) -> None:
+    mem = store.remember(text="version A", importance=0.4)
+    store.edit(mem.id, text="version B")
+    entry = next(e for e in store.journal.read() if e.op == "edit")
+    assert store.undo(entry) is True
+    assert store._get_by_id(mem.id).text == "version A"
+
+
+def test_undo_edit_refuses_after_later_edit(store: MemoryStore) -> None:
+    """Undoing an edit whose target has since been edited again would clobber
+    the newer state — it must return False and change nothing."""
+    mem = store.remember(text="state A")
+    store.edit(mem.id, text="state B")
+    store.edit(mem.id, text="state C")
+    first_edit = next(e for e in store.journal.read()
+                      if e.op == "edit" and (e.after or {}).get("text") == "state B")
+    assert store.undo(first_edit) is False
+    assert store._get_by_id(mem.id).text == "state C"
+
+
+def test_undo_edit_refuses_after_supersede(store: MemoryStore) -> None:
+    """undo(edit) must not resurrect a memory that was superseded after the
+    edit — the restore would silently clear superseded_by."""
+    old = store.remember(text="fact v1")
+    store.edit(old.id, text="fact v1 (fixed)")
+    new = store.remember(text="fact v2")
+    store.supersede(old_id=old.id, new_id=new.id)
+    entry = next(e for e in store.journal.read() if e.op == "edit")
+    assert store.undo(entry) is False
+    assert store._get_by_id(old.id).superseded_by == new.id
+
+
+def test_undo_edit_tolerates_access_bumps(store: MemoryStore) -> None:
+    """A recall touch between edit and undo only changes volatile access
+    tracking — that must not block the undo."""
+    mem = store.remember(text="often recalled fact")
+    store.edit(mem.id, text="often recalled fact (edited)")
+    store.recall("often recalled", k=1)   # bumps access_count/last_accessed
+    entry = next(e for e in store.journal.read() if e.op == "edit")
+    assert store.undo(entry) is True
+    assert store._get_by_id(mem.id).text == "often recalled fact"
+
+
+def _entry(i: int) -> JournalEntry:
+    return JournalEntry(ts=1000.0 + i, op="remember", actor="t", id=f"id-{i}",
+                        before=None, after={"text": "x" * 200}, meta={})
+
+
+def test_rotate_renames_then_compresses(tmp_path: Path) -> None:
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(10):
+        j.append(_entry(i))
+    j._rotate()
+    # Active file was renamed away — nothing left to lose to a truncate.
+    assert not (tmp_path / "j.log").exists()
+    archives = list(tmp_path.glob("j-*.log.gz"))
+    assert len(archives) == 1
+    assert not list(tmp_path.glob("j-*.log"))       # rotated file cleaned up
+    # New appends land in a fresh active file.
+    j.append(_entry(99))
+    assert (tmp_path / "j.log").exists()
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(10)] + ["id-99"]
+
+
+def test_rotate_crash_mid_compress_loses_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If compression dies after the rename, the plain rotated file remains
+    and read(include_archives=True) still returns every entry."""
+    import ai_houkai.memory_system.journal as journal_mod
+
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(5):
+        j.append(_entry(i))
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(journal_mod.gzip, "open", boom)
+    with pytest.raises(OSError):
+        j._rotate()
+    monkeypatch.undo()
+
+    orphans = list(tmp_path.glob("j-*.log"))
+    assert len(orphans) == 1                        # rename happened
+    assert not (tmp_path / "j.log").exists()
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(5)]
+    # And appends keep working on a fresh active file.
+    j.append(_entry(9))
+    assert [e.id for e in j.read(include_archives=True)][-1] == "id-9"

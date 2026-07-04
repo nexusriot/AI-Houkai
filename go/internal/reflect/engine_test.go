@@ -28,11 +28,13 @@ func (f *fakeReflectStore) AllRaw(_ context.Context) ([]vector.Item, error) {
 }
 func (f *fakeReflectStore) Remember(_ context.Context, text string, opts memory.RememberOpts) (memory.Memory, bool, []memory.Conflict, error) {
 	m := memory.Memory{
-		ID:         "new-" + text[:min(8, len(text))],
-		Text:       text,
-		Type:       opts.Type,
-		Tags:       opts.Tags,
-		Importance: opts.Importance,
+		ID:   "new-" + text[:min(8, len(text))],
+		Text: text,
+		Type: opts.Type,
+		Tags: opts.Tags,
+	}
+	if opts.Importance != nil {
+		m.Importance = *opts.Importance
 	}
 	f.added = append(f.added, m)
 	return m, true, nil, nil

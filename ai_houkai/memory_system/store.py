@@ -23,7 +23,7 @@ import time
 import uuid
 import warnings
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Literal
 
@@ -1009,6 +1009,7 @@ class MemoryStore:
         min_cosine: float | None = None,
         header: str = "## Relevant memory",
         token_counter: Callable[[str], int] | None = None,
+        touch: bool = True,
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
@@ -1023,7 +1024,8 @@ class MemoryStore:
 
         ``min_cosine`` applies an absolute relevance floor to every fan-out
         query, so an off-topic task injects nothing rather than padding context
-        with weak hits.
+        with weak hits. ``touch=False`` skips the access-count bump on every
+        fan-out recall (read-only packing).
 
         Note: this uses the default *weighted* fusion. ``fusion="rrf"`` is not
         offered here because RRF scores are rank-relative to each query's own
@@ -1035,7 +1037,7 @@ class MemoryStore:
         best: dict[str, tuple[Memory, float]] = {}
         for q in queries:
             for mem, score in self.recall(
-                query=q, k=10, mode=mode, min_cosine=min_cosine,
+                query=q, k=10, mode=mode, min_cosine=min_cosine, touch=touch,
             ):
                 if mem.id not in best or score > best[mem.id][1]:
                     best[mem.id] = (mem, score)
@@ -1480,45 +1482,77 @@ class MemoryStore:
             src = header.get("source") or {}
             src_model = src.get("embedding_model")
             src_dim   = int(src.get("embedding_dim") or 0)
+            opts = header.get("options") or {}
+            # A vectorless export (include_vectors=False) re-embeds on import
+            # regardless of which model wrote it, so a model mismatch only
+            # matters when the file actually carries vectors.
+            file_has_vectors = bool(opts.get("include_vectors", True)) and src_dim > 0
 
             model_mismatch = src_model and src_model != self.embedding_model
-            if model_mismatch and not regenerate_vectors:
+            if model_mismatch and file_has_vectors and not regenerate_vectors:
                 raise ImportError(
                     f"embedding model mismatch (file: {src_model!r}, "
                     f"store: {self.embedding_model!r}) — pass "
                     f"regenerate_vectors=True to re-embed on import"
                 )
-            summary.vectors_regenerated = bool(model_mismatch)
+            use_vectors = not model_mismatch and file_has_vectors
 
-            with self.as_actor("import"):
-                for lineno, line in enumerate(f, 2):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError as e:
-                        summary.errors.append((f"line:{lineno}", f"bad json: {e}"))
-                        continue
-                    try:
-                        self._import_one(
-                            row, on_conflict=on_conflict,
-                            use_vectors=not model_mismatch and src_dim > 0,
-                            dry_run=dry_run, summary=summary,
-                            collisions=collisions,
-                        )
-                    except _ImportConflict:
-                        # Collected; raised below
-                        pass
-                    except Exception as e:    # pragma: no cover — defensive
-                        summary.errors.append((row.get("id", "?"), str(e)))
+            # Parse every row up front so an on_conflict="error" run can
+            # detect ALL collisions before the first write — an aborted
+            # import must leave the store untouched.
+            rows: list[dict[str, Any]] = []
+            for lineno, line in enumerate(f, 2):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    summary.errors.append((f"line:{lineno}", f"bad json: {e}"))
 
-        if on_conflict == "error" and collisions:
-            head = collisions[:10]
+        if on_conflict == "error":
+            seen_ids: set[str] = set()
+            for row in rows:
+                meta = row.get("meta") or {}
+                rid = str(row.get("id") or meta.get("id") or "")
+                existing = self._get_by_id(rid) if rid else None
+                if existing is not None:
+                    collisions.append((rid, existing.text[:80]))
+                elif rid in seen_ids:
+                    collisions.append((rid, "(duplicate id within import file)"))
+                seen_ids.add(rid)
+            if collisions:
+                head = collisions[:10]
+                raise ImportConflictError(
+                    f"{len(collisions)} id collision(s) on import; "
+                    f"first: {head}", collisions=collisions,
+                )
+
+        with self.as_actor("import"):
+            for row in rows:
+                try:
+                    self._import_one(
+                        row, on_conflict=on_conflict,
+                        use_vectors=use_vectors,
+                        dry_run=dry_run, summary=summary,
+                        collisions=collisions,
+                    )
+                except _ImportConflict:
+                    # Collected; raised below
+                    pass
+                except Exception as e:    # pragma: no cover — defensive
+                    summary.errors.append((row.get("id", "?"), str(e)))
+
+        if on_conflict == "error" and collisions:  # pragma: no cover — pre-scan
+            head = collisions[:10]                 # above should catch these
             raise ImportConflictError(
                 f"{len(collisions)} id collision(s) on import; "
                 f"first: {head}", collisions=collisions,
             )
+        # Any row written without a vector was re-embedded by the collection —
+        # either the models mismatched or the file carried no vectors at all.
+        wrote = summary.imported + summary.overwritten + summary.renamed
+        summary.vectors_regenerated = not use_vectors and wrote > 0
         return summary
 
     def _import_one(
@@ -1607,11 +1641,22 @@ class MemoryStore:
             return True
 
         if entry.op == "edit":
-            if entry.before is None:
+            if entry.before is None or entry.after is None:
                 return False
             current = self._get_by_id(entry.id)
             if current is None:
                 return False  # memory has since been forgotten
+            # Refuse when the memory changed after this edit (a later edit,
+            # supersede, link, …) — blindly restoring `before` would clobber
+            # that newer state. Access tracking is volatile (any recall bumps
+            # it) and is restored from `before` anyway, so ignore it here.
+            volatile = ("last_accessed", "access_count")
+            current_state = {k: v for k, v in current.to_dict().items()
+                             if k not in volatile}
+            after_state = {k: v for k, v in entry.after.items()
+                           if k not in volatile}
+            if current_state != after_state:
+                return False
             restored = Memory.from_dict(entry.before)
             # Always pass documents: the edit may have changed the text, and
             # re-embedding unchanged text is harmless.

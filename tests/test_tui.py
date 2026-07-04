@@ -140,3 +140,60 @@ async def test_app_search_flow(seeded):
         assert app.nav.current.kind == "search"
         table = app.query_one("#list")
         assert table.row_count > 0
+
+
+class TestSearchDoesNotTouch:
+    def test_search_view_leaves_access_stats_alone(self, seeded):
+        """TUI browsing is read-only: recall via the search box must not bump
+        access_count/last_accessed (it would feed decay reinforcement)."""
+        store, (a, _, _) = seeded
+        before = store._get_by_id(a.id)
+        assert before.access_count == 0
+        search_view(store, "deployment release")
+        after = store._get_by_id(a.id)
+        assert after.access_count == 0
+        assert after.last_accessed == before.last_accessed
+
+
+@pytest.mark.asyncio
+async def test_nuke_double_press_nukes(seeded):
+    store, _ = seeded
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        await pilot.press("X")
+        assert app._nuke_pending is True
+        await pilot.press("X")
+        assert store.count() == 0
+
+
+@pytest.mark.asyncio
+async def test_nuke_confirmation_expires(seeded, monkeypatch):
+    """The armed nuke state must expire with the warning toast — a stray X
+    long after the prompt disappeared must not wipe the store."""
+    import asyncio
+
+    store, _ = seeded
+    monkeypatch.setattr(HoukaiTui, "NUKE_CONFIRM_SECONDS", 0.5)
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        await pilot.press("X")
+        assert app._nuke_pending is True
+        await asyncio.sleep(1.0)
+        await pilot.pause()
+        assert app._nuke_pending is False         # expired with the toast
+        await pilot.press("X")                    # stray X only re-arms
+        assert store.count() == 3
+        assert app._nuke_pending is True
+
+
+@pytest.mark.asyncio
+async def test_nuke_disarmed_by_navigation(seeded):
+    store, _ = seeded
+    app = HoukaiTui(store=store, collection="test")
+    async with app.run_test() as pilot:
+        await pilot.press("X")
+        assert app._nuke_pending is True
+        await pilot.press("r")                    # navigating disarms
+        assert app._nuke_pending is False
+        await pilot.press("X")                    # this X re-arms, not nukes
+        assert store.count() == 3

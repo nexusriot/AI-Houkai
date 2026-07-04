@@ -35,10 +35,11 @@ func ts(daysAgo float64) float64 {
 
 func TestScoreDecaysWithAge(t *testing.T) {
 	e := New(nil, 0.1, 0.05, nil, 0)
+	now := time.Now()
 	fresh := memory.Memory{Importance: 1.0, LastAccessed: ts(0)}
 	old := memory.Memory{Importance: 1.0, LastAccessed: ts(30)}
-	if e.Score(fresh) <= e.Score(old) {
-		t.Errorf("fresh (%.3f) should outscore old (%.3f)", e.Score(fresh), e.Score(old))
+	if e.scoreAt(fresh, now) <= e.scoreAt(old, now) {
+		t.Errorf("fresh (%.3f) should outscore old (%.3f)", e.scoreAt(fresh, now), e.scoreAt(old, now))
 	}
 }
 
@@ -81,26 +82,28 @@ func TestPruneDryRunDoesNotDelete(t *testing.T) {
 func TestFrequencyWeightOffMatchesRecencyOnly(t *testing.T) {
 	// With frequency_weight=0 the access count must not affect the score.
 	plain := New(nil, 0.1, 0.05, nil, 0)
+	now := time.Now()
 	rare := memory.Memory{Importance: 0.5, LastAccessed: ts(10), AccessCount: 0}
 	often := memory.Memory{Importance: 0.5, LastAccessed: ts(10), AccessCount: 50}
-	if plain.Score(rare) != plain.Score(often) {
+	if plain.scoreAt(rare, now) != plain.scoreAt(often, now) {
 		t.Errorf("frequency_weight=0 should ignore access_count: %.4f vs %.4f",
-			plain.Score(rare), plain.Score(often))
+			plain.scoreAt(rare, now), plain.scoreAt(often, now))
 	}
 }
 
 func TestFrequencyWeightReinforcesFrequentRecalls(t *testing.T) {
 	reinf := New(nil, 0.1, 0.05, nil, 0.2)
+	now := time.Now()
 	// Equal importance and age (fresh, so decay ≈ 1); only access count differs.
 	rare := memory.Memory{Importance: 0.5, LastAccessed: ts(0), AccessCount: 0}
 	often := memory.Memory{Importance: 0.5, LastAccessed: ts(0), AccessCount: 20}
-	if reinf.Score(often) <= reinf.Score(rare) {
+	if reinf.scoreAt(often, now) <= reinf.scoreAt(rare, now) {
 		t.Errorf("frequently-recalled memory should score higher: often=%.4f rare=%.4f",
-			reinf.Score(often), reinf.Score(rare))
+			reinf.scoreAt(often, now), reinf.scoreAt(rare, now))
 	}
 	// On a fresh memory reinforcement pushes the score above raw importance.
-	if reinf.Score(often) <= often.Importance {
-		t.Errorf("reinforced score %.4f should exceed importance %.2f", reinf.Score(often), often.Importance)
+	if reinf.scoreAt(often, now) <= often.Importance {
+		t.Errorf("reinforced score %.4f should exceed importance %.2f", reinf.scoreAt(often, now), often.Importance)
 	}
 }
 
