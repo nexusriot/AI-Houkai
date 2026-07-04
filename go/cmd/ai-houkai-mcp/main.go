@@ -73,6 +73,10 @@ func main() {
 
 	s := mcpserver.New(store, cfg.StorePath, cfg.Collection)
 	mcpserver.SetSummarizerSpec(cfg.Summarizer)
+	// Schedule-gate the maintenance_tick tool with the configured intervals
+	// and state file (mirrors Python's config-driven MaintenanceScheduler).
+	mc, statePath := cli.MaintenanceRuntime(cfg)
+	mcpserver.SetMaintenance(mc, statePath)
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("MCP server: %v", err)
 	}

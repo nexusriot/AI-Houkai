@@ -12,7 +12,7 @@ Library use:
 
     from ai_houkai.installers import ClaudeCodeInstaller
 
-    inst = ClaudeCodeInstaller(memory_path="~/.ai_houkai")
+    inst = ClaudeCodeInstaller(memory_path="~/.ai_houkai/.chroma")
     inst.install()                # register (CLI or ~/.claude.json)
     inst.install(scope="project") # register in ./.mcp.json
     inst.print_config()           # preview the JSON block
@@ -39,15 +39,22 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ai_houkai.installers.common import load_json, verify_server, write_json
+from ai_houkai.installers.common import (
+    load_json,
+    resolve_mcp_command,
+    verify_server,
+    write_json,
+)
 
 
 DEFAULT_CONFIG_PATH  = os.path.expanduser("~/.claude.json")
 PROJECT_CONFIG_PATH  = ".mcp.json"
-DEFAULT_MEMORY_PATH  = os.path.expanduser("~/.ai_houkai")
+# `.chroma` leaf matches the CLI default (~/.ai_houkai/.chroma) so `houkai
+# list` sees installed-client memories, and the store's journal.log lands in
+# ~/.ai_houkai/ instead of $HOME (it is written to the store path's parent).
+DEFAULT_MEMORY_PATH  = os.path.expanduser("~/.ai_houkai/.chroma")
 DEFAULT_COLLECTION   = "claude_code"
 SERVER_NAME          = "ai-houkai"
-CONSOLE_SCRIPT       = "ai-houkai-mcp"
 
 
 CLAUDEMD_SNIPPET = textwrap.dedent("""
@@ -79,14 +86,6 @@ CLAUDEMD_SNIPPET = textwrap.dedent("""
 """).strip()
 
 
-def _resolve_mcp_command() -> str:
-    """Return the absolute path to the ai-houkai-mcp console script if found."""
-    scripts = os.path.join(os.path.dirname(sys.executable), CONSOLE_SCRIPT)
-    if os.path.isfile(scripts):
-        return scripts
-    return CONSOLE_SCRIPT  # PATH lookup at runtime
-
-
 @dataclass
 class ClaudeCodeInstaller:
     """Register the AI-Houkai MCP server with Claude Code."""
@@ -102,7 +101,7 @@ class ClaudeCodeInstaller:
 
     @property
     def mcp_command(self) -> str:
-        return _resolve_mcp_command()
+        return resolve_mcp_command()
 
     def build_env(self) -> dict:
         return {

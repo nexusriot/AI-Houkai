@@ -34,7 +34,7 @@ func seedPack(t *testing.T, store *MemoryStore) {
 	}
 	for _, s := range seeds {
 		if _, _, _, err := store.Remember(ctx, s.text, RememberOpts{
-			Type: s.typ, Tags: s.tags, Importance: s.imp,
+			Type: s.typ, Tags: s.tags, Importance: Float32Ptr(s.imp),
 		}); err != nil {
 			t.Fatalf("seed: %v", err)
 		}

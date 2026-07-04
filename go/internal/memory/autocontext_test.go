@@ -30,8 +30,8 @@ func TestAutoContextPackDedupesByID(t *testing.T) {
 	ctx := context.Background()
 	// A memory whose text overlaps both the full task and an extracted phrase,
 	// so it surfaces from multiple fan-out queries but must appear once.
-	store.Remember(ctx, "deployment pipeline runbook and rollback steps", RememberOpts{Type: Procedural, Importance: 0.9})
-	store.Remember(ctx, "unrelated cooking recipe", RememberOpts{Type: Semantic, Importance: 0.2})
+	store.Remember(ctx, "deployment pipeline runbook and rollback steps", RememberOpts{Type: Procedural, Importance: Float32Ptr(0.9)})
+	store.Remember(ctx, "unrelated cooking recipe", RememberOpts{Type: Semantic, Importance: Float32Ptr(0.2)})
 
 	pack, err := store.AutoContextPack(ctx, "the deployment pipeline failed", AutoContextOpts{TokenBudget: 800, MaxPhrases: 3})
 	if err != nil {

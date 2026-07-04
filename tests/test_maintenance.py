@@ -539,3 +539,60 @@ class TestTickCrossProcessLock:
             state_path=str(state_path),
         ).tick()
         assert (tmp_path / "state.lock").exists()
+
+
+class TestSchedulerConsolidate:
+    """[maintenance.reflect] consolidate must reach ReflectionEngine.reflect —
+    without it a scheduled apply-mode reflection re-creates the same summaries
+    on every run."""
+
+    def _sched(self, store, tmp_path, **kwargs):
+        defaults = dict(
+            decay_every=None,
+            reflect_every=3_600,
+            tick_interval=300,
+            state_path=str(tmp_path / "state.json"),
+            min_cluster_size=2,
+        )
+        defaults.update(kwargs)
+        return MaintenanceScheduler(store=store, **defaults)
+
+    def test_consolidate_kwarg_reaches_engine(self, store, tmp_path, monkeypatch):
+        captured: dict = {}
+
+        class FakeEngine:
+            def __init__(self, *a, **k):
+                pass
+
+            def reflect(self, dry_run, consolidate):
+                captured["dry_run"] = dry_run
+                captured["consolidate"] = consolidate
+                return []
+
+        monkeypatch.setattr(sched_mod, "ReflectionEngine", FakeEngine)
+        sched = self._sched(store, tmp_path, reflect_apply=True,
+                            reflect_consolidate="hard")
+        result = sched.tick()
+        assert result.ran_reflect is True
+        assert captured == {"dry_run": False, "consolidate": "hard"}
+
+    def test_default_is_soft_consolidation(self, store, tmp_path):
+        assert self._sched(store, tmp_path).reflect_consolidate is True
+
+    def test_scheduled_apply_does_not_duplicate_summaries(self, store, tmp_path):
+        for day in ("Monday", "Tuesday", "Wednesday"):
+            store.remember(f"Deployed the billing service to production on {day}.",
+                           type="episodic", importance=0.5)
+        sched = self._sched(store, tmp_path, reflect_apply=True)
+
+        t0 = time.time()
+        first = sched.tick(now=t0)
+        assert first.ran_reflect and first.reflected >= 1
+
+        second = sched.tick(now=t0 + 7_200)   # next interval — sources are
+        assert second.ran_reflect             # consolidated, nothing re-summarised
+        assert second.reflected == 0
+
+        summaries = [m for m in store.list_recent(limit=100)
+                     if "reflection" in m.tags]
+        assert len(summaries) == first.reflected

@@ -114,6 +114,12 @@ class MaintenanceScheduler:
     reflect_apply
         If False (default), reflection runs in dry-run mode (no writes).
         If True, reflection summaries are written to the store.
+    reflect_consolidate
+        Forwarded to ``ReflectionEngine.reflect(consolidate=…)`` when applying:
+        ``False`` leaves source episodics untouched, ``True`` (default)
+        soft-deletes them under the new summary, ``"hard"`` deletes them.
+        Without consolidation a scheduled apply-mode reflection would create
+        duplicate summaries for the same clusters on every run.
     summarizer
         Optional ``Callable[[list[Memory]], str]`` forwarded to
         ReflectionEngine (e.g. from ``build_summarizer("ollama:llama3.1")``).
@@ -133,6 +139,7 @@ class MaintenanceScheduler:
         frequency_weight: float = 0.0,
         min_cluster_size: int = 3,
         reflect_apply: bool = False,
+        reflect_consolidate: bool | str = True,
         summarizer=None,
     ) -> None:
         self.store = store
@@ -146,6 +153,7 @@ class MaintenanceScheduler:
         self.frequency_weight = frequency_weight
         self.min_cluster_size = min_cluster_size
         self.reflect_apply = reflect_apply
+        self.reflect_consolidate = reflect_consolidate
         self.summarizer = summarizer
 
     def tick(self, now: float | None = None) -> TickResult:
@@ -197,7 +205,10 @@ class MaintenanceScheduler:
                         min_cluster_size=self.min_cluster_size,
                         summarizer=self.summarizer,
                     )
-                    created = engine.reflect(dry_run=not self.reflect_apply)
+                    created = engine.reflect(
+                        dry_run=not self.reflect_apply,
+                        consolidate=self.reflect_consolidate,
+                    )
                     result.reflected = len(created)
                     # The schedule gates the WORK, not the writes: clustering
                     # is O(n²) and the summarizer may call an LLM, and both

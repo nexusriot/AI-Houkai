@@ -12,12 +12,9 @@ from __future__ import annotations
 
 import logging
 import signal
-import sys
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
 import typer
 
@@ -59,8 +56,15 @@ def _make_scheduler(store, mcfg) -> MaintenanceScheduler:
         frequency_weight=mcfg.frequency_weight,
         min_cluster_size=mcfg.min_cluster_size,
         reflect_apply=mcfg.reflect_apply,
+        reflect_consolidate=mcfg.reflect_consolidate,
         summarizer=summarizer,
     )
+
+
+_DISABLED_MSG = (
+    "Maintenance is disabled ([maintenance].enabled = false in "
+    "~/.config/ai_houkai/config.toml) — nothing to do."
+)
 
 
 def _fmt_ts(ts: float | None) -> str:
@@ -88,6 +92,9 @@ def tick_cmd(ctx: typer.Context) -> None:
     """
     store = ctx.obj["store"]
     mcfg = load_maintenance()
+    if not mcfg.enabled:
+        typer.echo(_DISABLED_MSG)
+        return
     sched = _make_scheduler(store, mcfg)
 
     typer.echo("Running maintenance tick…")
@@ -111,6 +118,9 @@ def run_cmd(ctx: typer.Context) -> None:
     """
     store = ctx.obj["store"]
     mcfg = load_maintenance()
+    if not mcfg.enabled:
+        typer.echo(_DISABLED_MSG)
+        return
 
     logging.basicConfig(
         level=logging.INFO,
@@ -136,6 +146,9 @@ def start_cmd(ctx: typer.Context) -> None:
     """Detach the maintenance daemon into the background."""
     cfg = ctx.obj["config"]
     mcfg = load_maintenance()
+    if not mcfg.enabled:
+        typer.echo(_DISABLED_MSG, err=True)
+        raise typer.Exit(1)
 
     if is_alive(mcfg.pid_path):
         pid = get_pid(mcfg.pid_path)
@@ -191,6 +204,9 @@ def status_cmd(ctx: typer.Context) -> None:
 
     width = 60
     typer.echo("─" * width)
+    if not mcfg.enabled:
+        typer.echo("  Enabled:        false ([maintenance].enabled — "
+                   "tick/run/start are no-ops)")
     typer.echo(f"  Daemon:         {daemon_line}")
     typer.echo("─" * width)
     typer.echo(f"  Last decay:     {_fmt_ts(state.last_decay_at)}")
@@ -204,6 +220,9 @@ def status_cmd(ctx: typer.Context) -> None:
     typer.echo(f"  State file:     {mcfg.state_path}")
     typer.echo(f"  Log file:       {mcfg.log_path}")
     typer.echo(f"  reflect_apply:  {mcfg.reflect_apply}")
+    consolidate = {False: "none", True: "soft"}.get(
+        mcfg.reflect_consolidate, mcfg.reflect_consolidate)
+    typer.echo(f"  consolidate:    {consolidate}")
     typer.echo(f"  summarizer:     {mcfg.summarizer or 'extractive (built-in)'}")
     typer.echo(
         f"  reinforcement:  "

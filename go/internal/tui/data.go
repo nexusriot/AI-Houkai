@@ -51,10 +51,12 @@ func fmtAge(ts float64) string {
 
 func snippet(text string, width int) string {
 	flat := strings.Join(strings.Fields(text), " ")
-	if len(flat) <= width {
+	// Slice by runes, not bytes, so a multi-byte character is never split.
+	r := []rune(flat)
+	if len(r) <= width {
 		return flat
 	}
-	return flat[:width-1] + "…"
+	return string(r[:width-1]) + "…"
 }
 
 func memRow(m memory.Memory, extra string) Row {

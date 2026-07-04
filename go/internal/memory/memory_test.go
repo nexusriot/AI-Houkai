@@ -69,10 +69,15 @@ func TestMetadataEmptyTagsAndLinks(t *testing.T) {
 	}
 }
 
-func TestMetadataDefaultsTypeToEpisodic(t *testing.T) {
+func TestMetadataDefaultsTypeToSemantic(t *testing.T) {
+	// Matches Python: a row with no recorded type is semantic, everywhere.
 	m := MetadataToMemory("x", "y", map[string]string{})
-	if m.Type != Episodic {
-		t.Errorf("default type should be Episodic, got %q", m.Type)
+	if m.Type != Semantic {
+		t.Errorf("default type should be Semantic, got %q", m.Type)
+	}
+	// MemoryFromDict agrees.
+	if d := MemoryFromDict(map[string]any{"id": "x", "text": "y"}); d.Type != Semantic {
+		t.Errorf("MemoryFromDict default type should be Semantic, got %q", d.Type)
 	}
 }
 

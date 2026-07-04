@@ -53,12 +53,6 @@ func fmtAge(ts float64) string {
 	}
 }
 
-func fmtImportance(imp float32) string {
-	n := int(imp * 10)
-	bar := strings.Repeat("█", n) + strings.Repeat("░", 10-n)
-	return fmt.Sprintf("%s %.1f", bar, imp)
-}
-
 func fmtID(id string) string {
 	if len(id) >= 8 {
 		return id[:8]
@@ -159,10 +153,6 @@ func stripAnsi(s string) string {
 		out.WriteRune(r)
 	}
 	return out.String()
-}
-
-func PrintError(err error) {
-	fmt.Fprintf(os.Stderr, "error: %v\n", err)
 }
 
 func Confirm(prompt string) bool {

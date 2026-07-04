@@ -111,7 +111,7 @@ paragraph, re-packs long paragraphs on sentence boundaries. Omit files
 				if _, _, _, err := store.Remember(cmd.Context(), p.chunk, memory.RememberOpts{
 					Type:       memory.MemoryType(memType),
 					Tags:       tags,
-					Importance: p.imp,
+					Importance: memory.Float32Ptr(p.imp),
 					Source:     src,
 				}); err != nil {
 					return err

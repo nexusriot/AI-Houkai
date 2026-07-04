@@ -21,13 +21,17 @@ def mcp_store(tmp_path, monkeypatch):
         srv._store = None
 
 
-def _mcfg(tmp_path, *, reflect_apply: bool) -> MaintenanceConfig:
+def _mcfg(
+    tmp_path, *, reflect_apply: bool, enabled: bool = True,
+    reflect_consolidate: bool | str = True,
+) -> MaintenanceConfig:
     return MaintenanceConfig(
-        enabled=True, decay_every=None, reflect_every=3_600, tick_interval=300,
+        enabled=enabled, decay_every=None, reflect_every=3_600, tick_interval=300,
         log_path=str(tmp_path / "m.log"), state_path=str(tmp_path / "m.state.json"),
         pid_path=str(tmp_path / "m.pid"), decay_rate=0.1, min_score=0.05,
         protect_types=("procedural",), frequency_weight=0.0,
         min_cluster_size=2, reflect_apply=reflect_apply, summarizer=None,
+        reflect_consolidate=reflect_consolidate,
     )
 
 
@@ -75,3 +79,73 @@ class TestMcpTools:
         out = srv.maintenance_tick(reflect_apply=True)
         assert out["ran_reflect"] is True
         assert out["reflect_applied"] is True
+
+    def test_maintenance_tick_disabled_reports_and_runs_nothing(
+        self, mcp_store, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            srv, "load_maintenance",
+            lambda: _mcfg(tmp_path, reflect_apply=True, enabled=False))
+        out = srv.maintenance_tick()
+        assert out["enabled"] is False
+        assert out["ran_decay"] is False and out["ran_reflect"] is False
+        assert "disabled" in out["summary"]
+
+    def test_maintenance_tick_reports_enabled_true(
+        self, mcp_store, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            srv, "load_maintenance", lambda: _mcfg(tmp_path, reflect_apply=False))
+        out = srv.maintenance_tick()
+        assert out["enabled"] is True
+
+    def test_maintenance_tick_threads_consolidate_from_config(
+        self, mcp_store, tmp_path, monkeypatch
+    ):
+        from ai_houkai.maintenance.scheduler import TickResult
+
+        monkeypatch.setattr(
+            srv, "load_maintenance",
+            lambda: _mcfg(tmp_path, reflect_apply=True,
+                          reflect_consolidate="hard"))
+        captured: dict = {}
+
+        class FakeScheduler:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def tick(self):
+                return TickResult()
+
+        monkeypatch.setattr(srv, "MaintenanceScheduler", FakeScheduler)
+        srv.maintenance_tick()
+        assert captured["reflect_consolidate"] == "hard"
+
+    def test_import_tool_reports_conflict_not_crash(self, mcp_store, tmp_path):
+        created = srv.remember(text="conflicting row")
+        assert created["stored"] is True
+        path = str(tmp_path / "conflict.ahkai")
+        exported = srv.export(path=path)
+        assert exported["count"] == 1
+        out = srv.import_(path=path, on_conflict="error")
+        assert out["ok"] is False
+        assert "collision" in out["error"]
+
+    def test_edit_clear_source(self, mcp_store):
+        created = srv.remember(text="sourced fact", source="unit-test")
+        out = srv.edit(memory_id=created["id"], clear_source=True)
+        assert out["ok"] is True
+        assert out["source"] is None
+
+    def test_edit_source_and_clear_source_conflict(self, mcp_store):
+        created = srv.remember(text="sourced fact", source="unit-test")
+        out = srv.edit(memory_id=created["id"], source="new",
+                       clear_source=True)
+        assert out["ok"] is False
+        assert "clear_source" in out["error"]
+
+    def test_edit_omitted_source_left_unchanged(self, mcp_store):
+        created = srv.remember(text="sourced fact", source="keep-me")
+        out = srv.edit(memory_id=created["id"], importance=0.7)
+        assert out["ok"] is True
+        assert out["source"] == "keep-me"

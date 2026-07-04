@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,10 +19,10 @@ import (
 type ImportConflictPolicy string
 
 const (
-	ImportSkip      ImportConflictPolicy = "skip"
-	ImportOverwrite ImportConflictPolicy = "overwrite"
-	ImportRename    ImportConflictPolicy = "rename"
-	ImportErrorPolicy  ImportConflictPolicy = "error"
+	ImportSkip        ImportConflictPolicy = "skip"
+	ImportOverwrite   ImportConflictPolicy = "overwrite"
+	ImportRename      ImportConflictPolicy = "rename"
+	ImportErrorPolicy ImportConflictPolicy = "error"
 )
 
 // ImportOpts customises an import.
@@ -33,12 +34,12 @@ type ImportOpts struct {
 
 // ImportSummary is the result of MemoryStore.Import.
 type ImportSummary struct {
-	Imported           int           `json:"imported"`
-	Skipped            int           `json:"skipped"`
-	Overwritten        int           `json:"overwritten"`
-	Renamed            int           `json:"renamed"`
+	Imported           int              `json:"imported"`
+	Skipped            int              `json:"skipped"`
+	Overwritten        int              `json:"overwritten"`
+	Renamed            int              `json:"renamed"`
 	Errors             []ImportRowError `json:"errors,omitempty"`
-	VectorsRegenerated bool          `json:"vectors_regenerated"`
+	VectorsRegenerated bool             `json:"vectors_regenerated"`
 }
 
 // ImportRowError is one (id, message) pair from an import.
@@ -62,6 +63,9 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 		opts.OnConflict = ImportSkip
 	}
 	var summary ImportSummary
+	if err := validateChoice(string(opts.OnConflict), ImportPolicies, "on_conflict"); err != nil {
+		return summary, err
+	}
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -215,6 +219,9 @@ func (s *MemoryStore) importOne(
 }
 
 func (s *MemoryStore) addImported(ctx context.Context, mem Memory, vec []float32) error {
+	// Record whether the FILE's vector was used before any re-embed, so the
+	// journal reflects reality (a re-embedded row is not "preserved").
+	vectorsPreserved := len(vec) > 0
 	if len(vec) == 0 {
 		// Re-embed from text.
 		vecs, err := s.embedder.Embed(ctx, []string{mem.Text})
@@ -238,7 +245,7 @@ func (s *MemoryStore) addImported(ctx context.Context, mem Memory, vec []float32
 		return err
 	}
 	s.journalEntry("import", mem.ID, nil, mem.ToDict(), map[string]any{
-		"vectors_preserved": len(vec) > 0,
+		"vectors_preserved": vectorsPreserved,
 	})
 	return nil
 }
@@ -278,8 +285,27 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 		s.journalEntry("undo", mem.ID, nil, mem.ToDict(), map[string]any{"of": e.TS, "of_op": e.Op})
 		return true, nil
 
+	case "edit":
+		if e.Before == nil {
+			return false, nil
+		}
+		current, err := s.GetByID(ctx, e.ID)
+		if err != nil {
+			return false, nil // memory has since been forgotten
+		}
+		restored := MemoryFromDict(e.Before)
+		// Always re-embed: the edit may have changed the text, and
+		// re-embedding unchanged text is harmless (matches Python).
+		if err := s.UpdateMemory(ctx, restored, true); err != nil {
+			return false, err
+		}
+		s.journalEntry("undo", e.ID, current.ToDict(), restored.ToDict(),
+			map[string]any{"of": e.TS, "of_op": e.Op})
+		return true, nil
+
 	case "supersede":
-		if err := s.Restore(ctx, e.ID); err != nil {
+		ok, err := s.Restore(ctx, e.ID)
+		if err != nil || !ok {
 			return false, err
 		}
 		s.journalEntry("undo", e.ID, nil, nil, map[string]any{"of": e.TS, "of_op": e.Op})
@@ -307,7 +333,7 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 			src = e.ID
 		}
 		removed, err := s.unlinkRaw(ctx, src, dst, rel)
-		if err != nil || removed == 0 {
+		if err != nil || len(removed) == 0 {
 			return false, err
 		}
 		s.journalEntry("undo", e.ID, nil, nil, map[string]any{"of": e.TS, "of_op": e.Op})
@@ -316,16 +342,42 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 	case "unlink":
 		src, _ := e.Meta["src_id"].(string)
 		dst, _ := e.Meta["dst_id"].(string)
-		rel, _ := e.Meta["rel"].(string)
-		if rel == "" {
-			rel = RelRelated
-		}
 		if src == "" {
 			src = e.ID
 		}
-		added, err := s.linkRaw(ctx, src, dst, rel)
-		if err != nil || !added {
-			return false, err
+		// A rel="" unlink may have removed several differently-typed edges;
+		// meta["removed_rels"] records them. Entries written before that
+		// field existed fall back to the single rel.
+		var rels []string
+		if raw, ok := e.Meta["removed_rels"].([]any); ok {
+			for _, r := range raw {
+				if s, ok := r.(string); ok {
+					rels = append(rels, s)
+				}
+			}
+		}
+		if len(rels) == 0 {
+			rel, _ := e.Meta["rel"].(string)
+			if rel == "" {
+				rel = RelRelated
+			}
+			rels = []string{rel}
+		}
+		addedAny := false
+		for _, r := range rels {
+			added, err := s.linkRaw(ctx, src, dst, r)
+			if err != nil {
+				if errors.Is(err, ErrNotFound) {
+					return false, nil // an endpoint has since been forgotten
+				}
+				return false, err
+			}
+			if added {
+				addedAny = true
+			}
+		}
+		if !addedAny {
+			return false, nil
 		}
 		s.journalEntry("undo", e.ID, nil, nil, map[string]any{"of": e.TS, "of_op": e.Op})
 		return true, nil

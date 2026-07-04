@@ -15,10 +15,7 @@ from ai_houkai.memory_system.store import Memory
 
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 from rich.panel import Panel
-
-_USE_RICH = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
 @contextmanager

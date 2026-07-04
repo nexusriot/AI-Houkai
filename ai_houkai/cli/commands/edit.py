@@ -3,7 +3,7 @@
 from __future__ import annotations
 import subprocess
 import tempfile
-from typing import List, Optional
+from typing import List
 
 import typer
 

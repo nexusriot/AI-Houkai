@@ -1,8 +1,9 @@
 // Portable export to gzipped JSONL .ahkai files.
 //
 // The file format is line-oriented:
-//   line 1     : header object  {format, version, exported_at, source, options}
-//   line 2..N  : one memory row {id, text, meta, vector?}
+//
+//	line 1     : header object  {format, version, exported_at, source, options}
+//	line 2..N  : one memory row {id, text, meta, vector?}
 //
 // Memories are written in created_at-ascending order so two exports of
 // the same store produce byte-identical files modulo the header timestamp.

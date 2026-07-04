@@ -195,3 +195,30 @@ class TestCloseOrdering:
         astore._executor.submit(slow_count)
         astore.close()                          # must wait, then close client
         assert outcome.get("count") == 0        # job ran against a live client
+
+
+class TestAsyncAutoContext:
+    def test_auto_context_pack_wrapper(self, astore):
+        async def _inner():
+            await astore.remember(
+                "The deploy pipeline runs through GitHub Actions.",
+                type="procedural")
+            return await astore.auto_context_pack(
+                "deploy the api to production", token_budget=500)
+
+        pack = asyncio.get_event_loop().run_until_complete(_inner())
+        assert pack.budget == 500
+        assert pack.items
+        assert "## Relevant memory" in pack.text
+
+    def test_auto_context_pack_touch_false(self, astore):
+        async def _inner():
+            mem = await astore.remember(
+                "The deploy pipeline runs through GitHub Actions.",
+                type="procedural")
+            await astore.auto_context_pack(
+                "deploy the api", token_budget=500, touch=False)
+            return await astore.run(astore.sync._get_by_id, mem.id)
+
+        after = asyncio.get_event_loop().run_until_complete(_inner())
+        assert after.access_count == 0

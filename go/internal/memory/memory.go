@@ -133,7 +133,7 @@ func MetadataToMemory(id, text string, meta map[string]string) Memory {
 	m := Memory{
 		ID:   id,
 		Text: text,
-		Type: Episodic,
+		Type: Semantic, // default when metadata carries no type (matches Python)
 	}
 	if v, ok := meta["type"]; ok {
 		m.Type = MemoryType(v)

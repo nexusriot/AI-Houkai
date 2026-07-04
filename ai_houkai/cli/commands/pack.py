@@ -87,3 +87,71 @@ def pack(
         f"{' · truncated' if result.truncated else ''}]"
     )
     typer.echo(summary, err=True)
+
+
+def auto_context(
+    ctx: typer.Context,
+    task: str = typer.Argument(..., help="Task description to build context for"),
+    budget: int = typer.Option(800, "-b", "--budget", help="Token budget for the packed block"),
+    max_phrases: int = typer.Option(3, "--max-phrases", help="Key phrases to fan out over (besides the task itself)"),
+    mode: str = typer.Option("hybrid", "--mode", help="semantic|hybrid"),
+    min_cosine: Optional[float] = typer.Option(
+        None, "--min-cosine",
+        help="Absolute relevance floor per fan-out query (off-topic tasks inject nothing)",
+    ),
+    header: str = typer.Option("## Relevant memory", "--header", help="Block header (empty string to omit)"),
+    fmt: str = typer.Option("text", "--format", "-f", help="text|json"),
+) -> None:
+    """Build a context block by fanning recall out over multiple task angles.
+
+    Extracts key bigram/keyword phrases from the task description, recalls
+    memories for each angle, deduplicates keeping the best score per memory,
+    then packs greedily within the token budget. More thorough than `pack`
+    for tasks with compound concepts. The block is printed to stdout (pipe it
+    into a prompt); a one-line summary goes to stderr.
+    """
+    store = ctx.obj["store"]
+    with out.friendly_errors():
+        result = store.auto_context_pack(
+            task,
+            token_budget=budget,
+            max_phrases=max_phrases,
+            mode=mode,
+            min_cosine=min_cosine,
+            header=header,
+        )
+
+    if fmt == "json":
+        typer.echo(json.dumps(
+            {
+                "text": result.text,
+                "used_tokens": result.used_tokens,
+                "budget": result.budget,
+                "truncated": result.truncated,
+                "items": [
+                    {
+                        "id": p.memory.id,
+                        "text": p.memory.text,
+                        "type": p.memory.type,
+                        "tags": p.memory.tags,
+                        "importance": p.memory.importance,
+                        "score": round(p.score, 4),
+                        "tokens": p.tokens,
+                    }
+                    for p in result.items
+                ],
+            },
+            indent=2,
+        ))
+        return
+
+    if not result.items:
+        typer.echo("No memories found.", err=True)
+        return
+
+    typer.echo(result.text)
+    summary = (
+        f"[{len(result.items)} memories · {result.used_tokens}/{result.budget} tokens"
+        f"{' · truncated' if result.truncated else ''}]"
+    )
+    typer.echo(summary, err=True)

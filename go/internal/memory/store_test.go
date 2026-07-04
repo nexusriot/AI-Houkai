@@ -64,7 +64,7 @@ func TestRememberRecall(t *testing.T) {
 	ctx := context.Background()
 
 	m, stored, _, err := store.Remember(ctx, "the cat sat on the mat", RememberOpts{
-		Type: Semantic, Tags: []string{"animals"}, Importance: 0.7,
+		Type: Semantic, Tags: []string{"animals"}, Importance: Float32Ptr(0.7),
 	})
 	if err != nil || !stored {
 		t.Fatalf("Remember: stored=%v err=%v", stored, err)
@@ -210,8 +210,12 @@ func TestSupersedeAndRestore(t *testing.T) {
 		t.Error("IncludeSuperseded=true should surface the old memory")
 	}
 
-	if err := store.Restore(ctx, oldID); err != nil {
+	restored, err := store.Restore(ctx, oldID)
+	if err != nil {
 		t.Fatalf("Restore: %v", err)
+	}
+	if !restored {
+		t.Fatal("Restore = false, want true for a superseded memory")
 	}
 	old, _ = store.GetByID(ctx, oldID)
 	if old.SupersededBy != "" {

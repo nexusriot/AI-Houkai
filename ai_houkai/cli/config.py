@@ -42,6 +42,11 @@ class MaintenanceConfig:
     min_cluster_size: int
     reflect_apply: bool             # False → reflect in dry-run (observe only)
     summarizer: str | None          # e.g. "ollama:llama3.1"; None → extractive
+    # ReflectionEngine.reflect(consolidate=…) value: False (none) leaves the
+    # source episodics untouched, True (soft) supersedes them under the new
+    # summary, "hard" deletes them. Default soft — without consolidation a
+    # scheduled apply-mode reflection re-summarises the same clusters forever.
+    reflect_consolidate: bool | str = True
 
 
 def _resolve_importance(value: object) -> float | str:
@@ -60,6 +65,20 @@ def _resolve_interval(value: object) -> int | None:
     return parse_duration(str(value))
 
 
+def _resolve_consolidate(value: object) -> bool | str:
+    """Map the [maintenance.reflect] consolidate knob to the engine's value."""
+    if value in ("none", "off", False, None):
+        return False
+    if value in ("soft", True):
+        return True
+    if value == "hard":
+        return "hard"
+    raise ValueError(
+        f"[maintenance.reflect] consolidate must be one of: none, soft, hard "
+        f"— got {value!r}"
+    )
+
+
 def load() -> Config:
     file_cfg: dict = {}
     if _CONFIG_FILE.exists():
@@ -67,8 +86,12 @@ def load() -> Config:
             file_cfg = tomllib.load(f)
 
     return Config(
-        store_path=os.environ.get("AI_HOUKAI_PATH")
-            or file_cfg.get("store_path", _DEFAULT_PATH),
+        # expanduser so `AI_HOUKAI_PATH=~/mem` / store_path = "~/mem" don't
+        # create a literal ./~ directory (the shell only expands unquoted ~).
+        store_path=os.path.expanduser(
+            os.environ.get("AI_HOUKAI_PATH")
+            or file_cfg.get("store_path", _DEFAULT_PATH)
+        ),
         collection=os.environ.get("AI_HOUKAI_COLLECTION")
             or file_cfg.get("collection", _DEFAULT_COLLECTION),
         default_type=file_cfg.get("default_type", "semantic"),
@@ -90,7 +113,9 @@ def load_maintenance() -> MaintenanceConfig:
     reflect_cfg = m.get("reflect", {})
 
     return MaintenanceConfig(
-        enabled=bool(m.get("enabled", False)),
+        # Opt-out master switch: enabled = false disables every scheduled
+        # maintenance surface (tick/run/start and the MCP maintenance_tick).
+        enabled=bool(m.get("enabled", True)),
         decay_every=_resolve_interval(m.get("decay_every", "24h")),
         reflect_every=_resolve_interval(m.get("reflect_every", "7d")),
         tick_interval=_resolve_interval(m.get("tick_interval", "5m")) or 300,
@@ -111,4 +136,7 @@ def load_maintenance() -> MaintenanceConfig:
         reflect_apply=bool(reflect_cfg.get("apply", False)),
         summarizer=os.environ.get("AI_HOUKAI_SUMMARIZER")
             or reflect_cfg.get("summarizer") or None,
+        reflect_consolidate=_resolve_consolidate(
+            reflect_cfg.get("consolidate", "soft")
+        ),
     )

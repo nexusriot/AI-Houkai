@@ -154,3 +154,38 @@ def test_importing_mcp_server_creates_no_store(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / ".chroma").exists()
+
+
+class TestDefaultMemoryPath:
+    """Installer defaults must point at ~/.ai_houkai/.chroma — the CLI default
+    — so `houkai list` sees installed-client memories and the store journal
+    lands in ~/.ai_houkai/journal.log instead of $HOME/journal.log (the
+    journal is written to the store path's PARENT directory)."""
+
+    def test_all_installers_default_to_chroma_leaf(self):
+        from ai_houkai.installers import cursor as cur_mod
+        from ai_houkai.installers import opencode as oc_mod
+
+        expected = os.path.expanduser("~/.ai_houkai/.chroma")
+        assert cc_mod.DEFAULT_MEMORY_PATH == expected
+        assert cur_mod.DEFAULT_MEMORY_PATH == expected
+        assert oc_mod.DEFAULT_MEMORY_PATH == expected
+
+    def test_default_journal_parent_is_houkai_dir(self):
+        parent = Path(ClaudeCodeInstaller().memory_path).parent
+        assert parent == Path(os.path.expanduser("~/.ai_houkai"))
+        assert parent != Path(os.path.expanduser("~"))
+
+    def test_matches_cli_default(self):
+        from ai_houkai.cli import config as cfg_mod
+
+        assert ClaudeCodeInstaller().memory_path == cfg_mod._DEFAULT_PATH
+
+
+def test_claude_code_uses_shared_mcp_command_resolver(monkeypatch):
+    from ai_houkai.installers import common
+
+    monkeypatch.setattr(common, "resolve_mcp_command", lambda: "/stub/mcp")
+    monkeypatch.setattr(cc_mod, "resolve_mcp_command", lambda: "/stub/mcp")
+    assert ClaudeCodeInstaller().mcp_command == "/stub/mcp"
+    assert not hasattr(cc_mod, "_resolve_mcp_command")   # duplicate removed

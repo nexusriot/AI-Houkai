@@ -94,7 +94,9 @@ def ingest(
         typer.echo("Aborted.")
         return
 
-    with store.as_actor("import"):
+    # friendly_errors: a bad --type/--tag surfaces as a one-line error, not a
+    # traceback. Journal as "ingest" — "import" is the .ahkai importer's actor.
+    with store.as_actor("ingest"), out.friendly_errors():
         for label, chunk, imp in plan:
             store.remember(
                 text=chunk,

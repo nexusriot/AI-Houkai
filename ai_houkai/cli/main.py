@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 import typer
 
@@ -11,7 +12,7 @@ from ai_houkai.cli.config import load as load_config
 from ai_houkai.memory_system import MemoryStore
 from ai_houkai.cli.commands.remember import remember
 from ai_houkai.cli.commands.recall import recall
-from ai_houkai.cli.commands.pack import pack
+from ai_houkai.cli.commands.pack import pack, auto_context
 from ai_houkai.cli.commands.list_cmd import list_memories
 from ai_houkai.cli.commands.show import show
 from ai_houkai.cli.commands.forget import forget
@@ -69,7 +70,9 @@ def _callback(
 ) -> None:
     cfg = load_config()
     if store_path:
-        cfg.store_path = store_path
+        # A quoted/env-provided `~/…` reaches us unexpanded — expand it here
+        # or Chroma creates a literal ./~ directory.
+        cfg.store_path = os.path.expanduser(store_path)
     if collection:
         cfg.collection = collection
 
@@ -84,6 +87,7 @@ def _register() -> None:
     app.command("remember")(remember)
     app.command("recall")(recall)
     app.command("pack")(pack)
+    app.command("auto-context")(auto_context)
     app.command("list")(list_memories)
     app.command("show")(show)
     app.command("forget")(forget)
