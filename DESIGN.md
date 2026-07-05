@@ -414,6 +414,14 @@ of ≥ `compress_min_group` (default `2`) members is folded into a single
 `- (compressed)` summary line that is packed if it fits the remaining budget,
 surfaced separately as `compressed_groups`.
 
+![recall_pack greedy token-budget packing, default vs compress=True](docs/resources/recall_pack_budget.png)
+
+*Greedy fit to the default `token_budget = 800`: items are admitted in rank
+order until the budget is exhausted; an item too large for the remaining space
+is skipped while the walk continues, so a smaller lower-ranked memory can still
+slot in. `compress=True` folds the dropped candidates into one `- (compressed)`
+summary line when they cluster.*
+
 #### auto_context_pack() — multi-angle fan-out
 
 `auto_context_pack()` sits alongside `recall_pack()` for tasks with compound
@@ -445,6 +453,17 @@ reinforcement = 1 + frequency_weight × ln(1 + access_count)
 | `protect_types` | `("procedural",)` | Types immune to pruning |
 | `frequency_weight` | `0.0` | Recall reinforcement strength (0 = off) |
 
+![Exponential decay curves for importance 0.90/0.50/0.30 against the 0.05 prune line](docs/resources/decay_curves.png)
+
+*With λ = 0.1 a memory crosses the `min_score = 0.05` prune line at ~29 days
+(importance 0.90), ~23 days (0.50), or ~18 days (0.30); the dotted line marks
+the ≈6.9-day half-life.*
+
+![Decay survival region over importance × idle days](docs/resources/decay_heatmap.png)
+
+*The same score as a 2-D field — everything above the red `0.05` contour is
+retained, everything below is pruned.*
+
 ### Recall reinforcement
 
 `access_count` (incremented on every `recall()` hit) feeds back into the
@@ -457,6 +476,12 @@ times survive a prune that drops its never-reread twin. Note the score can
 then exceed `importance`; `min_score` is compared against the reinforced
 value. Configurable via `[maintenance.decay].frequency_weight`,
 `houkai prune --frequency-weight`, and the `MaintenanceScheduler`.
+
+![Reinforcement multiplier and the extra survival days recalls buy](docs/resources/reinforcement.png)
+
+*The multiplier grows with `ln(1 + access_count)`, so each extra recall resists
+decay a little less than the last; the right panel converts that into days of
+added lifetime before the prune line.*
 
 Score examples with λ=0.1 (no reinforcement, `frequency_weight=0`):
 
@@ -476,6 +501,16 @@ Score examples with λ=0.1 (no reinforcement, `frequency_weight=0`):
 | 0.05 | ~14 days | Normal agent memory |
 | 0.1 | ~7 days | Fast-changing environments |
 | 0.2 | ~3.5 days | Ephemeral session contexts |
+
+![Decay curves for λ = 0.05/0.10/0.20 at importance 0.50](docs/resources/halflife.png)
+
+*Turning λ up steepens the forgetting curve: 0.05 → ~14-day half-life,
+0.10 → ~7, 0.20 → ~3.5.*
+
+![Half-life as a function of decay_rate, t½ = ln2/λ](docs/resources/halflife_vs_lambda.png)
+
+*Half-life is `ln(2)/λ`, so it falls off hyperbolically as λ rises — the three
+marked points are the defaults from the table above.*
 
 ### API
 
@@ -1115,6 +1150,12 @@ final = α·cosine + β·BM25_local + γ·recency + δ·importance + ζ·polarit
 | δ importance      | 0.10 |
 | ζ polarity_weight | 0.05 |
 
+![Hybrid blend weights and a worked candidate ranking](docs/resources/hybrid_weights.png)
+
+*Cosine dominates at 0.55; the worked example shows how the additive blend
+ranks an exact-and-fresh hit (A, 0.95) above a strong keyword-only match
+(C, 0.61) and a stale semantic paraphrase (B, 0.52).*
+
 The polarity term is `ζ · mem.polarity` (so `+ζ` for `polarity=+1`, `−ζ`
 for `−1`, nothing for neutral). It is **not** confined to hybrid mode: the
 default `mode="semantic"` path also adds the same `ζ·polarity` bonus and
@@ -1132,6 +1173,11 @@ because every recall hit `_touch`-bumps `last_accessed`.
 **BM25 is computed locally** over the cosine over-fetch pool only — no
 second index, O(1) additional storage.
 
+![BM25 term-frequency saturation for k1 = 1.0/1.5/2.5](docs/resources/bm25_saturation.png)
+
+*BM25's `k1 = 1.5, b = 0.75` saturate term frequency: the 10th occurrence of a
+term adds far less than the 1st, unlike a linear tf count.*
+
 #### Fusion modes
 
 | `fusion` | Blend |
@@ -1144,6 +1190,12 @@ the BM25-vs-cosine magnitude mismatch), but its scores are **pool-relative**
 — comparable only across identically-pooled fan-outs, not arbitrary recalls.
 That is why `auto_context_pack` (which fans out over several different query
 pools and dedupes by score) deliberately does **not** expose `fusion="rrf"`.
+
+![Reciprocal Rank Fusion contributions per signal](docs/resources/rrf_fusion.png)
+
+*RRF sums `weight / (60 + rank)` across signals. Scores are tiny by design —
+only the relative order matters — which is exactly what makes it immune to the
+BM25-vs-cosine magnitude mismatch the weighted blend has to normalise around.*
 
 #### Re-selection, dedup, and gating
 
@@ -1162,6 +1214,12 @@ pools and dedupes by score) deliberately does **not** expose `fusion="rrf"`.
   bump) — e.g. for evaluation.
 - `explain=True` returns `(Memory, score, breakdown)` triples.
 - `diversity` / `dedup_threshold` also apply in `mode="semantic"`.
+
+![MMR relevance-versus-novelty trade-off and the crossover λ](docs/resources/mmr_tradeoff.png)
+
+*MMR's `λ · relevance − (1 − λ) · redundancy`: below the crossover λ a novel,
+slightly-less-relevant item beats a near-duplicate of something already
+selected; above it, raw relevance wins.*
 
 #### Lexical renormalisation
 
@@ -1306,6 +1364,17 @@ server (`AI_HOUKAI_AUTO_IMPORTANCE=1`):
 - **Medium** (0.6): task completions, durable project facts
 - **Low** (0.35): hedged/passing observations
 - Modifiers: +0.10 procedural/feedback, −0.15 questions, −0.10 fragments
+
+![Heuristic importance tiers with example phrases](docs/resources/importance_tiers.png)
+
+*Each bar is the score the shipped `score_importance()` actually returns for
+the quoted phrase; the highest matching tier wins.*
+
+![Importance base tier through modifiers to the final clamped value](docs/resources/importance_waterfall.png)
+
+*Base tier → modifiers → final, clamped to `[0.05, 0.98]`. A procedural
+instruction saturates at the 0.98 ceiling (0.90 tier + 0.10 type bonus), while
+the short question "Slow?" drops to 0.25 (−0.15 question, −0.10 fragment).*
 
 Still open as an extension: **LLM-based** scoring (ask the model to rate
 0–1 before storing) — pass any callable as `importance_fn`.

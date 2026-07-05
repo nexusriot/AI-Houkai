@@ -53,6 +53,12 @@ Defaults:
 | γ (recency)   | 0.15 | Mirrors `DecayEngine` half-life |
 | δ (importance)| 0.10 | Already explicit, weaker tiebreak |
 
+![Hybrid blend weights and a worked candidate ranking](docs/resources/hybrid_weights.png)
+
+*As shipped (`HybridWeights`): cosine dominates at 0.55, with a `+0.05` additive
+polarity term on top. The worked example ranks an exact-and-fresh hit (A, 0.95)
+over a keyword-only match (C, 0.61) and a stale paraphrase (B, 0.52).*
+
 `recency_decay(t) = exp(−λ · age_days)` reusing the `DecayEngine` formula
 with the **same** `λ` so the two systems agree on what "fresh" means.
 
@@ -64,6 +70,12 @@ with the **same** `λ` so the two systems agree on what "fresh" means.
 `bm25_score_normalized` is computed lazily over the query result set
 only (top-k from cosine + a small over-fetch), not the whole corpus —
 no second index needed.
+
+![BM25 term-frequency saturation for k1 = 1.0/1.5/2.5](docs/resources/bm25_saturation.png)
+
+*The shipped `k1 = 1.5, b = 0.75` saturate term frequency — the 10th hit of a
+term adds far less than the 1st — so a spammy document can't dominate on raw
+keyword count alone.*
 
 ### API additions
 
