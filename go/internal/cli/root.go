@@ -50,6 +50,12 @@ func NewRootCmd() *cobra.Command {
 		Long:    "houkai gives you direct terminal access to your agent's long-term memory store.",
 		Version: version.Version + " (built " + version.BuildTime + ")",
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			// We're past flag/arg parsing, so any error from here on (or from
+			// the command's RunE) is a runtime failure, not misuse — don't dump
+			// the usage text after it. Parse/arg errors happen before this hook
+			// runs, so they still show usage.
+			cmd.SilenceUsage = true
+
 			cfg := ResolveConfig(storePath, collection)
 
 			var embedder embed.Embedder

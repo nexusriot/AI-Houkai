@@ -904,7 +904,6 @@ func newImportCmd() *cobra.Command {
 			}
 			summary, err := store.Import(cmd.Context(), path, opts)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				return err
 			}
 			prefix := ""
@@ -941,7 +940,6 @@ func newInfoCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			hdr, count, err := memory.PeekExportHeader(args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				return err
 			}
 			b, _ := json.MarshalIndent(hdr, "", "  ")

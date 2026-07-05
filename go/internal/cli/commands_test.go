@@ -7,8 +7,11 @@ package cli
 import (
 	"context"
 	"hash/fnv"
+	"io"
 	"math"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
@@ -160,5 +163,50 @@ func TestBumpCmdJournaledAndClamped(t *testing.T) {
 	entries, _ := store.Journal().Read(memory.ReadOpts{Op: "edit", MemoryID: m.ID})
 	if len(entries) != 2 {
 		t.Errorf("edit journal entries = %d, want 2 (one per bump)", len(entries))
+	}
+}
+
+// TestImportCmdRuntimeErrorFormatting locks in the CLI error handling: a
+// runtime failure (here, importing a missing file) must be printed exactly
+// once and must NOT be followed by the command's usage text.
+//
+// Two bugs used to break this: newImportCmd printed the error by hand *and*
+// returned it (cobra printed it a second time), and the root command never set
+// SilenceUsage, so cobra also dumped the full usage after every runtime error.
+func TestImportCmdRuntimeErrorFormatting(t *testing.T) {
+	dir := t.TempDir()
+	// Force a key-free provider and an isolated store so PersistentPreRunE
+	// succeeds without network or real credentials; the missing-file error
+	// then surfaces from RunE, which is the path under test.
+	t.Setenv("AI_HOUKAI_EMBED_PROVIDER", "ollama")
+	t.Setenv("AI_HOUKAI_PATH", filepath.Join(dir, "store"))
+
+	// The manual print (the bug) wrote straight to os.Stderr, bypassing cobra's
+	// writer, so capture the real os.Stdout/os.Stderr via a pipe to see both it
+	// and cobra's own print.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origOut, origErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = w, w
+
+	root := NewRootCmd()
+	root.SetArgs([]string{"import", filepath.Join(dir, "missing.ahkai"), "-y"})
+	runErr := root.Execute()
+
+	os.Stdout, os.Stderr = origOut, origErr
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	s := string(out)
+
+	if runErr == nil {
+		t.Fatal("importing a missing file should fail")
+	}
+	if n := strings.Count(s, "Error:"); n != 1 {
+		t.Errorf("want the error printed exactly once, got %d occurrences:\n%s", n, s)
+	}
+	if strings.Contains(s, "Usage:") {
+		t.Errorf("usage must be silenced for a runtime error, but it was dumped:\n%s", s)
 	}
 }
