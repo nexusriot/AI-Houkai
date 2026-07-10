@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
+from ai_houkai.cli import config as cfg_mod
 from ai_houkai.installers import claude_code as cc_mod
+from ai_houkai.installers import common
+from ai_houkai.installers import cursor as cur_mod
+from ai_houkai.installers import opencode as oc_mod
 from ai_houkai.installers.claude_code import ClaudeCodeInstaller
 from ai_houkai.installers.common import load_json, write_json
 
@@ -163,9 +167,6 @@ class TestDefaultMemoryPath:
     journal is written to the store path's PARENT directory)."""
 
     def test_all_installers_default_to_chroma_leaf(self):
-        from ai_houkai.installers import cursor as cur_mod
-        from ai_houkai.installers import opencode as oc_mod
-
         expected = os.path.expanduser("~/.ai_houkai/.chroma")
         assert cc_mod.DEFAULT_MEMORY_PATH == expected
         assert cur_mod.DEFAULT_MEMORY_PATH == expected
@@ -177,14 +178,10 @@ class TestDefaultMemoryPath:
         assert parent != Path(os.path.expanduser("~"))
 
     def test_matches_cli_default(self):
-        from ai_houkai.cli import config as cfg_mod
-
         assert ClaudeCodeInstaller().memory_path == cfg_mod._DEFAULT_PATH
 
 
 def test_claude_code_uses_shared_mcp_command_resolver(monkeypatch):
-    from ai_houkai.installers import common
-
     monkeypatch.setattr(common, "resolve_mcp_command", lambda: "/stub/mcp")
     monkeypatch.setattr(cc_mod, "resolve_mcp_command", lambda: "/stub/mcp")
     assert ClaudeCodeInstaller().mcp_command == "/stub/mcp"

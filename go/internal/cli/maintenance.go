@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/maintenance"
+	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
 	"github.com/spf13/cobra"
 )
@@ -28,14 +29,20 @@ func maintCfg(cfg Config) maintenance.Config {
 	if cfg.Maintenance.Consolidate {
 		consolidate = reflectpkg.ConsolidateSoft
 	}
+	protect := make([]memory.MemoryType, len(cfg.Maintenance.Decay.ProtectTypes))
+	for i, t := range cfg.Maintenance.Decay.ProtectTypes {
+		protect[i] = memory.MemoryType(t)
+	}
 	return maintenance.Config{
 		Interval:        interval,
 		DecayRate:       cfg.Maintenance.Decay.DecayRate,
 		MinScore:        cfg.Maintenance.Decay.MinScore,
+		ProtectTypes:    protect,
 		Reflect:         cfg.Maintenance.Reflect,
 		Consolidate:     consolidate,
 		DecayEvery:      float64(cfg.Maintenance.DecayEverySecs),
 		ReflectEvery:    float64(cfg.Maintenance.ReflectEverySecs),
+		PurgeEvery:      float64(cfg.Maintenance.PurgeEverySecs),
 		FrequencyWeight: cfg.Maintenance.Decay.FrequencyWeight,
 		Summarizer:      summ,
 	}
@@ -57,6 +64,9 @@ func tickSummary(res maintenance.TickResult) string {
 	}
 	if res.RanReflect {
 		parts = append(parts, fmt.Sprintf("reflect created %d", res.Reflected))
+	}
+	if res.RanPurge {
+		parts = append(parts, fmt.Sprintf("purge removed %d", res.Purged))
 	}
 	if len(parts) == 0 {
 		return "nothing to do (jobs not due yet)"

@@ -29,6 +29,7 @@ class MaintenanceConfig:
     enabled: bool
     decay_every: int | None         # seconds; None = disabled
     reflect_every: int | None       # seconds; None = disabled
+    purge_every: int | None         # seconds; None = disabled (TTL reclamation)
     tick_interval: int              # seconds between loop wakes
     log_path: str
     state_path: str
@@ -118,6 +119,7 @@ def load_maintenance() -> MaintenanceConfig:
         enabled=bool(m.get("enabled", True)),
         decay_every=_resolve_interval(m.get("decay_every", "24h")),
         reflect_every=_resolve_interval(m.get("reflect_every", "7d")),
+        purge_every=_resolve_interval(m.get("purge_every", "24h")),
         tick_interval=_resolve_interval(m.get("tick_interval", "5m")) or 300,
         log_path=os.path.expanduser(
             str(m.get("log_path", str(_HOUKAI_DIR / "maintenance.log")))

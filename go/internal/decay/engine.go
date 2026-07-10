@@ -26,7 +26,7 @@ type Engine struct {
 
 // Storable is the subset of MemoryStore the Engine needs.
 type Storable interface {
-	ListRecent(ctx context.Context, limit int, includeSuperseded bool) ([]memory.Memory, error)
+	ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]memory.Memory, error)
 	Forget(ctx context.Context, id string) (bool, error)
 }
 
@@ -72,7 +72,11 @@ func (e *Engine) scoreAt(m memory.Memory, now time.Time) float32 {
 // Prune removes memories below MinScore (unless protected). Returns pruned IDs.
 // If dryRun is true, no deletions occur.
 func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error) {
-	mems, err := e.store.ListRecent(ctx, 0, false)
+	// includeSuperseded=true so soft-deleted memories also age out — otherwise
+	// every supersede leaves the old memory in the store forever and the
+	// collection grows without bound (matches Python's score_all).
+	// includeExpired=true so decay also considers TTL-expired rows.
+	mems, err := e.store.ListRecent(ctx, 0, true, true)
 	if err != nil {
 		return nil, err
 	}

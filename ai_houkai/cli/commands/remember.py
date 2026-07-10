@@ -22,6 +22,10 @@ def remember(
     source: Optional[str] = typer.Option(None, "-s", "--source"),
     on_conflict: str = typer.Option("ignore", "--on-conflict", help="ignore|warn|supersede|raise"),
     polarity: int = typer.Option(0, "--polarity", help="-1, 0, or 1"),
+    ttl: Optional[float] = typer.Option(
+        None, "--ttl", help="Time-to-live in seconds; the memory expires after this."),
+    expires_at: Optional[float] = typer.Option(
+        None, "--expires-at", help="Absolute expiry as a Unix timestamp."),
     stdin: bool = typer.Option(False, "--stdin", help="Force reading text from stdin"),
     auto_importance: bool = typer.Option(
         False, "--auto-importance",
@@ -58,6 +62,8 @@ def remember(
                 importance=imp,
                 source=source,
                 polarity=polarity,
+                expires_at=expires_at,
+                ttl_seconds=ttl,
                 on_conflict=on_conflict,
             )
     except ConflictError as e:

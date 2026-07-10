@@ -25,6 +25,48 @@ type scoredCand struct {
 func round4(f float32) float64 { return math.Round(float64(f)*1e4) / 1e4 }
 func round6(f float32) float64 { return math.Round(float64(f)*1e6) / 1e6 }
 
+// applyReranker rescores the first-stage candidate pool with reranker and
+// re-sorts descending. The reranker's score replaces the blended first-stage
+// score; in explain mode each memory's breakdown gains a "rerank" block
+// recording the first-stage score/rank and the new score/rank.
+func applyReranker(reranker Reranker, query string, scored []scoredCand, expl map[string]map[string]any) ([]scoredCand, error) {
+	mems := make([]Memory, len(scored))
+	for i, sc := range scored {
+		mems[i] = sc.mem
+	}
+	rr := reranker(query, mems)
+	if len(rr) != len(mems) {
+		return nil, validationErrorf("reranker returned %d scores for %d candidate(s)", len(rr), len(mems))
+	}
+	if expl != nil {
+		for i, sc := range scored {
+			e := expl[sc.mem.ID]
+			if e == nil {
+				e = map[string]any{}
+				expl[sc.mem.ID] = e
+			}
+			e["rerank"] = map[string]any{
+				"first_stage_score": round4(sc.score),
+				"first_stage_rank":  i,
+			}
+		}
+	}
+	reranked := make([]scoredCand, len(scored))
+	for i, sc := range scored {
+		reranked[i] = scoredCand{mem: sc.mem, score: rr[i], emb: sc.emb}
+	}
+	sort.SliceStable(reranked, func(i, j int) bool { return reranked[i].score > reranked[j].score })
+	if expl != nil {
+		for newRank, sc := range reranked {
+			if rrm, ok := expl[sc.mem.ID]["rerank"].(map[string]any); ok {
+				rrm["score"] = round4(sc.score)
+				rrm["rank"] = newRank
+			}
+		}
+	}
+	return reranked, nil
+}
+
 // scorerFilter applies the in-loop filters shared by all scorers: tag,
 // superseded, and the absolute cosine floor.
 func scorerFilter(m Memory, cosine float32, tag string, inclSup bool, minCosine *float32) bool {

@@ -88,7 +88,7 @@ houkai install                          # patches ~/.claude/settings.json
 houkai install --project                # → ./.claude/settings.json
 ```
 
-After restarting Claude Code, seventeen `mcp__ai-houkai__*` tools become
+After restarting Claude Code, all 22 `mcp__ai-houkai__*` tools become
 available. Cursor and OpenCode are supported too — see
 [Other MCP clients](#other-mcp-clients).
 
@@ -135,7 +135,7 @@ Notes:
 - Restart Claude Code (or run `/mcp` and re-add the server) for it to pick
   up the change. To verify the binary works in isolation, run
   `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ai-houkai-mcp`
-  — you should see the seventeen tool definitions on stdout.
+  — you should see the 22 tool definitions on stdout.
 
 To print the exact block the installer would write without touching any
 file, run `houkai install --print`.
@@ -162,6 +162,7 @@ neighbors / graph      Traverse the graph
 conflicts              Detect contradictions/duplicates
 supersede / restore    Soft-delete + revive
 prune                  Decay-based pruning (dry-run by default)
+purge                  Delete TTL-expired memories (dry-run by default; --apply)
 reflect                Cluster episodics into semantic memories (--summarizer provider:model)
 collections            List / create / delete / copy store namespaces
 export / import        Portable .ahkai round-trip (gzipped JSONL)
@@ -657,10 +658,10 @@ internal/
   embed/            Embedder interface + Ollama/OpenAI/DigitalOcean clients
   decay/            Time-based pruning engine
   reflect/          Episodic → semantic clustering
-  maintenance/      Schedule-gated prune + reflect ticks (flock-guarded state)
+  maintenance/      Schedule-gated prune + reflect + purge ticks (flock-guarded state)
   ingest/           Deterministic chunking for bulk ingestion
   tui/              Bubble Tea memory browser (navigator + view-models)
-  mcpserver/        17 MCP tool definitions
+  mcpserver/        22 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
   installer/        config patchers for Claude Code, Cursor, OpenCode
   version/          ldflags-injected build info
@@ -703,14 +704,20 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The Go port exposes **17 MCP tools** — `remember`, `recall`, `recall_pack`,
-`auto_context`, `forget`, `edit`, `list_recent`, `stats`, `link`, `unlink`,
-`neighbors`, `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`,
-`export`, `import`. This matches the Python reference port, including the
-advanced retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`,
-diversity/MMR, `dedup_threshold`, `min_cosine`, `touch`, `explain`, and
-`recall_pack` compression) and the `auto_context` fan-out tool. The tools
-keep the same names and behaviour, so existing clients keep working.
+The Go port exposes **22 MCP tools** — `remember`, `recall`, `recall_pack`,
+`auto_context`, `forget`, `purge_expired`, `edit`, `list_recent`, `stats`,
+`metrics`, `history`, `state_at`, `get_at`, `link`, `unlink`, `neighbors`,
+`find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`, `export`,
+`import`. This matches the Python reference port, including the advanced
+retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`, diversity/MMR,
+`dedup_threshold`, `min_cosine`, `touch`, `explain`, and `recall_pack`
+compression), the `auto_context` fan-out tool, and the recent additions —
+pluggable **reranking** (a store-config Go `func`, not a request param),
+**TTL/expiry** (`ttl_seconds`/`expires_at` on `remember`/`edit`,
+`include_expired` on `recall`/`list_recent`, `purge_expired` + a maintenance
+purge job), **point-in-time** `history`/`state_at`/`get_at`, and runtime
+`metrics`. The tools keep the same names and behaviour, so existing clients
+keep working.
 
 Behavioural parity notes (all matching Python):
 

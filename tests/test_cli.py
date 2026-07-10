@@ -10,6 +10,11 @@ import sys
 import pytest
 from typer.testing import CliRunner
 
+import ai_houkai.cli.commands.decay as decay_mod
+import ai_houkai.cli.commands.maintenance as maint_mod
+import ai_houkai.cli.main as main_mod
+from ai_houkai.cli import config as cfg_mod
+from ai_houkai.cli.config import MaintenanceConfig
 from ai_houkai.cli.main import app
 from ai_houkai.memory_system import MemoryStore
 
@@ -191,6 +196,36 @@ def test_export_import_roundtrip(tmp_path):
     list_r = _invoke(["list", "--format", "json"], store2_path)
     data = json.loads(list_r.output)
     assert len(data) == 2
+
+
+def test_import_conflict_error_exits_cleanly(tmp_path):
+    # `--on-conflict error` into a store that already has the ids used to
+    # raise ImportConflictError past the CLI's except clause → raw traceback.
+    store_path = str(tmp_path / "chroma")
+    export_file = str(tmp_path / "dump.jsonl")
+    _invoke(["remember", "collide me", "--tag", "x"], store_path)
+    assert _invoke(["export", export_file], store_path).exit_code == 0
+
+    # Import back into the SAME store so every id collides.
+    result = _invoke(
+        ["import", export_file, "--on-conflict", "error", "--yes"], store_path
+    )
+    assert result.exit_code == 1
+    assert "Error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_import_bad_on_conflict_value_exits_cleanly(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    export_file = str(tmp_path / "dump.jsonl")
+    _invoke(["remember", "something", "--tag", "x"], store_path)
+    _invoke(["export", export_file], store_path)
+    result = _invoke(
+        ["import", export_file, "--on-conflict", "bogus", "--yes"],
+        str(tmp_path / "chroma2"),
+    )
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
 
 
 def test_stats(tmp_path):
@@ -428,7 +463,6 @@ def test_graph_json_edges_use_full_ids(tmp_path):
 
 
 def test_config_expands_tilde_from_env(monkeypatch, tmp_path):
-    from ai_houkai.cli import config as cfg_mod
 
     monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", tmp_path / "missing.toml")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -439,7 +473,6 @@ def test_config_expands_tilde_from_env(monkeypatch, tmp_path):
 
 
 def test_config_expands_tilde_from_config_file(monkeypatch, tmp_path):
-    from ai_houkai.cli import config as cfg_mod
 
     toml = tmp_path / "config.toml"
     toml.write_text('store_path = "~/file-store/.chroma"\n')
@@ -453,7 +486,6 @@ def test_config_expands_tilde_from_config_file(monkeypatch, tmp_path):
 def test_cli_store_option_expands_tilde(monkeypatch, tmp_path):
     """`houkai --store '~/x'` (quoted, so the shell didn't expand it) must not
     create a literal ./~ directory."""
-    import ai_houkai.cli.main as main_mod
 
     captured = {}
 
@@ -469,7 +501,6 @@ def test_cli_store_option_expands_tilde(monkeypatch, tmp_path):
 
 
 def test_maintenance_config_consolidate_parsing(monkeypatch, tmp_path):
-    from ai_houkai.cli import config as cfg_mod
 
     toml = tmp_path / "config.toml"
 
@@ -487,7 +518,6 @@ def test_maintenance_config_consolidate_parsing(monkeypatch, tmp_path):
 
 
 def test_maintenance_config_enabled_defaults_true(monkeypatch, tmp_path):
-    from ai_houkai.cli import config as cfg_mod
 
     monkeypatch.setattr(cfg_mod, "_CONFIG_FILE", tmp_path / "missing.toml")
     assert cfg_mod.load_maintenance().enabled is True
@@ -499,12 +529,11 @@ def test_maintenance_config_enabled_defaults_true(monkeypatch, tmp_path):
 
 
 def test_maintenance_tick_noops_when_disabled(tmp_path, monkeypatch):
-    import ai_houkai.cli.commands.maintenance as maint_mod
-    from ai_houkai.cli.config import MaintenanceConfig
 
     def fake_mcfg():
         return MaintenanceConfig(
-            enabled=False, decay_every=1, reflect_every=1, tick_interval=300,
+            enabled=False, decay_every=1, reflect_every=1, purge_every=1,
+            tick_interval=300,
             log_path=str(tmp_path / "m.log"),
             state_path=str(tmp_path / "m.state.json"),
             pid_path=str(tmp_path / "m.pid"), decay_rate=0.1, min_score=0.05,
@@ -521,12 +550,11 @@ def test_maintenance_tick_noops_when_disabled(tmp_path, monkeypatch):
 
 
 def test_prune_defaults_come_from_config(tmp_path, monkeypatch):
-    import ai_houkai.cli.commands.decay as decay_mod
-    from ai_houkai.cli.config import MaintenanceConfig
 
     def fake_mcfg():
         return MaintenanceConfig(
-            enabled=True, decay_every=None, reflect_every=None, tick_interval=300,
+            enabled=True, decay_every=None, reflect_every=None, purge_every=None,
+            tick_interval=300,
             log_path="", state_path="", pid_path="",
             decay_rate=0.1, min_score=0.99,          # everything is at risk
             protect_types=(), frequency_weight=0.0,
@@ -593,3 +621,43 @@ def test_auto_context_json(tmp_path):
     data = json.loads(result.output)
     assert set(data) >= {"text", "used_tokens", "budget", "truncated", "items"}
     assert data["items"]
+
+
+def test_remember_ttl_hidden_from_recall(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    # expires_at in the past → immediately expired.
+    _invoke(["remember", "ephemeral cli note", "--expires-at", "1"], store_path)
+    r = _invoke(["recall", "ephemeral cli note", "-f", "json"], store_path)
+    # Expired: recall prints "No memories found." (stderr); the text is absent.
+    assert "ephemeral cli note" not in r.output
+    # With --include-expired it shows up.
+    r2 = _invoke(["recall", "ephemeral cli note", "--include-expired", "-f", "json"],
+                 store_path)
+    assert "ephemeral cli note" in r2.output
+
+
+def test_purge_command_dry_run_then_apply(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "expired cli doc", "--expires-at", "1"], store_path)
+    _invoke(["remember", "live cli doc"], store_path)
+
+    dry = _invoke(["purge"], store_path)
+    assert dry.exit_code == 0
+    assert "Dry-run" in dry.output
+    # Nothing deleted yet.
+    listed = _invoke(["list", "--format", "json", "--include-expired"], store_path)
+    assert len(json.loads(listed.output)) == 2
+
+    applied = _invoke(["purge", "--apply", "--yes"], store_path)
+    assert applied.exit_code == 0
+    assert "Purged 1" in applied.output
+    listed2 = _invoke(["list", "--format", "json", "--include-expired"], store_path)
+    assert len(json.loads(listed2.output)) == 1
+
+
+def test_purge_nothing_to_do(tmp_path):
+    store_path = str(tmp_path / "chroma")
+    _invoke(["remember", "permanent doc"], store_path)
+    r = _invoke(["purge"], store_path)
+    assert r.exit_code == 0
+    assert "Nothing to purge" in r.output

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_houkai.memory_system.journal as journal_mod
 from ai_houkai.memory_system import Journal, JournalEntry, MemoryStore
 
 
@@ -117,6 +118,18 @@ def test_undo_supersede(store: MemoryStore) -> None:
     entry = next(e for e in store.journal.read() if e.op == "supersede")
     assert store.undo(entry) is True
     assert (store._get_by_id(a.id)).superseded_by == ""
+
+
+def test_undo_restore_after_forget_returns_false(store: MemoryStore) -> None:
+    # supersede → restore → forget: undoing the restore would re-supersede a
+    # memory that no longer exists. Must return False, not raise KeyError.
+    a = store.remember(text="old fact")
+    b = store.remember(text="new fact")
+    store.supersede(old_id=a.id, new_id=b.id)
+    store.restore(a.id)
+    store.forget(a.id)
+    entry = next(e for e in store.journal.read() if e.op == "restore")
+    assert store.undo(entry) is False
 
 
 def test_undo_link_removes_edge(store: MemoryStore) -> None:
@@ -266,8 +279,6 @@ def test_rotate_crash_mid_compress_loses_nothing(
 ) -> None:
     """If compression dies after the rename, the plain rotated file remains
     and read(include_archives=True) still returns every entry."""
-    import ai_houkai.memory_system.journal as journal_mod
-
     j = Journal(tmp_path / "j.log", rotate_mb=64)
     for i in range(5):
         j.append(_entry(i))

@@ -336,7 +336,7 @@ func TestFindConflictsGlobalAllPairs(t *testing.T) {
 		t.Errorf("global scan should find all 10 pairs, got %d", len(got))
 	}
 	// A superseded member must not appear in any pair.
-	all, _ := store.ListRecent(ctx, 0, true)
+	all, _ := store.ListRecent(ctx, 0, true, true)
 	_ = store.Supersede(ctx, all[0].ID, all[1].ID)
 	got2, _ := store.FindConflicts(ctx, "", 0)
 	for _, c := range got2 {

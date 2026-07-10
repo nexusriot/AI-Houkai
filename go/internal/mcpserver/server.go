@@ -15,7 +15,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 17 tools.
+// New wires up the MCP server with all 22 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -28,7 +28,12 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addForget(s, store)
 	addEdit(s, store)
 	addListRecent(s, store)
+	addPurgeExpired(s, store)
 	addStats(s, store, path, collection)
+	addMetrics(s, store)
+	addHistory(s, store)
+	addStateAt(s, store)
+	addGetAt(s, store)
 	addLink(s, store)
 	addUnlink(s, store)
 	addNeighbors(s, store)
@@ -105,6 +110,8 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("source", mcp.Description("Provenance label")),
 		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede|raise (default: store policy)")),
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
+		mcp.WithNumber("expires_at", mcp.Description("Absolute TTL as a Unix timestamp (hidden from recall once passed)")),
+		mcp.WithNumber("ttl_seconds", mcp.Description("Relative TTL in seconds from now. Pass at most one of expires_at/ttl_seconds")),
 	)
 	s.AddTool(tool, rememberHandler(store))
 }
@@ -124,6 +131,13 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 			Polarity:   req.GetInt("polarity", 0),
 			OnConflict: memory.ConflictPolicy(req.GetString("on_conflict", "")),
 		}
+		args := req.GetArguments()
+		if v, ok := args["expires_at"].(float64); ok {
+			opts.ExpiresAt = &v
+		}
+		if v, ok := args["ttl_seconds"].(float64); ok {
+			opts.TTLSeconds = &v
+		}
 		m, stored, conflicts, err := store.Remember(ctx, text, opts)
 		if err != nil {
 			if ce, ok := err.(*memory.ConflictError); ok {
@@ -134,7 +148,11 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 		if !stored {
 			return jsonText(map[string]any{"stored": false, "conflicts": conflicts}), nil
 		}
-		return jsonText(map[string]any{"id": m.ID, "stored": true, "importance": m.Importance}), nil
+		out := map[string]any{"id": m.ID, "stored": true, "importance": m.Importance}
+		if m.ExpiresAt != 0 {
+			out["expires_at"] = m.ExpiresAt
+		}
+		return jsonText(out), nil
 	}
 }
 
@@ -152,6 +170,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: semantic)")),
 		mcp.WithNumber("overfetch", mcp.Description("Overfetch multiplier (default: 4)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+		mcp.WithBoolean("include_expired", mcp.Description("Include memories whose TTL has passed")),
 		mcp.WithString("fusion", mcp.Description("weighted (default) | rrf — Reciprocal Rank Fusion of the hybrid signals")),
 		mcp.WithNumber("diversity", mcp.Description("MMR λ in [0,1]: higher favours relevance, lower novelty (omit to disable)")),
 		mcp.WithNumber("dedup_threshold", mcp.Description("Drop a candidate whose cosine to an already-selected result exceeds this [0,1]")),
@@ -176,6 +195,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeSemantic))),
 			Overfetch:         req.GetInt("overfetch", 4),
 			IncludeSuperseded: req.GetBool("include_superseded", false),
+			IncludeExpired:    req.GetBool("include_expired", false),
 			Source:            req.GetString("source", ""),
 			Since:             since,
 			Until:             until,
@@ -199,6 +219,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			Score        float32        `json:"score"`
 			CreatedAt    float64        `json:"created_at"`
 			SupersededBy string         `json:"superseded_by,omitempty"`
+			ExpiresAt    float64        `json:"expires_at,omitempty"`
 			Explain      map[string]any `json:"explain,omitempty"`
 		}
 		out := make([]row, len(results))
@@ -212,6 +233,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 				Score:        r.Score,
 				CreatedAt:    r.CreatedAt,
 				SupersededBy: r.SupersededBy,
+				ExpiresAt:    r.ExpiresAt,
 				Explain:      r.Explain,
 			}
 		}
@@ -383,6 +405,7 @@ func addEdit(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("importance", mcp.Description("0.0–1.0")),
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
 		mcp.WithString("source", mcp.Description("Provenance label (empty string clears)")),
+		mcp.WithNumber("expires_at", mcp.Description("Set the TTL to this Unix timestamp; pass 0 to clear it")),
 	)
 	s.AddTool(tool, editHandler(store))
 }
@@ -415,6 +438,9 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 			p := int(v)
 			opts.Polarity = &p
 		}
+		if v, ok := args["expires_at"].(float64); ok {
+			opts.ExpiresAt = &v
+		}
 		if v, ok := args["source"].(string); ok {
 			opts.Source = &v
 		}
@@ -422,7 +448,7 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 		if err != nil {
 			return jsonText(map[string]any{"ok": false, "error": err.Error()}), nil
 		}
-		return jsonText(map[string]any{
+		out := map[string]any{
 			"ok":         true,
 			"id":         m.ID,
 			"text":       m.Text,
@@ -431,7 +457,11 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 			"importance": m.Importance,
 			"polarity":   m.Polarity,
 			"source":     m.Source,
-		}), nil
+		}
+		if m.ExpiresAt != 0 {
+			out["expires_at"] = m.ExpiresAt
+		}
+		return jsonText(out), nil
 	}
 }
 
@@ -440,11 +470,13 @@ func addListRecent(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithDescription("List recently created memories."),
 		mcp.WithNumber("limit", mcp.Description("Max results (default: 20)")),
 		mcp.WithBoolean("include_superseded", mcp.Description("Include superseded memories")),
+		mcp.WithBoolean("include_expired", mcp.Description("Include memories whose TTL has passed")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		limit := req.GetInt("limit", 20)
 		incSup := req.GetBool("include_superseded", false)
-		mems, err := store.ListRecent(ctx, limit, incSup)
+		incExp := req.GetBool("include_expired", false)
+		mems, err := store.ListRecent(ctx, limit, incSup, incExp)
 		if err != nil {
 			return errResult(err), nil
 		}
@@ -456,6 +488,7 @@ func addListRecent(s *server.MCPServer, store *memory.MemoryStore) {
 			Importance   float32  `json:"importance"`
 			CreatedAt    float64  `json:"created_at"`
 			SupersededBy string   `json:"superseded_by,omitempty"`
+			ExpiresAt    float64  `json:"expires_at,omitempty"`
 		}
 		out := make([]row, len(mems))
 		for i, m := range mems {
@@ -467,6 +500,7 @@ func addListRecent(s *server.MCPServer, store *memory.MemoryStore) {
 				Importance:   m.Importance,
 				CreatedAt:    m.CreatedAt,
 				SupersededBy: m.SupersededBy,
+				ExpiresAt:    m.ExpiresAt,
 			}
 		}
 		return jsonText(out), nil
@@ -485,6 +519,127 @@ func addStats(s *server.MCPServer, store *memory.MemoryStore, path, collection s
 		stats["path"] = path
 		stats["collection"] = collection
 		return jsonText(stats), nil
+	})
+}
+
+func addMetrics(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("metrics",
+		mcp.WithDescription("Runtime metrics: op counters + recall latency since server start (process-local, reset on restart)."),
+	)
+	s.AddTool(tool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		m, err := store.Metrics(ctx)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(m), nil
+	})
+}
+
+func addPurgeExpired(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("purge_expired",
+		mcp.WithDescription("Hard-delete memories whose TTL has passed (reclaims storage). Expired memories are already hidden from recall."),
+		mcp.WithBoolean("dry_run", mcp.Description("Report what would be purged without deleting")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dry := req.GetBool("dry_run", false)
+		purged, err := store.PurgeExpired(ctx, 0, dry)
+		if err != nil {
+			return errResult(err), nil
+		}
+		ids := make([]string, len(purged))
+		for i, p := range purged {
+			ids[i] = p.ID
+		}
+		return jsonText(map[string]any{"purged": len(purged), "dry_run": dry, "ids": ids}), nil
+	})
+}
+
+func addHistory(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("history",
+		mcp.WithDescription("Full journaled timeline of one memory, oldest first (creation, edits, supersede/restore, links pointing at it, forget)."),
+		mcp.WithString("memory_id", mcp.Required(), mcp.Description("Memory UUID or 8-char prefix")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("memory_id")
+		if err != nil {
+			return errResult(err), nil
+		}
+		entries, err := store.History(ctx, id)
+		if err != nil {
+			return errResult(err), nil
+		}
+		out := make([]map[string]any, len(entries))
+		for i, e := range entries {
+			out[i] = map[string]any{
+				"ts": e.TS, "op": string(e.Op), "actor": e.Actor, "id": e.ID,
+				"before": e.Before, "after": e.After, "meta": e.Meta,
+				"summary": e.Summary(),
+			}
+		}
+		return jsonText(out), nil
+	})
+}
+
+func addStateAt(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("state_at",
+		mcp.WithDescription("Reconstruct the store's live memories as of a past time (best-effort journal replay)."),
+		mcp.WithString("ts", mcp.Required(), mcp.Description("Epoch seconds, an ISO-8601 date/datetime, or a relative span like \"7d\"")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, err := req.RequireString("ts")
+		if err != nil {
+			return errResult(err), nil
+		}
+		ts, _, perr := timeparse.Parse(raw)
+		if perr != nil {
+			return errResult(perr), nil
+		}
+		mems, err := store.StateAt(ctx, ts)
+		if err != nil {
+			return errResult(err), nil
+		}
+		items := make([]map[string]any, len(mems))
+		for i, m := range mems {
+			items[i] = map[string]any{
+				"id": m.ID, "text": m.Text, "type": string(m.Type),
+				"tags": m.Tags, "importance": m.Importance, "created_at": m.CreatedAt,
+			}
+		}
+		return jsonText(map[string]any{"ts": ts, "count": len(mems), "memories": items}), nil
+	})
+}
+
+func addGetAt(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("get_at",
+		mcp.WithDescription("Reconstruct a single memory as it was at a past time (see state_at)."),
+		mcp.WithString("memory_id", mcp.Required(), mcp.Description("Memory UUID or 8-char prefix")),
+		mcp.WithString("ts", mcp.Required(), mcp.Description("Epoch seconds, an ISO-8601 date/datetime, or a relative span like \"7d\"")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("memory_id")
+		if err != nil {
+			return errResult(err), nil
+		}
+		raw, err := req.RequireString("ts")
+		if err != nil {
+			return errResult(err), nil
+		}
+		ts, _, perr := timeparse.Parse(raw)
+		if perr != nil {
+			return errResult(perr), nil
+		}
+		mem, err := store.GetAt(ctx, id, ts)
+		if err != nil {
+			return errResult(err), nil
+		}
+		if mem == nil {
+			return jsonText(map[string]any{"ok": false, "error": "memory did not exist at that time"}), nil
+		}
+		return jsonText(map[string]any{
+			"ok": true, "ts": ts, "id": mem.ID, "text": mem.Text,
+			"type": string(mem.Type), "tags": mem.Tags, "importance": mem.Importance,
+			"created_at": mem.CreatedAt, "expires_at": mem.ExpiresAt,
+		}), nil
 	})
 }
 

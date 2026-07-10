@@ -596,3 +596,74 @@ class TestSchedulerConsolidate:
         summaries = [m for m in store.list_recent(limit=100)
                      if "reflection" in m.tags]
         assert len(summaries) == first.reflected
+
+
+class TestPurgeJob:
+    """Auto-purge of expired (TTL) memories via the maintenance tick."""
+
+    def test_state_has_purge_fields(self, tmp_path):
+        s = MaintenanceState()
+        assert s.last_purge_at is None
+        assert s.total_purged == 0
+        s2 = MaintenanceState(last_purge_at=123.0, total_purged=7)
+        s2.save(tmp_path / "state.json")
+        loaded = MaintenanceState.load(tmp_path / "state.json")
+        assert loaded.last_purge_at == 123.0
+        assert loaded.total_purged == 7
+
+    def test_old_state_file_without_purge_fields_loads(self, tmp_path):
+        # Migration: a state file written before purge existed.
+        p = tmp_path / "state.json"
+        p.write_text('{"last_decay_at": 5.0, "total_decayed": 2}')
+        loaded = MaintenanceState.load(p)
+        assert loaded.last_purge_at is None and loaded.total_purged == 0
+        assert loaded.last_decay_at == 5.0
+
+    def test_tick_purges_expired_when_overdue(self, store, tmp_path):
+        store.remember("expired doc", expires_at=1.0)  # long past
+        store.remember("live doc")
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None, purge_every=1,
+            state_path=str(tmp_path / "state.json"),
+        )
+        result = sched.tick()
+        assert result.ran_purge is True
+        assert result.purged == 1
+        assert store.count() == 1  # only the live one remains
+
+    def test_tick_skips_purge_when_fresh(self, store, tmp_path):
+        store.remember("expired doc", expires_at=1.0)
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None, purge_every=86_400,
+            state_path=str(tmp_path / "state.json"),
+        )
+        MaintenanceState(last_purge_at=time.time()).save(tmp_path / "state.json")
+        result = sched.tick()
+        assert result.ran_purge is False
+        assert store.count() == 1  # not purged
+
+    def test_purge_disabled_never_runs(self, store, tmp_path):
+        store.remember("expired doc", expires_at=1.0)
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None, purge_every=None,
+            state_path=str(tmp_path / "state.json"),
+        )
+        result = sched.tick()
+        assert result.ran_purge is False
+        assert store.count() == 1
+
+    def test_tick_advances_last_purge_and_total(self, store, tmp_path):
+        store.remember("expired doc", expires_at=1.0)
+        state_path = str(tmp_path / "state.json")
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None, purge_every=1,
+            state_path=state_path,
+        )
+        sched.tick()
+        loaded = MaintenanceState.load(state_path)
+        assert loaded.last_purge_at is not None
+        assert loaded.total_purged == 1
+
+    def test_purge_summary_string(self):
+        r = TickResult(ran_purge=True, purged=3)
+        assert "purge removed 3" in r.summary()

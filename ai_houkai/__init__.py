@@ -7,6 +7,7 @@ from ai_houkai.memory_system import (
     MemoryStore,
     MemoryType,
     ReflectionEngine,
+    Reranker,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "MemoryStore",
     "MemoryType",
     "ReflectionEngine",
+    "Reranker",
 ]

@@ -210,18 +210,23 @@ class ReflectionEngine:
                 continue
             cluster = [seed]
             used[seed] = True
-            seed_polarity = mems[seed].polarity
+            # The cluster's effective polarity: the first non-zero polarity
+            # absorbed. Comparing against the seed alone would let a neutral
+            # seed bridge a +1 and a -1 into one blended summary.
+            cluster_polarity = mems[seed].polarity
             for j in range(n):
                 if used[j]:
                     continue
                 # Never merge memories with explicitly opposite polarities:
                 # a positive and a negative memory describe contradictory states.
                 j_polarity = mems[j].polarity
-                if seed_polarity != 0 and j_polarity != 0 and seed_polarity != j_polarity:
+                if cluster_polarity != 0 and j_polarity != 0 and cluster_polarity != j_polarity:
                     continue
                 if _cosine(embeddings[seed], embeddings[j]) >= self.similarity_threshold:
                     cluster.append(j)
                     used[j] = True
+                    if cluster_polarity == 0:
+                        cluster_polarity = j_polarity
             if len(cluster) >= self.min_cluster_size:
                 result.append(cluster)
 

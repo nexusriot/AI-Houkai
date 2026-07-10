@@ -24,6 +24,10 @@ and periodic reflection that condenses experience into knowledge.
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency (creation-time by default) + importance + polarity blended scoring; CJK/Korean lexical tokenization |
 | **Retrieval controls** | RRF fusion · MMR diversity · near-duplicate dedup · `min_cosine` relevance gate · read-only/`explain` recall |
+| **Reranking** | Pluggable second-stage `reranker` (e.g. a cross-encoder) rescores the candidate pool before the top-k cut |
+| **TTL / expiry** | Per-memory `ttl_seconds`/`expires_at` — expired memories hidden from recall, reclaimed by `purge_expired` |
+| **History / point-in-time** | `history()` timeline per memory + `state_at()`/`get_at()` journal replay ("what did I know as of T?") |
+| **Runtime metrics** | `metrics()` — op counters + recall latency, via `GET /metrics` and the `metrics` MCP tool |
 | **Retrieval eval** | `ai_houkai.eval` — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set |
 | **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
 | **Importance auto-assignment** | Heuristic 0–1 scoring from text (instructions > decisions > completions > observations) |
@@ -34,8 +38,8 @@ and periodic reflection that condenses experience into knowledge.
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
 | **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
-| **MCP server** | 17 tools for any MCP client (Claude Code, Claude Desktop) |
-| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links), optional bearer-token auth |
+| **MCP server** | 22 tools for any MCP client (Claude Code, Claude Desktop) |
+| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links/history/metrics), optional bearer-token auth |
 | **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
@@ -63,7 +67,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (17 tools)
+│   │   └── server.py             # FastMCP server (22 tools)
 │   ├── http_server/
 │   │   ├── __init__.py
 │   │   └── server.py             # stdlib JSON HTTP/REST server (houkai serve)
@@ -117,7 +121,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 681 tests across 26 files
+├── tests/                        # 751 tests across 31 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -235,12 +239,37 @@ hits = store.recall("off-topic", k=5, min_cosine=0.2)
 # Read-only recall (no access-count bump) + score breakdowns
 for mem, score, why in store.recall("deploy", k=3, touch=False, explain=True):
     print(score, why)   # why: {'mode':'hybrid','fusion':'weighted','cosine':…,'weights':{…}}
+
+# Second-stage rerank: a stronger model rescores the pool before the top-k cut.
+# A reranker takes (query, [Memory]) and returns one score per memory.
+def rerank(query, mems):
+    return [cross_encoder.predict((query, m.text)) for m in mems]
+hits = store.recall("deploy", k=5, overfetch=10, reranker=rerank)
+# …or set it once on the store: MemoryStore(..., reranker=rerank)
 ```
 
 `diversity`/`dedup_threshold` must be in `[0, 1]` and `min_cosine` in `[-1, 1]`
 (else `ValueError`). `recall_pack(...)` accepts the same
 `fusion`/`diversity`/`dedup_threshold`/`min_cosine`/`touch` and forwards them to
 `recall`.
+
+### Expiry, history & metrics
+
+```python
+# TTL: a memory that expires (and disappears from recall) after a window
+store.remember("staging deploy token abc123", ttl_seconds=3600)   # or expires_at=<epoch>
+store.recall("token")                       # expired memories are hidden…
+store.recall("token", include_expired=True) # …unless you ask for them
+store.purge_expired()                       # hard-delete expired rows (reclaim storage)
+
+# Point-in-time: the audit journal doubles as a time machine
+store.history(mem.id)          # every event that touched this memory, oldest→newest
+store.state_at(some_epoch)     # the whole store reconstructed as of a past instant
+store.get_at(mem.id, epoch)    # one memory as it was then (or None)
+
+# Runtime metrics: op counters + recall latency since the store was created
+store.metrics()   # {'uptime_seconds':…, 'count':…, 'calls':{…}, 'recall_latency_ms':{…}}
+```
 
 ### Async usage
 
@@ -302,6 +331,9 @@ houkai remember "Python's GIL blocks CPU parallelism" \
 # Read from stdin (pipe-friendly)
 echo "Deploy with: make release" | houkai remember --stdin --type procedural
 
+# Time-to-live: expires (and drops out of recall) after N seconds
+houkai remember "staging token abc123" --ttl 3600
+
 # Score importance heuristically from the text (instructions/corrections ≈ 0.9,
 # decisions ≈ 0.75, completions ≈ 0.6, hedged observations ≈ 0.35)
 houkai remember "Never push directly to main" --auto-importance
@@ -316,6 +348,7 @@ git log --oneline -20 | houkai ingest --tag git --auto-importance --yes
 # Semantic search
 houkai recall "parallel execution" -k 5
 houkai recall "deploy" --mode hybrid --format json
+houkai recall "token" --include-expired          # also return TTL-expired hits
 
 # Filter by provenance and creation time (ISO date, epoch, or a relative span)
 houkai recall "auth" --source git --since 7d           # last week, from git ingests
@@ -418,6 +451,10 @@ houkai prune --frequency-weight 0.2
 
 # Actually delete (requires --apply)
 houkai prune --apply --yes
+
+# Purge TTL-expired memories (dry-run by default; ignores protect-types)
+houkai purge
+houkai purge --apply --yes
 
 # Preview reflection clusters
 houkai reflect
@@ -577,13 +614,18 @@ Endpoints (all JSON in / JSON out):
 |---|---|
 | `GET /health` | liveness + memory count (always open) |
 | `GET /stats` | store statistics |
-| `GET /memories?limit=&include_superseded=` | recent memories |
-| `POST /memories` | store a memory (`remember`) |
+| `GET /metrics` | runtime counters + recall latency |
+| `GET /memories?limit=&include_superseded=&include_expired=` | recent memories |
+| `POST /memories` | store a memory (`remember`; accepts `ttl_seconds`/`expires_at`) |
 | `GET /memories/{id}` | fetch one |
-| `PATCH /memories/{id}` | edit fields in place (journaled, undoable) |
+| `PATCH /memories/{id}` | edit fields in place (journaled, undoable; `expires_at`) |
 | `DELETE /memories/{id}` | forget one |
 | `GET /memories/{id}/neighbors?rel=&direction=&depth=` | linked memories |
-| `GET\|POST /recall` | search — supports `source`, `since`, `until` filters and `overfetch` |
+| `GET /memories/{id}/history` | journaled timeline of one memory |
+| `GET /memories/{id}/at?ts=` | reconstruct one memory as of a past time |
+| `GET /state_at?ts=` | reconstruct all live memories as of a past time |
+| `POST /purge_expired` | hard-delete TTL-expired memories (`{dry_run?}`) |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until`, `include_expired`, `explain` |
 | `POST /recall_pack` | token-budgeted context block |
 | `POST /auto_context` | multi-angle context block (`auto_context_pack`) |
 | `POST /links` · `POST /unlink` | manage the link graph |
@@ -591,10 +633,12 @@ Endpoints (all JSON in / JSON out):
 
 ```bash
 curl -s localhost:8077/health
-curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git'
-curl -s localhost:8077/memories -d '{"text":"remember this","type":"semantic"}'
+curl -s localhost:8077/metrics
+curl -s 'localhost:8077/recall?query=auth&k=3&since=7d&source=git&explain=true'
+curl -s localhost:8077/memories -d '{"text":"session token","type":"semantic","ttl_seconds":3600}'
 curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
-curl -s localhost:8077/auto_context -d '{"task":"deploy the api to production"}'
+curl -s "localhost:8077/state_at?ts=7d"          # store as it was a week ago
+curl -s -X POST localhost:8077/purge_expired -d '{"dry_run":true}'
 curl -s -X PATCH localhost:8077/memories/<id> -d '{"importance":0.9}'
 ```
 
@@ -642,14 +686,16 @@ compression trio; its response adds the fan-out `queries`. String `tags` in
 
 A full Go port lives in [`go/`](go/) — two static binaries (`houkai` CLI +
 `ai-houkai-mcp` MCP server), no Python runtime, packaged as a Debian `.deb`
-and macOS tarballs. It is at parity on the core surface: the same seventeen MCP
-tools, hybrid retrieval, decay/reflection with LLM summarizers, context
-packing, bulk ingest, collections, importance auto-assignment, installers for
-Claude Code / Cursor / OpenCode, and a Bubble Tea TUI. The Python-side phase
-0–1 retrieval refinements (RRF fusion, MMR diversity/dedup, `min_cosine`,
-read-only/`explain` recall, created-based recency, multi-hop link decay, CJK
-tokenization, compression packing, the eval harness) and the latest HTTP
-hardening are not yet in the Go port.
+and macOS tarballs. It is at parity on the core surface: the same 22 MCP
+tools, hybrid retrieval with the full ranking suite (RRF fusion, MMR
+diversity/dedup, `min_cosine`, read-only/`explain` recall, created-based
+recency, multi-hop link decay, CJK tokenization), context packing with
+compression, decay/reflection with LLM summarizers, bulk ingest, collections,
+importance auto-assignment, installers for Claude Code / Cursor / OpenCode, and
+a Bubble Tea TUI. The five recent additions — pluggable **reranking**,
+**TTL/expiry** (+ maintenance purge), **point-in-time history**, recall
+**explain**, and runtime **metrics** — are ported too. The only Python-only
+piece is the retrieval-eval harness (`ai_houkai.eval`).
 Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean
 instead of bundled sentence-transformers, and the store is
 [chromem-go](https://github.com/philippgille/chromem-go) — not
@@ -863,12 +909,18 @@ ai-houkai-mcp
 # or: python -m ai_houkai.mcp_server.server
 ```
 
-Exposed tools (17):
+Exposed tools (22):
 
-- **Core** — `remember` · `edit` · `recall` · `recall_pack` · `auto_context` · `forget` · `list_recent` · `stats`
+- **Core** — `remember` · `edit` · `recall` · `recall_pack` · `auto_context` · `forget` · `purge_expired` · `list_recent` · `stats` · `metrics`
 - **Linking** — `link` · `unlink` · `neighbors`
 - **Conflicts** — `find_conflicts` · `supersede`
+- **History** — `history` · `state_at` · `get_at`
 - **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `export` · `import`
+
+`recall` accepts `include_expired` and `explain`; `remember`/`edit` accept a TTL
+(`ttl_seconds`/`expires_at`). `history`/`state_at`/`get_at` replay the audit
+journal for point-in-time queries; `metrics` reports op counters + recall
+latency.
 
 `auto_context` fans out recall over several angles extracted from a task
 description, dedupes by id, and packs the result within a token budget.

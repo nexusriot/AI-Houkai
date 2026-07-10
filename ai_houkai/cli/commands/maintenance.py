@@ -48,6 +48,7 @@ def _make_scheduler(store, mcfg) -> MaintenanceScheduler:
         store=store,
         decay_every=mcfg.decay_every,
         reflect_every=mcfg.reflect_every,
+        purge_every=mcfg.purge_every,
         tick_interval=mcfg.tick_interval,
         state_path=mcfg.state_path,
         decay_rate=mcfg.decay_rate,

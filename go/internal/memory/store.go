@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,6 +27,13 @@ const (
 	ModeHybrid   RecallMode = "hybrid"
 )
 
+// Reranker rescores a recall candidate pool with a stronger (usually
+// cross-encoder) relevance model. It receives the query and the candidate
+// memories (already filtered + first-stage ranked) and returns one score per
+// memory, in the same order; higher = more relevant. Recall re-sorts by the
+// returned scores and, in explain mode, records the first-stage score/rank.
+type Reranker func(query string, mems []Memory) []float32
+
 // StoreConfig holds MemoryStore creation parameters.
 type StoreConfig struct {
 	Path              string
@@ -40,6 +48,10 @@ type StoreConfig struct {
 	// ImportanceFn, when set, auto-scores memories remembered without an
 	// explicit importance (e.g. ScoreImportance). Nil → DefaultImportance.
 	ImportanceFn func(text string, memType MemoryType, tags []string) float32
+
+	// Reranker, when set, is the default second-stage reranker applied to the
+	// recall candidate pool (per-call RecallOpts.Reranker overrides it).
+	Reranker Reranker
 
 	// Audit-journal options.
 	Actor           string // "cli" | "mcp" | "lib" | "reflection" | "decay" | "import"
@@ -71,6 +83,15 @@ type MemoryStore struct {
 	cfg      StoreConfig
 	journal  *Journal
 	actor    string
+
+	// Process-local runtime metrics (not persisted; reset on restart). Guarded
+	// by metricMu since HTTP/MCP handlers may call the store concurrently.
+	metricMu      sync.Mutex
+	metricStarted time.Time
+	metricCalls   map[string]int
+	recallCount   int
+	recallTotalS  float64
+	recallMaxS    float64
 }
 
 // NewMemoryStore creates a new store backed by the given vector backend + embedder.
@@ -78,7 +99,13 @@ func NewMemoryStore(backend vector.Backend, embedder embed.Embedder, cfg StoreCo
 	if cfg.Actor == "" {
 		cfg.Actor = "lib"
 	}
-	s := &MemoryStore{backend: backend, embedder: embedder, cfg: cfg, actor: cfg.Actor}
+	s := &MemoryStore{
+		backend: backend, embedder: embedder, cfg: cfg, actor: cfg.Actor,
+		metricStarted: time.Now(),
+		metricCalls: map[string]int{
+			"remember": 0, "recall": 0, "forget": 0, "edit": 0, "supersede": 0,
+		},
+	}
 	if cfg.JournalEnabled {
 		jp := cfg.JournalPath
 		if jp == "" {
@@ -147,6 +174,24 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		return Memory{}, false, nil, err
 	}
 
+	// Expiry: absolute epoch (ExpiresAt) or relative (TTLSeconds from now).
+	// nil / 0 means "never expires". They are mutually exclusive.
+	var expiresAt float64
+	if opts.ExpiresAt != nil && opts.TTLSeconds != nil {
+		return Memory{}, false, nil, validationErrorf("pass at most one of ExpiresAt, TTLSeconds")
+	}
+	if opts.TTLSeconds != nil {
+		if *opts.TTLSeconds <= 0 {
+			return Memory{}, false, nil, validationErrorf("ttl_seconds must be > 0")
+		}
+		expiresAt = nowFloat() + *opts.TTLSeconds
+	} else if opts.ExpiresAt != nil {
+		if *opts.ExpiresAt < 0 {
+			return Memory{}, false, nil, validationErrorf("expires_at must be >= 0")
+		}
+		expiresAt = *opts.ExpiresAt
+	}
+
 	// Importance nil means "unset" → auto-score when an ImportanceFn is
 	// configured, else keep the configured default. An explicit value —
 	// including 0 — is honoured, clamped to [0, 1].
@@ -161,7 +206,9 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		importance = clamp01(*opts.Importance)
 	}
 
-	now := float64(time.Now().Unix())
+	// Sub-second precision, matching Python's time.time(): whole-second
+	// timestamps make same-second remembers tie, so ListRecent order flaps.
+	now := nowFloat()
 	m := Memory{
 		ID:           uuid.NewString(),
 		Text:         text,
@@ -176,6 +223,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		SupersededBy: "",
 		SupersededAt: 0,
 		Polarity:     opts.Polarity,
+		ExpiresAt:    expiresAt,
 	}
 	if m.Tags == nil {
 		m.Tags = []string{}
@@ -200,6 +248,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	if err != nil {
 		return Memory{}, false, nil, err
 	}
+	s.recordCall("remember")
 	s.journalEntry("remember", m.ID, nil, m.ToDict(), nil)
 
 	// Conflict check. A per-call OnConflict overrides the store default.
@@ -222,7 +271,11 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 				log.Printf("ai-houkai: %d conflict(s) detected for new memory", len(conflicts))
 			case PolicySupersede:
 				for _, c := range conflicts {
-					_ = s.doSupersede(ctx, c.B.ID, m.ID)
+					// A failed supersede must surface (Python's exception
+					// propagates); the memory itself IS stored.
+					if err := s.doSupersede(ctx, c.B.ID, m.ID); err != nil {
+						return m, true, nil, fmt.Errorf("supersede conflict %s: %w", c.B.ID, err)
+					}
 				}
 			case PolicyRaise:
 				// Roll back the just-added memory — the caller is told it was
@@ -245,6 +298,11 @@ type RememberOpts struct {
 	Importance *float32
 	Source     string
 	Polarity   int
+	// ExpiresAt / TTLSeconds set an optional TTL: an absolute epoch (ExpiresAt)
+	// or a relative lifetime in seconds (TTLSeconds, from now). nil = never
+	// expires. Pass at most one.
+	ExpiresAt  *float64
+	TTLSeconds *float64
 	// OnConflict overrides the store's configured conflict policy for this
 	// call only (empty = use the store default).
 	OnConflict ConflictPolicy
@@ -278,6 +336,16 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if opts.MinCosine != nil && (*opts.MinCosine < -1 || *opts.MinCosine > 1) {
 		return nil, validationErrorf("min_cosine must be in [-1, 1]")
 	}
+
+	t0 := time.Now()
+	s.recordCall("recall")
+	defer func() { s.recordRecallLatency(time.Since(t0)) }()
+
+	reranker := opts.Reranker
+	if reranker == nil {
+		reranker = s.cfg.Reranker
+	}
+
 	count, err := s.backend.Count(ctx)
 	if err != nil {
 		return nil, err
@@ -296,7 +364,9 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	// Unlike Python (which pushes type/importance/source/time into Chroma's
 	// where-clause), the Go backend filters entirely client-side, so ANY active
 	// filter — not just tag — forces an over-fetch to avoid under-returning.
+	// Expiry filtering and reranking both reorder/drop rows, so they force it too.
 	noPostFilter := opts.Mode == ModeSemantic && opts.IncludeSuperseded &&
+		opts.IncludeExpired && reranker == nil &&
 		opts.Tag == "" && opts.Type == "" && opts.MinImportance <= 0 &&
 		opts.Source == "" && opts.Since == 0 && opts.Until == 0 &&
 		!needEmb && opts.MinCosine == nil
@@ -321,6 +391,8 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		return nil, err
 	}
 
+	now := nowFloat()
+
 	// The "where-clause" filters (type/importance/source/since/until) form the
 	// scoring pool; tag/superseded/min_cosine are applied inside the scorers so
 	// the BM25 pool matches Python's server-side-filtered document set.
@@ -342,6 +414,12 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		if opts.Until > 0 && m.CreatedAt > opts.Until {
 			continue
 		}
+		// Drop expired unless asked to keep them. Post-filter (not a backend
+		// query filter), so rows written before TTL existed (ExpiresAt 0) are
+		// unaffected.
+		if !opts.IncludeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
 		pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
 	}
 
@@ -355,7 +433,6 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		expl = map[string]map[string]any{}
 	}
 
-	now := nowFloat()
 	var scored []scoredCand
 	if opts.Mode == ModeHybrid {
 		docs := make([]string, len(pool))
@@ -370,6 +447,14 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		}
 	} else {
 		scored = scoreSemantic(pool, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl)
+	}
+
+	// Second-stage rerank over the surviving pool, before the top-k cut.
+	if reranker != nil && len(scored) > 0 {
+		scored, err = applyReranker(reranker, query, scored, expl)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var chosen []scoredCand
@@ -436,6 +521,12 @@ type RecallOpts struct {
 	MinCosine      *float32   // absolute cosine relevance floor in [-1,1]; nil disables
 	NoTouch        bool       // skip the access-count / last_accessed bump (read-only)
 	Explain        bool       // populate MemoryWithScore.Explain with per-signal breakdowns
+	// IncludeExpired keeps memories whose ExpiresAt has passed (hidden by
+	// default, like superseded).
+	IncludeExpired bool
+	// Reranker overrides the store's default reranker for this call: it
+	// rescores the first-stage pool before the top-k cut. nil = store default.
+	Reranker Reranker
 }
 
 // Forget deletes a memory by ID. Returns true if found and deleted.
@@ -448,6 +539,7 @@ func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
 	if err := s.backend.Delete(ctx, []string{id}); err != nil {
 		return false, err
 	}
+	s.recordCall("forget")
 	s.journalEntry("forget", id, before.ToDict(), nil, nil)
 	return true, nil
 }
@@ -462,7 +554,9 @@ type EditOpts struct {
 	Tags       []string
 	Importance *float32 // clamped to [0, 1]
 	Polarity   *int
-	Source     *string
+	// ExpiresAt: nil = unchanged; a pointer to 0 clears the TTL.
+	ExpiresAt *float64
+	Source    *string
 }
 
 // Edit updates fields of an existing memory in place, keeping its id.
@@ -497,6 +591,12 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 	if opts.Importance != nil {
 		mem.Importance = clamp01(*opts.Importance)
 	}
+	if opts.ExpiresAt != nil {
+		if *opts.ExpiresAt < 0 {
+			return Memory{}, validationErrorf("expires_at must be >= 0")
+		}
+		mem.ExpiresAt = *opts.ExpiresAt
+	}
 	if opts.Tags != nil {
 		if err := validateTags(opts.Tags); err != nil {
 			return Memory{}, err
@@ -523,25 +623,32 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 	if err := s.UpdateMemory(ctx, mem, textChanged); err != nil {
 		return Memory{}, err
 	}
+	s.recordCall("edit")
 	s.journalEntry("edit", mem.ID, before, after, nil)
 	return mem, nil
 }
 
 // ListRecent returns up to limit memories sorted by created_at desc.
-func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded bool) ([]Memory, error) {
+func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]Memory, error) {
 	items, err := s.backend.All(ctx)
 	if err != nil {
 		return nil, err
 	}
+	now := nowFloat()
 	var mems []Memory
 	for _, it := range items {
 		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
 		if !includeSuperseded && m.SupersededBy != "" {
 			continue
 		}
+		if !includeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
 		mems = append(mems, m)
 	}
-	sort.Slice(mems, func(i, j int) bool {
+	// Stable: same-created_at rows keep insertion order instead of flapping
+	// between calls (export claims byte-identical output for a fixed store).
+	sort.SliceStable(mems, func(i, j int) bool {
 		return mems[i].CreatedAt > mems[j].CreatedAt
 	})
 	if limit > 0 && len(mems) > limit {
@@ -553,6 +660,225 @@ func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSupersed
 // Count returns total stored memories.
 func (s *MemoryStore) Count(ctx context.Context) (int, error) {
 	return s.backend.Count(ctx)
+}
+
+func (s *MemoryStore) recordCall(name string) {
+	s.metricMu.Lock()
+	s.metricCalls[name]++
+	s.metricMu.Unlock()
+}
+
+func (s *MemoryStore) recordRecallLatency(d time.Duration) {
+	sec := d.Seconds()
+	s.metricMu.Lock()
+	s.recallCount++
+	s.recallTotalS += sec
+	if sec > s.recallMaxS {
+		s.recallMaxS = sec
+	}
+	s.metricMu.Unlock()
+}
+
+// Metrics returns process-local runtime metrics since this store was created.
+// Complements Stats (content aggregates) with operational counters and recall
+// latency. Per-instance and in-memory — not persisted, reset on restart.
+func (s *MemoryStore) Metrics(ctx context.Context) (map[string]any, error) {
+	count, err := s.backend.Count(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.metricMu.Lock()
+	calls := make(map[string]int, len(s.metricCalls))
+	for k, v := range s.metricCalls {
+		calls[k] = v
+	}
+	n := s.recallCount
+	avgMs := 0.0
+	if n > 0 {
+		avgMs = math.Round(s.recallTotalS/float64(n)*1e3*1e3) / 1e3
+	}
+	maxMs := math.Round(s.recallMaxS * 1e3 * 1e3) / 1e3
+	s.metricMu.Unlock()
+	return map[string]any{
+		"uptime_seconds": math.Round(time.Since(s.metricStarted).Seconds()*1e3) / 1e3,
+		"count":          count,
+		"calls":          calls,
+		"recall_latency_ms": map[string]any{
+			"count": n,
+			"avg":   avgMs,
+			"max":   maxMs,
+		},
+	}, nil
+}
+
+// PurgeExpired hard-deletes memories whose TTL has passed, returning those
+// purged. Expired memories are already hidden from recall/list; this reclaims
+// their storage. Unlike decay's Prune it ignores protect-types — an explicit
+// TTL is a stronger signal. Each deletion is journaled per-row (actor "purge").
+// dryRun reports without deleting. A now of 0 uses the current time.
+func (s *MemoryStore) PurgeExpired(ctx context.Context, now float64, dryRun bool) ([]Memory, error) {
+	if now == 0 {
+		now = nowFloat()
+	}
+	items, err := s.backend.All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var expired []Memory
+	for _, it := range items {
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			expired = append(expired, m)
+		}
+	}
+	if !dryRun && len(expired) > 0 {
+		restore := s.AsActor("purge")
+		defer restore()
+		for _, m := range expired {
+			if _, err := s.Forget(ctx, m.ID); err != nil {
+				return expired, err
+			}
+		}
+	}
+	return expired, nil
+}
+
+// entryTouches reports whether a journal entry concerns memoryID — as the op's
+// subject (entry.ID) or as a link target / supersede counterpart recorded only
+// in meta (dst_id / new_id / superseder_id).
+func entryTouches(e JournalEntry, memoryID string) bool {
+	if e.ID == memoryID {
+		return true
+	}
+	for _, key := range []string{"dst_id", "new_id", "superseder_id"} {
+		if v, ok := e.Meta[key].(string); ok && v == memoryID {
+			return true
+		}
+	}
+	return false
+}
+
+// History returns every journaled event touching memoryID, oldest first.
+// Covers the memory as an op's subject and as a link/supersede counterpart.
+// Store-wide "nuke" events are omitted (use JournalTail for those). Bounded by
+// journal retention.
+func (s *MemoryStore) History(ctx context.Context, memoryID string) ([]JournalEntry, error) {
+	if s.journal == nil {
+		return nil, nil
+	}
+	all, err := s.journal.Read(ReadOpts{IncludeArchives: true})
+	if err != nil {
+		return nil, err
+	}
+	out := []JournalEntry{}
+	for _, e := range all {
+		if entryTouches(e, memoryID) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// replayLink applies a link/unlink journal delta to a reconstructed state map.
+func replayLink(state map[string]map[string]any, meta map[string]any, add bool) {
+	src, _ := meta["src_id"].(string)
+	dst, _ := meta["dst_id"].(string)
+	rel, _ := meta["rel"].(string)
+	d, ok := state[src]
+	if src == "" || !ok {
+		return
+	}
+	links, _ := d["links"].([]any)
+	if add {
+		for _, l := range links {
+			if lm, ok := l.(map[string]any); ok && lm["to"] == dst && lm["rel"] == rel {
+				return // already present
+			}
+		}
+		d["links"] = append(links, map[string]any{"to": dst, "rel": rel})
+		return
+	}
+	// unlink: a rel="" unlink removes several rels, recorded in removed_rels.
+	removed := map[string]bool{}
+	if rr, ok := meta["removed_rels"].([]any); ok {
+		for _, r := range rr {
+			if rs, ok := r.(string); ok {
+				removed[rs] = true
+			}
+		}
+	} else if rel != "" {
+		removed[rel] = true
+	}
+	kept := []any{}
+	for _, l := range links {
+		lm, _ := l.(map[string]any)
+		to, _ := lm["to"].(string)
+		lrel, _ := lm["rel"].(string)
+		matchAll := len(removed) == 0 && rel == ""
+		if to == dst && (matchAll || removed[lrel]) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	d["links"] = kept
+}
+
+// StateAt reconstructs the live memories as of timestamp by replaying the
+// journal. Best-effort audit tool, not a source of record: it sees only
+// journaled snapshots, so it is accurate back to the oldest retained entry, a
+// "nuke" in the window clears reconstructed state, and memories written with
+// journaling disabled are invisible. Reconstructed memories carry no embedding.
+func (s *MemoryStore) StateAt(ctx context.Context, timestamp float64) ([]Memory, error) {
+	if s.journal == nil {
+		return nil, nil
+	}
+	entries, err := s.journal.Read(ReadOpts{Until: timestamp, IncludeArchives: true})
+	if err != nil {
+		return nil, err
+	}
+	state := map[string]map[string]any{}
+	for _, e := range entries {
+		switch e.Op {
+		case "remember", "import", "edit", "supersede", "restore":
+			if e.After != nil {
+				state[e.ID] = e.After
+			}
+		case "forget":
+			delete(state, e.ID)
+		case "nuke":
+			state = map[string]map[string]any{}
+		case "link":
+			replayLink(state, e.Meta, true)
+		case "unlink":
+			replayLink(state, e.Meta, false)
+		case "undo":
+			if e.After != nil {
+				state[e.ID] = e.After
+			} else if ofOp, _ := e.Meta["of_op"].(string); ofOp == "remember" {
+				delete(state, e.ID)
+			}
+		}
+	}
+	out := make([]Memory, 0, len(state))
+	for _, d := range state {
+		out = append(out, MemoryFromDict(d))
+	}
+	return out, nil
+}
+
+// GetAt reconstructs a single memory as of timestamp (see StateAt). Returns nil
+// if the memory did not exist then.
+func (s *MemoryStore) GetAt(ctx context.Context, memoryID string, timestamp float64) (*Memory, error) {
+	mems, err := s.StateAt(ctx, timestamp)
+	if err != nil {
+		return nil, err
+	}
+	for i := range mems {
+		if mems[i].ID == memoryID {
+			return &mems[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // Nuke deletes every memory in the current collection (keeping the collection
@@ -952,6 +1278,7 @@ func (s *MemoryStore) doSupersede(ctx context.Context, oldID, newID string) erro
 	if _, err := s.linkRaw(ctx, newMem.ID, old.ID, RelSupersedes); err != nil {
 		return err
 	}
+	s.recordCall("supersede")
 	s.journalEntry("supersede", old.ID, before, old.ToDict(),
 		map[string]any{"old_id": old.ID, "new_id": newMem.ID})
 	return nil
@@ -993,7 +1320,7 @@ func (s *MemoryStore) touchMany(ctx context.Context, mems []*Memory) error {
 	if len(mems) == 0 {
 		return nil
 	}
-	now := float64(time.Now().Unix())
+	now := nowFloat()
 	var firstErr error
 	for _, m := range mems {
 		m.LastAccessed = now
@@ -1139,7 +1466,9 @@ func (s *MemoryStore) AllRaw(ctx context.Context) ([]vector.Item, error) {
 // Stats returns aggregate stats. Type/tag counts and average importance are
 // computed over ACTIVE (non-superseded) memories, matching the Python CLI.
 func (s *MemoryStore) Stats(ctx context.Context) (map[string]any, error) {
-	mems, err := s.ListRecent(ctx, 0, true)
+	// includeExpired=true: expired-but-not-yet-purged memories are still in the
+	// store, so they count toward totals.
+	mems, err := s.ListRecent(ctx, 0, true, true)
 	if err != nil {
 		return nil, err
 	}

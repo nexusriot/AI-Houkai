@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from ai_houkai.tui.data import (
@@ -61,6 +63,16 @@ class TestViews:
         view = neighbors_view(store, a)
         assert [r[0] for r in view.rows] == [b.id[:8]]
         assert view.rows[0][4] == "refines"
+
+    def test_neighbors_view_parallel_links_one_row_per_target(self, seeded):
+        # Two edges to the same target must collapse into one row — the app
+        # keys DataTable rows by id8, and a repeated key raises DuplicateKey.
+        store, (a, b, _) = seeded
+        store.link(a.id, b.id, rel="related")
+        view = neighbors_view(store, store._get_by_id(a.id))
+        assert [r[0] for r in view.rows] == [b.id[:8]]
+        assert set(view.rows[0][4].split(",")) == {"refines", "related"}
+        assert view.memories[b.id[:8]].id == b.id
 
     def test_detail_markup_contents(self, seeded):
         store, (a, b, _) = seeded
@@ -170,8 +182,6 @@ async def test_nuke_double_press_nukes(seeded):
 async def test_nuke_confirmation_expires(seeded, monkeypatch):
     """The armed nuke state must expire with the warning toast — a stray X
     long after the prompt disappeared must not wipe the store."""
-    import asyncio
-
     store, _ = seeded
     monkeypatch.setattr(HoukaiTui, "NUKE_CONFIRM_SECONDS", 0.5)
     app = HoukaiTui(store=store, collection="test")

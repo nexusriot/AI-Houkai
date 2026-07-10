@@ -20,7 +20,7 @@ from ai_houkai.cli.commands.nuke import nuke
 from ai_houkai.cli.commands.edit import edit, tag, bump
 from ai_houkai.cli.commands.link import link, unlink, neighbors, graph
 from ai_houkai.cli.commands.conflicts import conflicts, supersede, restore
-from ai_houkai.cli.commands.decay import prune
+from ai_houkai.cli.commands.decay import prune, purge
 from ai_houkai.cli.commands.reflect import reflect
 from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
 from ai_houkai.cli.commands.stats import stats
@@ -105,6 +105,7 @@ def _register() -> None:
     app.command("supersede")(supersede)
     app.command("restore")(restore)
     app.command("prune")(prune)
+    app.command("purge")(purge)
     app.command("reflect")(reflect)
     app.command("export")(export_cmd)
     app.command("import")(import_cmd)

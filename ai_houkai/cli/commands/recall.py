@@ -20,6 +20,8 @@ def recall(
     until: Optional[str] = typer.Option(None, "--until", help="Only memories created at/before (ISO date, epoch, or '7d')"),
     mode: str = typer.Option("semantic", "--mode", help="semantic|hybrid"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
+    include_expired: bool = typer.Option(False, "--include-expired",
+                                         help="Also return memories whose TTL has passed"),
     fmt: str = typer.Option("auto", "--format", "-f", help="auto|rich|tsv|json"),
 ) -> None:
     """Semantic search across memories."""
@@ -41,6 +43,7 @@ def recall(
             until=until_ts,
             mode=mode,
             include_superseded=include_superseded,
+            include_expired=include_expired,
         )
     if not results:
         typer.echo("No memories found.", err=True)

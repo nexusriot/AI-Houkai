@@ -4,15 +4,20 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed (17):
-    remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?)
-    edit(memory_id, text?, type?, tags?, importance?, polarity?, source?, clear_source?)
-    recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?)
+Tools exposed (22):
+    remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?, expires_at?, ttl_seconds?)
+    edit(memory_id, text?, type?, tags?, importance?, polarity?, source?, clear_source?, expires_at?)
+    recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?, include_superseded?, include_expired?, explain?)
     recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?, compress?, compress_threshold?, compress_min_group?)
     auto_context(task, token_budget?, max_phrases?, mode?)
     forget(memory_id)
-    list_recent(limit?, include_superseded?)
+    purge_expired(dry_run?)
+    list_recent(limit?, include_superseded?, include_expired?)
     stats()
+    metrics()
+    history(memory_id)
+    state_at(ts)
+    get_at(memory_id, ts)
     link(src_id, dst_id, rel?)
     unlink(src_id, dst_id, rel?)
     neighbors(memory_id, rel?, direction?, depth?)
@@ -80,6 +85,8 @@ def remember(
     source: str | None = None,
     on_conflict: str | None = None,
     polarity: int = 0,
+    expires_at: float | None = None,
+    ttl_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Store a new memory.
     type: episodic | semantic | procedural | feedback.
@@ -87,6 +94,9 @@ def remember(
     the server runs with AI_HOUKAI_AUTO_IMPORTANCE=1).
     on_conflict: ignore | warn | supersede | raise (default: store policy).
     polarity: -1 (negative) | 0 (neutral) | +1 (positive).
+    expires_at / ttl_seconds: optional TTL — an absolute epoch (expires_at) or
+    a relative lifetime in seconds (ttl_seconds). Expired memories are hidden
+    from recall and reclaimable by purge_expired. Pass at most one.
     """
 
     policy = on_conflict  # type: ignore[assignment]
@@ -98,6 +108,8 @@ def remember(
             importance=importance,
             source=source,
             polarity=polarity,
+            expires_at=expires_at,
+            ttl_seconds=ttl_seconds,
             on_conflict=policy,  # type: ignore[arg-type]
         )
     except ConflictError as e:
@@ -109,7 +121,8 @@ def remember(
                 for c in e.conflicts
             ],
         }
-    return {"id": mem.id, "stored": True, "importance": mem.importance}
+    return {"id": mem.id, "stored": True, "importance": mem.importance,
+            "expires_at": mem.expires_at or None}
 
 
 @mcp.tool()
@@ -125,12 +138,16 @@ def recall(
     mode: str = "semantic",
     overfetch: int = 4,
     include_superseded: bool = False,
+    include_expired: bool = False,
+    explain: bool = False,
 ) -> list[dict[str, Any]]:
     """Semantic (or hybrid) search across stored memories.
     mode: "semantic" (default) | "hybrid" (cosine + BM25 + recency + importance).
     source: keep only memories with this exact provenance string.
     since/until: bound created_at — epoch seconds, an ISO-8601 date/datetime,
     or a relative span like "7d" / "24h" (since="7d" → last 7 days).
+    include_expired: also return memories whose TTL has passed (hidden by default).
+    explain: attach a per-signal score breakdown to each hit under "explain".
     """
     hits = get_store().recall(
         query=query,
@@ -144,9 +161,12 @@ def recall(
         mode=mode,            # type: ignore[arg-type]
         overfetch=overfetch,
         include_superseded=include_superseded,
+        include_expired=include_expired,
+        explain=explain,
     )
-    return [
-        {
+
+    def _hit(m: Any, score: float) -> dict[str, Any]:
+        return {
             "id": m.id,
             "text": m.text,
             "type": m.type,
@@ -155,9 +175,12 @@ def recall(
             "score": round(score, 4),
             "created_at": m.created_at,
             "superseded_by": m.superseded_by or None,
+            "expires_at": m.expires_at or None,
         }
-        for m, score in hits
-    ]
+
+    if explain:
+        return [{**_hit(m, score), "explain": expl} for m, score, expl in hits]
+    return [_hit(m, score) for m, score in hits]
 
 
 @mcp.tool()
@@ -296,6 +319,7 @@ def edit(
     polarity: int | None = None,
     source: str | None = None,
     clear_source: bool = False,
+    expires_at: float | None = None,
 ) -> dict[str, Any]:
     """Update fields of an existing memory in place, keeping its id.
 
@@ -305,6 +329,8 @@ def edit(
     type: episodic | semantic | procedural | feedback.
     clear_source: true removes the provenance string (an omitted `source`
     otherwise means "leave unchanged"); do not combine with `source`.
+    expires_at: set the TTL to this absolute epoch; pass 0 to clear it (omit to
+    leave unchanged).
     """
     if clear_source and source is not None:
         return {"ok": False,
@@ -320,6 +346,8 @@ def edit(
         kwargs["importance"] = importance
     if polarity is not None:
         kwargs["polarity"] = polarity
+    if expires_at is not None:
+        kwargs["expires_at"] = expires_at
     if source is not None:
         kwargs["source"] = source
     if clear_source:
@@ -337,6 +365,7 @@ def edit(
         "importance": mem.importance,
         "polarity": mem.polarity,
         "source": mem.source,
+        "expires_at": mem.expires_at or None,
     }
 
 
@@ -344,6 +373,7 @@ def edit(
 def list_recent(
     limit: int = 20,
     include_superseded: bool = False,
+    include_expired: bool = False,
 ) -> list[dict[str, Any]]:
     """List the most recently created memories."""
     return [
@@ -354,9 +384,90 @@ def list_recent(
             "tags": m.tags,
             "created_at": m.created_at,
             "superseded_by": m.superseded_by or None,
+            "expires_at": m.expires_at or None,
         }
-        for m in get_store().list_recent(limit=limit, include_superseded=include_superseded)
+        for m in get_store().list_recent(
+            limit=limit, include_superseded=include_superseded,
+            include_expired=include_expired)
     ]
+
+
+@mcp.tool()
+def purge_expired(dry_run: bool = False) -> dict[str, Any]:
+    """Hard-delete memories whose TTL has passed (reclaims storage).
+
+    Expired memories are already hidden from recall; this removes them for
+    good. dry_run=True reports what would be purged without deleting.
+    """
+    purged = get_store().purge_expired(dry_run=dry_run)
+    return {"purged": len(purged), "dry_run": dry_run,
+            "ids": [p.id for p in purged]}
+
+
+@mcp.tool()
+def metrics() -> dict[str, Any]:
+    """Runtime metrics: op counters + recall latency since server start.
+
+    Process-local and in-memory (reset on restart). Complements `stats`
+    (content aggregates) with operational counts.
+    """
+    return get_store().metrics()
+
+
+@mcp.tool()
+def history(memory_id: str) -> list[dict[str, Any]]:
+    """Full journaled timeline of one memory, oldest first.
+
+    Every event touching the memory — creation, edits, supersede/restore,
+    links pointing at it, forget — with before/after snapshots. Bounded by
+    journal retention.
+    """
+    return [
+        {"ts": e.ts, "op": e.op, "actor": e.actor, "id": e.id,
+         "before": e.before, "after": e.after, "meta": e.meta,
+         "summary": e.summary()}
+        for e in get_store().history(memory_id)
+    ]
+
+
+@mcp.tool()
+def state_at(ts: str) -> dict[str, Any]:
+    """Reconstruct the store's live memories as of a past time.
+
+    ts: epoch seconds, an ISO-8601 date/datetime, or a relative span like "7d".
+    Best-effort replay of the journal (see the store's state_at docs for its
+    limits: retention window, nuke resets, journaling-disabled gaps).
+    """
+    t = parse_timestamp(ts)
+    if t is None:
+        return {"error": "ts is required"}
+    mems = get_store().state_at(t)
+    return {
+        "ts": t,
+        "count": len(mems),
+        "memories": [
+            {"id": m.id, "text": m.text, "type": m.type, "tags": m.tags,
+             "importance": m.importance, "created_at": m.created_at}
+            for m in mems
+        ],
+    }
+
+
+@mcp.tool()
+def get_at(memory_id: str, ts: str) -> dict[str, Any]:
+    """Reconstruct a single memory as it was at a past time (see state_at)."""
+    t = parse_timestamp(ts)
+    if t is None:
+        return {"error": "ts is required"}
+    mem = get_store().get_at(memory_id, t)
+    if mem is None:
+        return {"ok": False, "error": "memory did not exist at that time"}
+    return {"ok": True, "ts": t, **{
+        "id": mem.id, "text": mem.text, "type": mem.type, "tags": mem.tags,
+        "importance": mem.importance, "created_at": mem.created_at,
+        "superseded_by": mem.superseded_by or None,
+        "expires_at": mem.expires_at or None,
+    }}
 
 
 @mcp.tool()
@@ -488,11 +599,14 @@ def maintenance_tick(
             "summary": "maintenance disabled ([maintenance].enabled = false)",
             "ran_decay": False,
             "ran_reflect": False,
+            "ran_purge": False,
             "decayed": 0,
             "reflected": 0,
+            "purged": 0,
             "reflect_applied": False,
             "decay_error": None,
             "reflect_error": None,
+            "purge_error": None,
         }
     if reflect_apply is None:
         reflect_apply = mcfg.reflect_apply
@@ -500,6 +614,7 @@ def maintenance_tick(
         store=get_store(),
         decay_every=mcfg.decay_every,
         reflect_every=mcfg.reflect_every,
+        purge_every=mcfg.purge_every,
         tick_interval=mcfg.tick_interval,
         state_path=mcfg.state_path,
         decay_rate=mcfg.decay_rate,
@@ -517,11 +632,14 @@ def maintenance_tick(
         "summary": result.summary(),
         "ran_decay": result.ran_decay,
         "ran_reflect": result.ran_reflect,
+        "ran_purge": result.ran_purge,
         "decayed": result.decayed,
         "reflected": result.reflected,
+        "purged": result.purged,
         "reflect_applied": result.reflect_applied,
         "decay_error": result.decay_error,
         "reflect_error": result.reflect_error,
+        "purge_error": result.purge_error,
     }
 
 
@@ -536,7 +654,9 @@ def journal_tail(
     op: filter by remember|forget|supersede|restore|link|unlink|reflect|decay|...
     since_seconds: limit to entries within the last N seconds.
     """
-    since = (time.time() - since_seconds) if since_seconds else None
+    if n <= 0:  # entries[-0:] would be the WHOLE journal, not none of it
+        return []
+    since = (time.time() - since_seconds) if since_seconds is not None else None
     entries = list(get_store().journal.read(since=since, op=op))
     entries = entries[-n:][::-1]
     return [
@@ -553,11 +673,12 @@ def export(
     include_superseded: bool = False,
     type: str | None = None,
     tag: str | None = None,
-    since: float | None = None,
+    since: str | float | None = None,
 ) -> dict[str, Any]:
     """Export memories to a portable .ahkai file (gzipped JSONL).
 
     The path is server-local. Returns summary counts.
+    since: epoch float, ISO date, or relative like "7d" — same as recall.
     """
     summary = get_store().export(
         path,
@@ -565,7 +686,7 @@ def export(
         include_superseded=include_superseded,
         types=[type] if type else None,
         tags=[tag] if tag else None,
-        since=since,
+        since=parse_timestamp(since),
     )
     return {
         "path":    str(summary.path),

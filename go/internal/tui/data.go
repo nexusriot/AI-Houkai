@@ -79,7 +79,7 @@ type View struct {
 }
 
 func recentView(ctx context.Context, store *memory.MemoryStore, limit int) (View, error) {
-	mems, err := store.ListRecent(ctx, limit, false)
+	mems, err := store.ListRecent(ctx, limit, false, false)
 	if err != nil {
 		return View{}, err
 	}

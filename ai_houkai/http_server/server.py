@@ -4,15 +4,20 @@ Routes (all JSON in / JSON out):
 
     GET    /health                         liveness + memory count
     GET    /stats                          store statistics
-    GET    /memories?limit=&include_superseded=
+    GET    /metrics                        runtime counters + recall latency
+    GET    /memories?limit=&include_superseded=&include_expired=
                                            recent memories (list_recent)
-    POST   /memories                       store a memory (remember)
+    POST   /memories                       store a memory (remember; ttl_seconds/expires_at)
     GET    /memories/{id}                  fetch one memory
-    PATCH  /memories/{id}                  edit fields in place (journaled)
+    PATCH  /memories/{id}                  edit fields in place (journaled; expires_at)
     DELETE /memories/{id}                  forget one memory
     GET    /memories/{id}/neighbors?rel=&direction=&depth=
                                            linked memories
-    GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=&overfetch=
+    GET    /memories/{id}/history          full journaled timeline of one memory
+    GET    /memories/{id}/at?ts=           reconstruct one memory as of a past time
+    GET    /state_at?ts=                   reconstruct all live memories as of a past time
+    POST   /purge_expired  {dry_run?}      hard-delete memories whose TTL passed
+    GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=&overfetch=&include_expired=&explain=
     POST   /recall                         same, via JSON body
     POST   /recall_pack                    token-budgeted context block
     POST   /auto_context                   multi-angle context block (auto_context_pack)
@@ -70,12 +75,16 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         "links": [{"to": l.to, "rel": l.rel} for l in mem.links],
         "superseded_by": mem.superseded_by or None,
         "superseded_at": mem.superseded_at or None,
+        "expires_at": mem.expires_at or None,
     }
 
 
-def _hit_dict(mem: Any, score: float) -> dict[str, Any]:
+def _hit_dict(mem: Any, score: float,
+              explanation: dict[str, Any] | None = None) -> dict[str, Any]:
     d = _mem_dict(mem)
     d["score"] = round(score, 4)
+    if explanation is not None:
+        d["explain"] = explanation
     return d
 
 
@@ -181,10 +190,15 @@ def _time(value: Any) -> Optional[float]:
         raise HttpError(400, str(exc)) from exc
 
 
-def _require(body: dict[str, Any], key: str) -> Any:
+def _require(body: dict[str, Any], key: str) -> str:
     if key not in body or body[key] in (None, ""):
         raise HttpError(400, f"missing required field: {key}")
-    return body[key]
+    v = body[key]
+    # Every required field is a string; a JSON number/list/object here used
+    # to sail into the store and surface as a 500.
+    if not isinstance(v, str):
+        raise HttpError(400, f"{key}: must be a string")
+    return v
 
 
 # Each takes (store, match, query, body) and returns (status, payload).
@@ -199,11 +213,60 @@ def _stats(store: MemoryStore, m, q, b):
                  "collection": store.collection_name}
 
 
+def _metrics(store: MemoryStore, m, q, b):
+    # Runtime counters + recall latency (process-local, reset on restart).
+    return 200, store.metrics()
+
+
 def _list(store: MemoryStore, m, q, b):
     limit = _as_int(_qs_one(q, "limit"), 20)
     inc = _as_bool(_qs_one(q, "include_superseded"))
-    mems = store.list_recent(limit=limit, include_superseded=inc)
+    inc_exp = _as_bool(_qs_one(q, "include_expired"))
+    mems = store.list_recent(limit=limit, include_superseded=inc,
+                             include_expired=inc_exp)
     return 200, {"memories": [_mem_dict(x) for x in mems]}
+
+
+def _purge_expired(store: MemoryStore, m, q, b):
+    dry = _body_bool(b, "dry_run")
+    purged = store.purge_expired(dry_run=dry)
+    return 200, {"purged": len(purged), "dry_run": dry,
+                 "ids": [p.id for p in purged]}
+
+
+def _journal_entry_dict(e: Any) -> dict[str, Any]:
+    return {"ts": e.ts, "op": e.op, "actor": e.actor, "id": e.id,
+            "before": e.before, "after": e.after, "meta": e.meta,
+            "summary": e.summary()}
+
+
+def _history(store: MemoryStore, m, q, b):
+    mid = m.group("id")
+    entries = store.history(mid)
+    # Distinguish an unknown id from a live memory with no journal history.
+    if not entries and store._get_by_id(mid) is None:
+        raise HttpError(404, "memory not found")
+    return 200, {"id": mid,
+                 "history": [_journal_entry_dict(e) for e in entries]}
+
+
+def _state_at(store: MemoryStore, m, q, b):
+    ts = _time(_qs_one(q, "ts"))
+    if ts is None:
+        raise HttpError(400, "missing required field: ts")
+    mems = store.state_at(ts)
+    return 200, {"ts": ts, "count": len(mems),
+                 "memories": [_mem_dict(x) for x in mems]}
+
+
+def _get_at(store: MemoryStore, m, q, b):
+    ts = _time(_qs_one(q, "ts"))
+    if ts is None:
+        raise HttpError(400, "missing required field: ts")
+    mem = store.get_at(m.group("id"), ts)
+    if mem is None:
+        raise HttpError(404, "memory did not exist at that time")
+    return 200, _mem_dict(mem)
 
 
 def _remember(store: MemoryStore, m, q, b):
@@ -211,11 +274,15 @@ def _remember(store: MemoryStore, m, q, b):
     try:
         mem = store.remember(
             text=text,
-            type=b.get("type", "semantic"),
+            # `or` (not a .get default) so an explicit JSON null also means
+            # "use the default", matching the null convention in _edit.
+            type=b.get("type") or "semantic",
             tags=_body_tags(b),
             importance=_body_float(b, "importance"),
             source=b.get("source"),
             polarity=_body_int(b, "polarity", 0),
+            expires_at=_body_float(b, "expires_at"),
+            ttl_seconds=_body_float(b, "ttl_seconds"),
             on_conflict=b.get("on_conflict"),
         )
     except ConflictError as e:
@@ -261,6 +328,9 @@ def _edit(store: MemoryStore, m, q, b):
         kwargs["importance"] = _body_float(b, "importance")
     if b.get("polarity") is not None:
         kwargs["polarity"] = _body_int(b, "polarity", 0)
+    if b.get("expires_at") is not None:
+        # null = unchanged; an explicit 0 clears the TTL.
+        kwargs["expires_at"] = _body_float(b, "expires_at")
     if "source" in b:
         kwargs["source"] = b["source"]
     if not kwargs:
@@ -273,6 +343,10 @@ def _edit(store: MemoryStore, m, q, b):
 
 
 def _neighbors(store: MemoryStore, m, q, b):
+    # neighbors() can't distinguish "no links" from "no such memory" — check
+    # existence first so a typo'd id is a 404, consistent with GET /memories/{id}.
+    if store._get_by_id(m.group("id")) is None:
+        raise HttpError(404, "memory not found")
     hits = store.neighbors(
         m.group("id"),
         rel=_qs_one(q, "rel"),
@@ -298,6 +372,8 @@ def _recall_params(q, b):
             "mode": get("mode") or "semantic",
             "overfetch": _body_int(b, "overfetch", 4),
             "include_superseded": _body_bool(b, "include_superseded"),
+            "include_expired": _body_bool(b, "include_expired"),
+            "explain": _body_bool(b, "explain"),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -314,13 +390,28 @@ def _recall_params(q, b):
         "mode": _qs_one(q, "mode") or "semantic",
         "overfetch": _as_int(_qs_one(q, "overfetch"), 4),
         "include_superseded": _as_bool(_qs_one(q, "include_superseded")),
+        "include_expired": _as_bool(_qs_one(q, "include_expired")),
+        "explain": _as_bool(_qs_one(q, "explain")),
     }
 
 
 def _recall(store: MemoryStore, m, q, b):
     p = _recall_params(q, b)
+    # The store's configured reranker (if any) applies automatically; a
+    # callable can't cross the JSON boundary, so it's a library/server-config
+    # concern, not a per-request param.
+    if p.get("explain"):
+        hits = store.recall(**p)
+        return 200, {"results": [_hit_dict(mem, s, expl) for mem, s, expl in hits]}
     hits = store.recall(**p)
     return 200, {"results": [_hit_dict(mem, s) for mem, s in hits]}
+
+
+def _compress_threshold(body: dict[str, Any]) -> float:
+    # `or 0.30` would swallow an explicit 0.0 ("cluster everything") and
+    # silently substitute the default — only None may mean "default".
+    v = _body_float(body, "compress_threshold")
+    return 0.30 if v is None else v
 
 
 def _pack_payload(res: Any) -> dict[str, Any]:
@@ -361,7 +452,7 @@ def _recall_pack(store: MemoryStore, m, q, b):
         include_superseded=_body_bool(b, "include_superseded"),
         header=b.get("header", "## Relevant memory"),
         compress=_body_bool(b, "compress"),
-        compress_threshold=_body_float(b, "compress_threshold") or 0.30,
+        compress_threshold=_compress_threshold(b),
         compress_min_group=_body_int(b, "compress_min_group", 2),
     )
     return 200, _pack_payload(res)
@@ -377,7 +468,7 @@ def _auto_context(store: MemoryStore, m, q, b):
         min_cosine=_body_float(b, "min_cosine"),
         header=b.get("header", "## Relevant memory"),
         compress=_body_bool(b, "compress"),
-        compress_threshold=_body_float(b, "compress_threshold") or 0.30,
+        compress_threshold=_compress_threshold(b),
         compress_min_group=_body_int(b, "compress_min_group", 2),
     )
     payload = _pack_payload(res)
@@ -429,12 +520,17 @@ Route = tuple[str, "re.Pattern[str]", Callable, bool]  # method, pat, fn, needs_
 _ROUTES: list[Route] = [
     ("GET",    re.compile(r"^/health$"),                         _health,      False),
     ("GET",    re.compile(r"^/stats$"),                          _stats,       False),
+    ("GET",    re.compile(r"^/metrics$"),                        _metrics,     False),
     ("GET",    re.compile(r"^/memories$"),                       _list,        False),
     ("POST",   re.compile(r"^/memories$"),                       _remember,    True),
     ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)$"),         _get_one,     False),
     ("PATCH",  re.compile(r"^/memories/(?P<id>[^/]+)$"),         _edit,        True),
     ("DELETE", re.compile(r"^/memories/(?P<id>[^/]+)$"),         _forget,      False),
     ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)/neighbors$"), _neighbors, False),
+    ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)/history$"), _history,     False),
+    ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)/at$"),      _get_at,      False),
+    ("GET",    re.compile(r"^/state_at$"),                       _state_at,    False),
+    ("POST",   re.compile(r"^/purge_expired$"),                  _purge_expired, True),
     ("GET",    re.compile(r"^/recall$"),                         _recall,      False),
     ("POST",   re.compile(r"^/recall$"),                         _recall,      True),
     ("POST",   re.compile(r"^/recall_pack$"),                    _recall_pack, True),
@@ -472,13 +568,42 @@ def build_handler(
             return
 
         def _send(self, status: int, payload: Any) -> None:
+            self._drain_unread_body()
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _drain_unread_body(self) -> None:
+            # HTTP/1.1 keeps connections alive, so a request body that was
+            # never read (404/405 path, 401 rejection, bodied GET/DELETE …)
+            # stays in the socket buffer and gets parsed as the *start of the
+            # next request*, desyncing every client that pools connections.
+            # Read and discard it; if it's too large to drain cheaply, close
+            # the connection instead.
+            if self._body_consumed:
+                return
+            self._body_consumed = True
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length <= 0:
+                return
+            if length > _MAX_BODY:
+                self.close_connection = True
+                return
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
 
         def _authorized(self, path: str) -> bool:
             if auth_token is None or path == "/health":
@@ -499,6 +624,7 @@ def build_handler(
             if length > _MAX_BODY:
                 raise HttpError(413, "request body too large")
             raw = self.rfile.read(length)
+            self._body_consumed = True
             try:
                 data = json.loads(raw or b"{}")
             except json.JSONDecodeError as exc:
@@ -508,6 +634,7 @@ def build_handler(
             return data
 
         def _dispatch(self) -> None:
+            self._body_consumed = False
             parts = urlsplit(self.path)
             path = parts.path.rstrip("/") or "/"
             query = parse_qs(parts.query)

@@ -25,6 +25,7 @@ func newRememberCmd() *cobra.Command {
 	var memType, source, onConflict string
 	var polarity int
 	var autoImportance, stdin bool
+	var ttlSeconds float64
 
 	cmd := &cobra.Command{
 		Use:   "remember <text>",
@@ -75,6 +76,9 @@ func newRememberCmd() *cobra.Command {
 				Polarity:   polarity,
 				OnConflict: memory.ConflictPolicy(onConflict),
 			}
+			if cmd.Flags().Changed("ttl") {
+				opts.TTLSeconds = &ttlSeconds
+			}
 			m, stored, conflicts, err := store.Remember(cmd.Context(), text, opts)
 			if err != nil {
 				if ce, ok := err.(*memory.ConflictError); ok {
@@ -101,6 +105,7 @@ func newRememberCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&stdin, "stdin", false, "Read the memory text from stdin")
 	cmd.Flags().BoolVar(&autoImportance, "auto-importance", false,
 		"Score importance heuristically from the text (also: default_importance = \"auto\" in config.toml)")
+	cmd.Flags().Float64Var(&ttlSeconds, "ttl", 0, "Time-to-live in seconds; the memory expires (and is hidden from recall) after this")
 	return cmd
 }
 
@@ -108,7 +113,7 @@ func newRecallCmd() *cobra.Command {
 	var k int
 	var tag, memType, mode, source, since, until string
 	var minImp float32
-	var inclSup bool
+	var inclSup, inclExp bool
 
 	cmd := &cobra.Command{
 		Use:   "recall <query>",
@@ -131,6 +136,7 @@ func newRecallCmd() *cobra.Command {
 				Mode:              memory.RecallMode(mode),
 				Overfetch:         4,
 				IncludeSuperseded: inclSup,
+				IncludeExpired:    inclExp,
 				Source:            source,
 				Since:             sinceTS,
 				Until:             untilTS,
@@ -162,6 +168,7 @@ func newRecallCmd() *cobra.Command {
 	cmd.Flags().Float32Var(&minImp, "min-importance", 0, "Minimum importance")
 	cmd.Flags().StringVar(&mode, "mode", "semantic", "Scoring mode: semantic|hybrid")
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded memories")
+	cmd.Flags().BoolVar(&inclExp, "include-expired", false, "Include memories whose TTL has passed")
 	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
 	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
 	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
@@ -170,7 +177,7 @@ func newRecallCmd() *cobra.Command {
 
 func newListCmd() *cobra.Command {
 	var limit int
-	var inclSup bool
+	var inclSup, inclExp bool
 	var tag, memType, sortBy, since string
 
 	cmd := &cobra.Command{
@@ -186,7 +193,7 @@ func newListCmd() *cobra.Command {
 			}
 			store := storeFromCtx(cmd.Context())
 			// Fetch unbounded, then filter/sort/limit client-side (matching Python).
-			mems, err := store.ListRecent(cmd.Context(), 0, inclSup)
+			mems, err := store.ListRecent(cmd.Context(), 0, inclSup, inclExp)
 			if err != nil {
 				return err
 			}
@@ -227,6 +234,7 @@ func newListCmd() *cobra.Command {
 	}
 	cmd.Flags().IntVar(&limit, "limit", 20, "Max results")
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded")
+	cmd.Flags().BoolVar(&inclExp, "include-expired", false, "Include memories whose TTL has passed")
 	cmd.Flags().StringVar(&tag, "tag", "", "Filter by tag")
 	cmd.Flags().StringVar(&memType, "type", "", "Filter by type")
 	cmd.Flags().StringVar(&sortBy, "sort", "created", "Sort order: created|importance")
@@ -782,6 +790,54 @@ than untouched ones of equal importance and age. Memories whose type is in
 	return cmd
 }
 
+func newPurgeCmd() *cobra.Command {
+	var apply, yes bool
+	cmd := &cobra.Command{
+		Use:   "purge",
+		Short: "Hard-delete memories whose TTL has passed (dry-run by default)",
+		Long: `Hard-delete memories whose TTL (expires_at) has passed. Dry-run by default.
+
+Expired memories are already hidden from recall/list; this reclaims their
+storage. Unlike prune it ignores protect-types — an explicit TTL is a stronger
+signal than the decay heuristic.`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			store := storeFromCtx(cmd.Context())
+			candidates, err := store.PurgeExpired(cmd.Context(), 0, true) // preview
+			if err != nil {
+				return err
+			}
+			if len(candidates) == 0 {
+				fmt.Println("no expired memories to purge")
+				return nil
+			}
+			for _, m := range candidates {
+				action := "[dry-run]"
+				if apply {
+					action = "[purge]"
+				}
+				fmt.Printf("%s %s  %s\n", action, fmtID(m.ID), fmtAge(m.CreatedAt))
+			}
+			if !apply {
+				fmt.Printf("\n%d expired memories would be purged. Use --apply to delete.\n", len(candidates))
+				return nil
+			}
+			if !yes && !Confirm(fmt.Sprintf("Delete %d expired memories?", len(candidates))) {
+				fmt.Println("aborted")
+				return nil
+			}
+			deleted, err := store.PurgeExpired(cmd.Context(), 0, false)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Purged %d expired memories.\n", len(deleted))
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&apply, "apply", false, "Actually delete (default: dry-run)")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip the confirmation prompt when applying")
+	return cmd
+}
+
 func newReflectCmd() *cobra.Command {
 	var apply, yes bool
 	var consolidate string
@@ -1147,7 +1203,7 @@ func newStatsCmd() *cobra.Command {
 				if cmd.Flags().Changed("frequency-weight") {
 					freqWeight = freqWeightFlag
 				}
-				active, err := store.ListRecent(cmd.Context(), 0, false)
+				active, err := store.ListRecent(cmd.Context(), 0, false, false)
 				if err != nil {
 					return err
 				}
