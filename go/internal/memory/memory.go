@@ -36,6 +36,10 @@ type Memory struct {
 	SupersededBy string     `json:"superseded_by"`
 	SupersededAt float64    `json:"superseded_at"`
 	Polarity     int        `json:"polarity"`
+	// ExpiresAt is the Unix timestamp after which the memory is treated as
+	// expired: hidden from recall/list and reclaimable by PurgeExpired.
+	// 0 means "never expires".
+	ExpiresAt float64 `json:"expires_at"`
 }
 
 type MemoryWithScore struct {
@@ -175,6 +179,11 @@ func MetadataToMemory(id, text string, meta map[string]string) Memory {
 	if v, ok := meta["polarity"]; ok {
 		m.Polarity, _ = strconv.Atoi(v)
 	}
+	// Old rows written before TTL landed have no "expires_at" key; the
+	// zero-value 0 = never expires, so they keep showing up in recall.
+	if v, ok := meta["expires_at"]; ok {
+		m.ExpiresAt, _ = strconv.ParseFloat(v, 64)
+	}
 	return m
 }
 
@@ -197,6 +206,7 @@ func MemoryToMetadata(m Memory) map[string]string {
 		"superseded_by": m.SupersededBy,
 		"superseded_at": fmt.Sprintf("%f", m.SupersededAt),
 		"polarity":      strconv.Itoa(m.Polarity),
+		"expires_at":    fmt.Sprintf("%f", m.ExpiresAt),
 	}
 }
 
@@ -227,6 +237,7 @@ func (m Memory) ToDict() map[string]any {
 		"superseded_by": m.SupersededBy,
 		"superseded_at": m.SupersededAt,
 		"polarity":      m.Polarity,
+		"expires_at":    m.ExpiresAt,
 	}
 }
 
@@ -293,5 +304,6 @@ func MemoryFromDict(d map[string]any) Memory {
 		SupersededBy: asString(d["superseded_by"]),
 		SupersededAt: asFloat(d["superseded_at"]),
 		Polarity:     asInt(d["polarity"]),
+		ExpiresAt:    asFloat(d["expires_at"]),
 	}
 }

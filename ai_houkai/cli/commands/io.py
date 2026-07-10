@@ -16,6 +16,7 @@ from typing import Optional
 import typer
 
 from ai_houkai.cli import output as out
+from ai_houkai.memory_system.store import ImportConflictError
 
 
 def export_cmd(
@@ -68,7 +69,14 @@ def import_cmd(
             regenerate_vectors=regenerate_vectors,
             dry_run=dry_run,
         )
-    except (ImportError, FileNotFoundError) as e:
+    except ImportConflictError as e:
+        # Not an ImportError subclass — without this clause `--on-conflict
+        # error` hitting a real collision died with a raw traceback.
+        typer.echo(f"Error: {e}", err=True)
+        for cid, reason in e.collisions[:10]:
+            typer.echo(f"  ! {cid}: {reason}", err=True)
+        raise typer.Exit(1)
+    except (ImportError, FileNotFoundError, ValueError) as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 

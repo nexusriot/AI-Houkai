@@ -197,6 +197,7 @@ def _mem_to_dict(mem: Memory) -> dict[str, Any]:
         "access_count": mem.access_count,
         "polarity": mem.polarity,
         "superseded_by": mem.superseded_by or None,
+        "expires_at": mem.expires_at or None,
         "links": [{"to": l.to, "rel": l.rel} for l in mem.links],
     }
 

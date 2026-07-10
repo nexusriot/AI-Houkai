@@ -46,15 +46,17 @@ into `httpserver`.
 
 ### `internal/memory` — domain core
 
-- `Memory`: 13-field record (id, text, type, tags, importance, timestamps,
-  access count, source, links, supersedence pointers, polarity). Also
-  exposes `ToDict()` / `MemoryFromDict()` for the journal and `.ahkai`
-  payloads — these emit and consume Python's serialisation shape verbatim.
+- `Memory`: 14-field record (id, text, type, tags, importance, timestamps,
+  access count, source, links, supersedence pointers, polarity, `expires_at`
+  TTL). Also exposes `ToDict()` / `MemoryFromDict()` for the journal and
+  `.ahkai` payloads — these emit and consume Python's serialisation shape
+  verbatim.
 - `MemoryStore`: the only stateful object. Backed by a `vector.Backend` plus
   an `embed.Embedder`. All public operations are methods on it:
   `Remember`, `Recall`, `RecallPack`, `Forget`, `ListRecent`, `GetByID`,
   `UpdateMemory`, `Link`, `Unlink`, `Neighbors`, `Subgraph`, `FindConflicts`,
-  `Supersede`, `Restore`, `Stats`, `AllRaw`, `Export`, `Import`, `Undo`.
+  `Supersede`, `Restore`, `Stats`, `AllRaw`, `Export`, `Import`, `Undo`,
+  `PurgeExpired`, `History`, `StateAt`, `GetAt`, `Metrics`.
 - `RecallPack` (`pack.go`): ranks via `Recall` (hybrid by default), then
   greedily packs `- (type) text` lines into a token budget. Token cost
   defaults to a ~4-chars/token estimate (`EstimateTokens`); callers can
@@ -256,10 +258,13 @@ boundary as Python's `tui/data.py` vs `tui/app.py`:
 ### `internal/maintenance` — scheduled ticks
 
 One synchronous entry point: `maintenance.Tick(ctx, store, store, cfg,
-statePath, now)` runs a decay prune and (optionally) a reflection pass, then
-persists `State` (last-run timestamps + totals) to a JSON state file. Jobs
-are gated on a schedule (`DecayEvery` / `ReflectEvery`, seconds since the
-job's last recorded run — mirroring Python's `MaintenanceScheduler`), and the
+statePath, now)` runs a decay prune, (optionally) a reflection pass, and a
+**TTL purge** (`store.PurgeExpired`, reached through an `expirable`
+type-assertion so a bare `decay.Storable` fake need not implement it), then
+persists `State` (last-run timestamps + totals, incl. `LastPurgeAt` /
+`TotalPurged`) to a JSON state file. Jobs are gated on a schedule
+(`DecayEvery` / `ReflectEvery` / `PurgeEvery`, seconds since the job's last
+recorded run — mirroring Python's `MaintenanceScheduler`), and the
 whole load→run→save cycle holds an exclusive **flock on `<state>.lock`** so a
 daemon loop, a cron `houkai maintenance tick`, and the MCP `maintenance_tick`
 tool can all target the same state file without double-running jobs. The CLI
@@ -268,11 +273,12 @@ drives it via `houkai maintenance` (`tick`/`run`/`start`/`stop`/`status`) and
 
 ### `internal/mcpserver` — MCP surface
 
-Wraps `mark3labs/mcp-go`. Seventeen tools:
+Wraps `mark3labs/mcp-go`. Twenty-two tools:
 
 ```
 remember        recall          recall_pack     auto_context    forget
-edit            list_recent     stats           link            unlink
+purge_expired   edit            list_recent     stats           metrics
+history         state_at        get_at          link            unlink
 neighbors       find_conflicts  supersede       maintenance_tick
 journal_tail    export          import
 ```
@@ -282,12 +288,15 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-These 17 tools mirror the Python tool names so existing MCP clients keep
-working, and the surface is back at full parity: the `auto_context` tool and
-the advanced `recall` / `recall_pack` parameters (`fusion=rrf`, diversity/MMR,
+These 22 tools mirror the Python tool names so existing MCP clients keep
+working, and the surface is at full parity: the `auto_context` tool, the
+advanced `recall` / `recall_pack` parameters (`fusion=rrf`, diversity/MMR,
 `dedup_threshold`, `min_cosine`, `touch`, `explain`, `recall_pack`
-compression via `compress`/`compress_threshold`/`compress_min_group`) are all
-implemented (see `internal/memory/scoring.go`, `pack.go`, `autocontext.go`).
+compression via `compress`/`compress_threshold`/`compress_min_group`), and the
+recent additions — reranking (store-config `Reranker` func), TTL/expiry
+(`ttl_seconds`/`expires_at`, `include_expired`, `purge_expired`), point-in-time
+`history`/`state_at`/`get_at`, and `metrics` — are all implemented (see
+`internal/memory/scoring.go`, `pack.go`, `autocontext.go`, `store.go`).
 `maintenance_tick`'s `consolidate` is a tri-state string (`none|soft|hard`).
 `export` / `import`
 take a server-local file path — there's no streaming over MCP yet, and

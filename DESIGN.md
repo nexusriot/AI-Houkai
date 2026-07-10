@@ -1,7 +1,7 @@
 # AI-Houkai — Architecture & Design
 
 > This document covers the **Python** implementation (`ai_houkai/`). The Go
-> port under `go/` has the same feature surface (16 MCP tools, identical
+> port under `go/` has the same feature surface (22 MCP tools, identical
 > `.ahkai` format and journal line format) but its own internals — see
 > [go/DESIGN.md](go/DESIGN.md).
 
@@ -27,6 +27,8 @@
 18. [Audit Journal](#18-audit-journal)
 19. [Portable Import / Export](#19-portable-import--export)
 20. [HTTP / REST API](#20-http--rest-api)
+21. [Memory Expiry (TTL)](#21-memory-expiry-ttl)
+22. [Runtime Metrics](#22-runtime-metrics)
 
 ---
 
@@ -70,6 +72,7 @@ Four cognitive operations model how humans manage long-term memory:
 │   auto_context_pack()  forget()  nuke()  count()             │
 │   list_recent()  link()  unlink()  neighbors()  subgraph()   │
 │   supersede()  restore()  find_conflicts()  undo()           │
+│   purge_expired()  history()  state_at()  get_at()  metrics()│
 └───────────────────────────┬──────────────────────────────────┘
                             │
             ┌───────────────┼────────────────┐
@@ -105,7 +108,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   │                             ExportSummary, ImportSummary,
 │   │                             ImportConflictError, Journal, JournalEntry,
 │   │                             DecayEngine, ReflectionEngine, build_summarizer,
-│   │                             AsyncMemoryStore, CompressedGroup,
+│   │                             AsyncMemoryStore, CompressedGroup, Reranker,
 │   │                             extract_key_phrases, score_importance,
 │   │                             MEMORY_TYPES, LINK_RELS, RECALL_MODES,
 │   │                             FUSIONS, CONFLICT_POLICIES,
@@ -129,7 +132,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 17 tools
+│   └── server.py                 FastMCP server — 22 tools
 ├── http_server/
 │   ├── __init__.py
 │   └── server.py                 stdlib JSON HTTP/REST server (houkai serve)
@@ -200,6 +203,8 @@ class Memory:
     superseded_by: str          # id of superseding memory, or ""
     superseded_at: float        # epoch when superseded
     polarity:      int          # -1 / 0 / +1
+    # expiry (TTL)
+    expires_at:    float        # epoch after which the memory is expired; 0 = never
 ```
 
 `polarity` plays two roles. Beyond driving `polarity_diff` conflict detection
@@ -283,12 +288,18 @@ inside a tag — it would silently split into two tags on the next read);
     "superseded_by": "",
     "superseded_at": 0.0,
     "polarity":      0,
+    "expires_at":    0.0,
 }
 
 # read — all new fields default safely for old records
-tags  = [t for t in meta.get("tags", "").split(",") if t]
-links = json.loads(meta.get("links") or "[]")
+tags       = [t for t in meta.get("tags", "").split(",") if t]
+links      = json.loads(meta.get("links") or "[]")
+expires_at = float(meta.get("expires_at", 0.0))   # 0 = never expires
 ```
+
+Every field added over the project's life (`links`, `superseded_by`,
+`superseded_at`, `polarity`, `expires_at`) is read with a safe default, so a
+`.chroma` written by an older version loads unchanged — no migration step.
 
 ---
 
@@ -334,7 +345,7 @@ be fine — HNSW ensures queries stay fast as collections grow.
 
 ```
                  ┌─────────────────────┐
-                 │    remember(text)   │
+                 │    remember(text)   │  ← optional ttl_seconds / expires_at
                  └────────┬────────────┘
                           │  UUID assigned
                           │  text embedded (384-dim)
@@ -343,18 +354,29 @@ be fine — HNSW ensures queries stay fast as collections grow.
                  ┌─────────────────────┐
                  │   ChromaDB HNSW     │◄── persists to disk
                  └────────┬────────────┘
-          ┌───────────────┼──────────────┬─────────────────┐
-          ▼               ▼              ▼                 ▼
-   recall(query)    list_recent()   edit(id, …)       forget(id)
-          │               │              │                 │
-     vector search   chronological  in-place update   hard delete
-     metadata filter    sort        re-embeds on      returns bool
-          │                         text change
+          ┌───────────────┼──────────────┬─────────────────┬───────────────┐
+          ▼               ▼              ▼                 ▼               ▼
+   recall(query)    list_recent()   edit(id, …)       forget(id)    purge_expired()
+          │               │              │                 │               │
+     vector search   chronological  in-place update   hard delete   hard-delete every
+     metadata filter    sort        re-embeds on      returns bool   memory past its TTL
+   hide superseded  hide superseded text change                     (journaled, actor
+    + expired         + expired                                      "purge")
+          │
           ▼
     _touch(memory)
     ├── last_accessed = now
     └── access_count += 1
 ```
+
+**Expiry (TTL).** `remember(ttl_seconds=…)` or `remember(expires_at=…)` stamps
+an `expires_at` epoch. Once it passes, the memory is **soft-hidden** — excluded
+from `recall()` and `list_recent()` by default (like superseded), overridable
+with `include_expired=True` — but still physically present and fetchable by id.
+`purge_expired()` reclaims the storage with a per-row journaled `forget`
+(actor `"purge"`); unlike decay's `prune()` it ignores `protect_types` (an
+explicit TTL is a stronger signal than the decay heuristic). The scheduled
+maintenance tick runs it automatically on a `purge_every` cadence (§17).
 
 `edit()` updates fields of an existing memory **keeping its id**: omitted
 fields stay unchanged (`source` uses a sentinel so `source=None` explicitly
@@ -373,15 +395,20 @@ nothing is a true no-op (no write, no journal entry).
 3. Score the pool: weighted hybrid (`_hybrid_score`), `fusion="rrf"`
    (`_rrf_score`), or semantic (`_semantic_filter`); `min_cosine` drops any
    candidate below an absolute cosine floor.
-4. Optional re-selection: when `diversity` or `dedup_threshold` is set,
+4. **Drop expired** memories (`expires_at != 0 and expires_at <= now`) unless
+   `include_expired=True` — a post-filter, so pre-TTL records (no key) are
+   unaffected (§21).
+5. **Rerank** (optional): if a `reranker` is configured (per-store or per-call),
+   rescore the surviving pool with it and re-sort before the cut (§14).
+6. Optional re-selection: when `diversity` or `dedup_threshold` is set,
    `_mmr_select` re-orders/drops near-duplicates (min-max-normalising
    relevance first); otherwise take the top-k.
-5. Unless `touch=False`, batch-bump access tracking for **all** hits in ONE
+7. Unless `touch=False`, batch-bump access tracking for **all** hits in ONE
    Chroma write (`_touch_many`).
-6. Optional multi-hop graph expansion out to `expand.depth` with a per-hop
+8. Optional multi-hop graph expansion out to `expand.depth` with a per-hop
    `expand.decay` multiplier (`_expand_links`).
-7. Return `(Memory, score)` pairs — or `(Memory, score, breakdown)` triples
-   when `explain=True`.
+9. Return `(Memory, score)` pairs — or `(Memory, score, breakdown)` triples
+   when `explain=True` (§14).
 
 #### recall_pack() — token-budgeted assembly
 
@@ -662,20 +689,22 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose seventeen tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose twenty-two tools:
 
 **Core tools**
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?` | `{id, stored, importance}` or `{stored:false, conflicts:[…]}` |
-| `edit` | `memory_id`, `text?`, `type?`, `tags?`, `importance?`, `polarity?`, `source?` | `{ok, id, text, type, tags, importance, polarity, source}` or `{ok:false, error}` — in-place, journaled, undoable |
-| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `overfetch?`, `include_superseded?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by}]` |
+| `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?`, `expires_at?`, `ttl_seconds?` | `{id, stored, importance, expires_at}` or `{stored:false, conflicts:[…]}` |
+| `edit` | `memory_id`, `text?`, `type?`, `tags?`, `importance?`, `polarity?`, `source?`, `expires_at?` | `{ok, id, text, type, tags, importance, polarity, source, expires_at}` or `{ok:false, error}` — in-place, journaled, undoable |
+| `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `overfetch?`, `include_superseded?`, `include_expired?`, `explain?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by,expires_at,explain?}]` |
 | `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `max_items?`, `include_superseded?`, `compress?`, `compress_threshold?`, `compress_min_group?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}], compressed_groups:[{ids,text,tokens,count}]}` |
 | `auto_context` | `task`, `token_budget?`, `max_phrases?`, `mode?` | `{text, queries, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}]}` |
 | `forget` | `memory_id` | `{deleted}` |
-| `list_recent` | `limit?`, `include_superseded?` | `list[{…,superseded_by}]` |
+| `purge_expired` | `dry_run?` | `{purged, dry_run, ids}` — hard-delete TTL-expired memories (§21) |
+| `list_recent` | `limit?`, `include_superseded?`, `include_expired?` | `list[{…,superseded_by,expires_at}]` |
 | `stats` | — | `{count, path, collection}` |
+| `metrics` | — | `{uptime_seconds, count, calls, recall_latency_ms}` — runtime counters (§22) |
 
 **Linking tools**
 
@@ -696,8 +725,11 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, decayed, reflected, reflect_applied, decay_error, reflect_error}` |
+| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, ran_purge, decayed, reflected, purged, reflect_applied, decay_error, reflect_error, purge_error}` |
 | `journal_tail` | `n?`, `op?`, `since_seconds?` | `list[{ts,op,actor,id,summary,meta}]` (newest first) |
+| `history` | `memory_id` | `list[{ts,op,actor,id,before,after,meta,summary}]` — full timeline, oldest first (§18) |
+| `state_at` | `ts` | `{ts, count, memories:[…]}` — store reconstructed as of `ts` (§18) |
+| `get_at` | `memory_id`, `ts` | `{ok, ts, …}` — one memory as of `ts`, or `{ok:false, error}` (§18) |
 | `export` | `path`, `include_vectors?`, `include_superseded?`, `type?`, `tag?`, `since?` | `{path, count, bytes, elapsed}` |
 | `import` | `path`, `on_conflict?`, `regenerate_vectors?`, `dry_run?` | `{ok, imported, skipped, overwritten, renamed, errors, vectors_regenerated}` |
 
@@ -974,36 +1006,41 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 621 tests across 26 files
+### 751 tests across 31 files
 
 | File | Tests | What it covers |
 |---|---|---|
-| `test_maintenance.py` | 64 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating |
+| `test_maintenance.py` | 74 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating, **TTL purge job** (gating, state persistence, disabled) |
+| `test_http_server.py` | 56 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain` |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
-| `test_pack.py` | 52 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
+| `test_pack.py` | 54 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
 | `test_validation.py` | 44 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
+| `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
 | `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
-| `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
-| `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
-| `test_reflection.py` | 23 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
+| `test_reflection.py` | 24 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources, polarity-cluster separation |
+| `test_summarizers.py` | 22 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
+| `test_journal.py` | 22 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
 | `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
-| `test_cli.py` | 22 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution |
+| `test_async_store.py` | 22 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
+| `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
 | `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
 | `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
-| `test_async_store.py` | 20 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
+| `test_mcp_server.py` | 19 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain` |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
-| `test_http_server.py` | 16 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 error handling, concurrency lock, `/health` topology-leak guard |
+| `test_export_import.py` | 17 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
+| `test_tui.py` | 15 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search), parallel-link row collapse |
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
+| `test_installers.py` | 14 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
-| `test_journal.py` | 15 | Append-only audit journal: tail/show/undo, rotation, actor attribution |
-| `test_export_import.py` | 13 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
-| `test_tui.py` | 10 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search) |
-| `test_installers.py` | 10 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
+| `test_history.py` | 10 | **History / point-in-time**: `history()` timeline (incl. link/supersede counterparts), `state_at` / `get_at` replay, nuke reset, link-delta replay |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
-| `test_mcp_server.py` | 6 | MCP tools in-process: lazy `get_store()` env honoring, `edit` tool result/error dicts, `maintenance_tick` config-default + explicit `reflect_apply` |
+| `test_dispatch.py` | 8 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
+| `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
+| `test_metrics.py` | 5 | **Runtime metrics**: op counters, recall-latency recording, empty-recall counting, backend count |
+| `test_fd_hygiene.py` | 1 | ChromaDB file-descriptor reclamation across many store open/close cycles |
 
 ### Test isolation strategy
 
@@ -1251,6 +1288,8 @@ store.recall(query, k, fusion="rrf")                     # Reciprocal Rank Fusio
 store.recall(query, k, diversity=0.7, dedup_threshold=0.92)  # MMR + near-dup drop
 store.recall(query, k, min_cosine=0.2)                   # absolute relevance gate
 store.recall(query, k, touch=False, explain=True)        # read-only + breakdowns
+store.recall(query, k, reranker=my_cross_encoder)        # second-stage rerank
+store.recall(query, k, include_expired=True)             # keep TTL-expired hits
 
 # Graph-walk expansion after scoring (multi-hop BFS)
 store.recall(query, k,
@@ -1273,6 +1312,72 @@ The `explain=True` breakdown shape **varies by scoring path**:
 | `fusion="rrf"`  | `signals` (per-signal `{rank, contribution}`), `polarity`, `rrf_k`, `score` |
 | semantic        | `cosine`, `polarity`, `score` |
 | graph-expanded  | `{source:"graph_expansion", rel, hop, score}` |
+
+Both servers surface `explain` on request (HTTP `?explain=true` / body
+`{"explain": true}`; MCP `explain: true`), attaching the breakdown under an
+`explain` key on each hit.
+
+#### Second-stage reranking
+
+The blended score is a cheap first stage. A **reranker** — a stronger, usually
+cross-encoder relevance model — can rescore the candidate pool before the
+top-`k` cut, the standard retrieve-then-rerank pattern (Elasticsearch's
+`rescore`, ColBERT, cross-encoders). It is a pluggable hook, not a bundled
+model, so the core stays dependency-free:
+
+```python
+Reranker = Callable[[str, list[Memory]], list[float]]   # query, pool → one score/mem
+
+MemoryStore(..., reranker=fn)          # per-store default
+store.recall(query, k, reranker=fn)    # per-call override (wins over the default)
+```
+
+The reranker receives the query and the surviving first-stage pool (so raise
+`overfetch` to give it more to work with) and returns one score per memory in
+order; `recall()` re-sorts by those scores — the reranker's score **replaces**
+the blended score — then applies the top-`k` cut. Under `explain=True` each
+hit gains a `rerank` block recording `first_stage_score` / `first_stage_rank`
+and the new `score` / `rank`, so a promotion is auditable. A reranker is a live
+callable, so it is a **library / server-config** concern — it cannot cross the
+JSON boundary, and the servers simply honour whatever reranker their store was
+built with (no per-request reranker parameter).
+
+#### The recall pipeline
+
+Where each stage from §5 sits — and the exact insertion points for expiry
+filtering, reranking, and explain:
+
+```
+  query
+    │  embed
+    ▼
+ ┌──────────────────────┐   over-fetch  k · overfetch  (default 4×)
+ │  ChromaDB HNSW query  │──────────────────────────────┐
+ └──────────────────────┘                               ▼
+                                       ┌───────────────────────────────────┐
+   where-clause pool  ◄────────────────│ type · min_importance · source ·  │
+   (type/imp/src/time)                 │ since · until                     │
+                                       └───────────────┬───────────────────┘
+                                                       ▼
+                                   tag · superseded · min_cosine  (in scorer)
+                                                       ▼
+                          ┌────────────────────────────────────────────┐
+                          │ score: _hybrid_score / _rrf_score /         │──► explain{}
+                          │        _semantic_filter                     │    (per hit,
+                          └────────────────────────┬───────────────────┘     if explain)
+                                                    ▼
+                          drop expired  (unless include_expired)   ◄── §21 TTL
+                                                    ▼
+                          reranker(query, pool)  →  re-sort          ◄── §14 rerank
+                                                    ▼
+                          MMR / dedup  (if diversity|dedup)  ELSE  top-k
+                                                    ▼
+                          _touch_many  (unless touch=False)
+                                                    ▼
+                          graph expand  (if expand)  →  append neighbours
+                                                    ▼
+                          [(Memory, score)]  or  [(Memory, score, explain)]
+```
 
 #### Metadata filters
 
@@ -1456,6 +1561,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `supersede` | `conflicts.py` | `store.supersede()` |
 | `restore` | `conflicts.py` | `store.restore()` |
 | `prune` | `decay.py` | `DecayEngine.prune()` |
+| `purge` | `decay.py` | `store.purge_expired()` — hard-delete TTL-expired memories (dry-run by default, `--apply`) |
 | `reflect` | `reflect.py` | `ReflectionEngine.reflect()` |
 | `export` | `io.py` | `store.list_recent()` → JSONL |
 | `import` | `io.py` | JSONL → `store.remember()` |
@@ -1550,12 +1656,20 @@ maintenance/
 ### Tick semantics
 
 `tick()` is the single unit of work and is **idempotent with respect to
-the schedule**: each job (decay, reflect) runs only if its configured
-interval (`decay_every`, default 24 h; `reflect_every`, default 7 d) has
-elapsed since the last run recorded in `MaintenanceState`.
+the schedule**: each job (decay, reflect, **purge**) runs only if its
+configured interval (`decay_every`, default 24 h; `reflect_every`, default
+7 d; `purge_every`, default 24 h) has elapsed since the last run recorded in
+`MaintenanceState`.
 Callers may therefore invoke it as often as they like — from cron, from
 the foreground loop (`tick_interval`, default 5 min), from an MCP client
 via the `maintenance_tick` tool, or ad hoc.
+
+The **purge job** reclaims TTL-expired memories: it calls
+`store.purge_expired()` (§21), stamping `last_purge_at` and accumulating
+`total_purged` in `MaintenanceState` (both fields default to 0, so older state
+files load unchanged). It is safe to run always-on: expired memories are a new
+concept, so an existing store has none, and the job only ever deletes memories
+whose TTL has already passed.
 
 **Concurrent tickers serialise.** The whole load→run→save cycle holds an
 exclusive `flock` on `<state file>.lock`, so the daemon loop, a cron tick,
@@ -1573,9 +1687,10 @@ records which mode ran, and `summary()` says `reflect would create N
 (dry-run)` vs `reflect created N`. Totals (`total_reflected`) only count
 persisted summaries.
 
-Errors in one job never block the other; they are captured in
-`TickResult.decay_error` / `reflect_error` and surfaced in `summary()`.
-A failed job does **not** advance its schedule — it retries next tick.
+Errors in one job never block the others; they are captured in
+`TickResult.decay_error` / `reflect_error` / `purge_error` and surfaced in
+`summary()`. A failed job does **not** advance its schedule — it retries next
+tick.
 
 ### Three deployment modes
 
@@ -1636,6 +1751,42 @@ again, and undoing an `edit` or `unlink` fails if the memory (or a link
 endpoint) has since been forgotten.  Every successful undo is itself
 journalled with `op="undo"`.
 
+### History &amp; point-in-time queries
+
+Because every mutating op writes a full `before`/`after` snapshot, the journal
+doubles as a **time machine** for read-only auditing:
+
+```python
+store.history(memory_id)          # → [JournalEntry] touching this memory, oldest→newest
+store.state_at(timestamp)         # → [Memory] the whole store, reconstructed as of t
+store.get_at(memory_id, t)        # → Memory | None — one memory as of t
+```
+
+`history()` returns every entry that concerns a memory — as the op's subject
+(`entry.id`) **and** as a counterpart recorded only in `meta`: a link target
+(`dst_id`), the superseding memory (`new_id`), or a restore's `superseder_id`.
+So `B`'s history shows the `link A→B` even though that entry is filed under `A`.
+
+`state_at()` / `get_at()` **replay** the log up to `t`: `remember`/`import`/
+`edit`/`supersede`/`restore` set the memory to their `after` snapshot,
+`forget` deletes it, `link`/`unlink` apply the meta delta, and `nuke` clears
+everything. It is a **best-effort audit tool, not an event-source of record**:
+it sees only what was journaled, so it is accurate back to the oldest retained
+archive (rotation prunes past `keep_days`), a `nuke` in the window resets the
+reconstruction (it snapshots nothing), memories written with the journal
+disabled are invisible, and reconstructed memories carry no embedding.
+
+```
+journal (oldest → newest, replayed until t):
+  remember A {v1}   edit A {v2}   remember B   link A→B   forget B   nuke
+  └─ state[A]=v1    └─ state[A]=v2  └ state[B]  └ A.links  └ del B   └ state={}
+                    ▲                                                  ▲
+              state_at(t₁) = {A:v2, …}                         state_at(t₂) = {}
+```
+
+Both are exposed over HTTP (`GET /memories/{id}/history`, `GET /state_at?ts=`,
+`GET /memories/{id}/at?ts=`) and MCP (`history`, `state_at`, `get_at`).
+
 ---
 
 ## 19. Portable Import / Export
@@ -1685,24 +1836,29 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 |---|---|
 | `GET /health` | `count()` — always reachable (liveness, skips auth); returns only `{status, count}`, omitting the collection name |
 | `GET /stats` | path / collection / count |
-| `GET /memories` | `list_recent(limit, include_superseded)` |
-| `POST /memories` | `remember(...)` → 201, or 409 on `ConflictError` |
+| `GET /metrics` | `metrics()` — runtime counters + recall latency (§22) |
+| `GET /memories` | `list_recent(limit, include_superseded, include_expired)` |
+| `POST /memories` | `remember(...)` incl. `ttl_seconds` / `expires_at` → 201, or 409 on `ConflictError` |
 | `GET /memories/{id}` | `_get_by_id` → 404 if absent |
-| `PATCH /memories/{id}` | `edit(...)` — in-place, journaled; 404 if absent, 400 on bad field |
+| `PATCH /memories/{id}` | `edit(...)` incl. `expires_at` — in-place, journaled; 404 if absent, 400 on bad field |
 | `DELETE /memories/{id}` | `forget` → 404 if absent |
 | `GET /memories/{id}/neighbors` | `neighbors(rel, direction, depth)` |
-| `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until` |
+| `GET /memories/{id}/history` | `history(id)` → journaled timeline; 404 if id unknown (§18) |
+| `GET /memories/{id}/at?ts=` | `get_at(id, ts)` → 404 if it didn't exist then (§18) |
+| `GET /state_at?ts=` | `state_at(ts)` → all live memories reconstructed as of `ts` (§18) |
+| `POST /purge_expired` | `purge_expired(dry_run?)` → count + ids (§21) |
+| `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until`/`include_expired`/`explain` |
 | `POST /recall_pack` | `recall_pack(...)` |
 | `POST /links` · `POST /unlink` | `link` / `unlink` |
 | `POST /supersede` · `POST /conflicts` | `supersede` / `find_conflicts` |
 
-The newer ranking and compression knobs (`fusion`, `diversity`,
-`dedup_threshold`, `min_cosine`, `expand`, and `recall_pack`'s `compress*`
-group) are **not** exposed over HTTP — `/recall` and `/recall_pack` accept
-only the stable parameter set (`query`, `k` / `token_budget`, `type`, `tag`,
-`min_importance`, `source`, `since`, `until`, `mode`, `max_items`,
-`include_superseded`). Callers needing the full ranking surface use the
-Python API or MCP.
+The stable `/recall` parameter set is `query`, `k` / `token_budget`, `type`,
+`tag`, `min_importance`, `source`, `since`, `until`, `mode`,
+`include_superseded`, `include_expired`, and `explain`. The heavier ranking
+and compression knobs (`fusion`, `diversity`, `dedup_threshold`, `min_cosine`,
+`expand`, and `recall_pack`'s `compress*` group) are **not** exposed over
+HTTP; a configured `reranker` still applies (it is store config, not a request
+param). Callers needing the full ranking surface use the Python API or MCP.
 
 ### Design
 
@@ -1750,3 +1906,87 @@ Python API or MCP.
   needs no CLI extras — symmetric with `ai-houkai-mcp`.
 - `make_server(...)` / `serve(...)` / `build_handler(...)` for embedding the
   API in another process or test (tests drive a real server on port 0).
+
+---
+
+## 21. Memory Expiry (TTL)
+
+Some memories are useful only for a bounded window — a sprint's context, a
+session token, a "remind me until Friday" note. **Expiry** is an explicit,
+absolute deadline that complements the statistical `DecayEngine` (§6): decay is
+a soft, importance-and-recency curve; a TTL is a hard "gone after this instant."
+
+### Data model
+
+One field, `Memory.expires_at` (epoch seconds, `0` = never), serialised
+alongside the other scalar metadata and read with a safe default so pre-TTL
+records load as "never expires" (§3). A memory is **expired** when
+`expires_at != 0 and expires_at <= now`.
+
+### Setting a TTL
+
+```python
+store.remember(text, ttl_seconds=3600)      # relative — now + 1 h
+store.remember(text, expires_at=epoch)       # absolute
+store.edit(id, expires_at=epoch)             # set/extend; expires_at=0 clears it
+```
+
+`ttl_seconds` and `expires_at` are mutually exclusive (passing both, or a
+non-positive `ttl_seconds` / negative `expires_at`, raises `ValueError`).
+
+### Two-stage removal — hide, then reclaim
+
+Expiry is a **soft-delete that mirrors supersede** (§12), not an immediate
+`forget`:
+
+1. **Hidden** — once `expires_at` passes, the memory is excluded from
+   `recall()` and `list_recent()` by default (post-filter, so old records are
+   unaffected; §5), overridable with `include_expired=True`. It is still in the
+   store and fetchable by id (`GET /memories/{id}`, `get_at`), so nothing is
+   lost the instant a deadline slips past.
+2. **Reclaimed** — `store.purge_expired(now=None, dry_run=False)` hard-deletes
+   every expired memory, returning those purged, each with a per-row journaled
+   `forget` (actor `"purge"`) so it is auditable and individually undoable.
+   Unlike decay's `prune()`, purge **ignores `protect_types`** — an explicit
+   TTL is a stronger, user-set signal than the decay heuristic. The scheduled
+   maintenance tick runs it on the `purge_every` cadence (§17); `houkai purge`
+   (dry-run by default, `--apply` to delete) and the `purge_expired` MCP tool /
+   `POST /purge_expired` endpoint expose it on demand.
+
+### Surface
+
+| Layer | Set TTL | Hide/show | Reclaim |
+|---|---|---|---|
+| Python | `remember(ttl_seconds=/expires_at=)`, `edit(expires_at=)` | `recall/list_recent(include_expired=)` | `purge_expired()` |
+| MCP | `remember`, `edit` args | `recall`, `list_recent` `include_expired` | `purge_expired` tool |
+| HTTP | `POST/PATCH` `ttl_seconds`/`expires_at` | `?include_expired=` | `POST /purge_expired` |
+| CLI | `houkai remember --ttl <s>` | `--include-expired` | `houkai purge [--apply]` |
+
+---
+
+## 22. Runtime Metrics
+
+`stats()` reports **content** aggregates (counts, type/tag breakdowns) computed
+from the store's rows. `metrics()` is the complementary **operational** view —
+process-local counters and recall latency accumulated since the store object
+was created:
+
+```python
+store.metrics()
+# {
+#   "uptime_seconds": 1234.5,
+#   "count": 812,                         # live backend count
+#   "calls": {"remember": 40, "recall": 210, "forget": 3, "edit": 12, "supersede": 5},
+#   "recall_latency_ms": {"count": 210, "avg": 8.3, "max": 141.2},
+# }
+```
+
+Counters are bumped inside `remember` / `recall` / `forget` / `edit` /
+`supersede`; recall wraps its body to record wall-clock latency (the empty-store
+early return still counts, so the numbers match call volume). The registry is
+**in-memory and per-instance** — not persisted, reset on restart, and not
+shared across processes — so it is a cheap liveness/throughput signal for a
+long-running server, not a durable analytics store. In the Go port it is
+guarded by a mutex since handlers run concurrently; in Python the HTTP server's
+`store_lock` already serialises access. Exposed as the `metrics` MCP tool and
+`GET /metrics`.

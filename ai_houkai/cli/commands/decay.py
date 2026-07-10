@@ -75,3 +75,34 @@ def prune(
 
     removed = engine.prune(dry_run=False)
     typer.echo(f"Pruned {len(removed)} memories.")
+
+
+def purge(
+    ctx: typer.Context,
+    apply: bool = typer.Option(False, "--apply", help="Actually delete (default is dry-run)"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Hard-delete memories whose TTL (expires_at) has passed. Dry-run by default.
+
+    Expired memories are already hidden from recall/list; this reclaims their
+    storage. Unlike `prune` it ignores protect_types — an explicit TTL is a
+    stronger signal than the decay heuristic.
+    """
+    store = ctx.obj["store"]
+    candidates = store.purge_expired(dry_run=True)
+    if not candidates:
+        typer.echo("Nothing to purge.")
+        return
+
+    typer.echo(f"Expired memories ({len(candidates)}):")
+    out.print_memories_table([(m, 0.0) for m in candidates],
+                             show_score=False, fmt="auto")
+
+    if not apply:
+        typer.echo("\nDry-run — pass --apply to delete.")
+        return
+    if not out.confirm(f"Delete {len(candidates)} expired memories?", yes=yes):
+        typer.echo("Aborted.")
+        return
+    removed = store.purge_expired(dry_run=False)
+    typer.echo(f"Purged {len(removed)} expired memories.")

@@ -17,8 +17,10 @@ from typing import Any
 class MaintenanceState:
     last_decay_at: float | None = None      # Unix timestamp of last decay run
     last_reflect_at: float | None = None    # Unix timestamp of last reflect run
+    last_purge_at: float | None = None      # Unix timestamp of last TTL purge
     total_decayed: int = 0                  # cumulative memories pruned
     total_reflected: int = 0               # cumulative summaries created
+    total_purged: int = 0                   # cumulative expired memories purged
 
     def save(self, path: str | Path) -> None:
         p = Path(path).expanduser()

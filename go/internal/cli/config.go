@@ -71,6 +71,7 @@ type MaintenanceConfig struct {
 	// < 0 = job disabled. Defaults: decay 24h, reflect 7d.
 	DecayEverySecs   int `toml:"decay_every_secs"`
 	ReflectEverySecs int `toml:"reflect_every_secs"`
+	PurgeEverySecs   int `toml:"purge_every_secs"`
 }
 
 // MaintPaths returns the resolved state/pid/log paths, defaulting to files
@@ -126,6 +127,7 @@ func defaultConfig() Config {
 			IntervalSecs:     3600,
 			DecayEverySecs:   86_400,  // 24h, matching Python's decay_every
 			ReflectEverySecs: 604_800, // 7d, matching Python's reflect_every
+			PurgeEverySecs:   86_400,  // 24h, matching Python's purge_every
 		},
 	}
 }

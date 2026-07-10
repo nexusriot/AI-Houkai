@@ -43,6 +43,7 @@ from .store import (
     MemoryStore,
     MemoryType,
     PackResult,
+    Reranker,
 )
 from .journal import JournalEntry
 
@@ -138,6 +139,8 @@ class AsyncMemoryStore:
         source: str | None = None,
         *,
         polarity: int = 0,
+        expires_at: float | None = None,
+        ttl_seconds: float | None = None,
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
     ) -> Memory:
@@ -149,6 +152,8 @@ class AsyncMemoryStore:
             importance,
             source,
             polarity=polarity,
+            expires_at=expires_at,
+            ttl_seconds=ttl_seconds,
             on_conflict=on_conflict,
             contradiction_fn=contradiction_fn,
         )
@@ -165,13 +170,14 @@ class AsyncMemoryStore:
         tags: Iterable[str] | None = None,
         importance: float | None = None,
         polarity: int | None = None,
+        expires_at: float | None = None,
         source: str | None = MemoryStore._UNSET,
     ) -> Memory:
         """Update fields of an existing memory in place — see MemoryStore.edit."""
         return await self.run(
             self.sync.edit, memory_id,
             text=text, type=type, tags=tags, importance=importance,
-            polarity=polarity, source=source,
+            polarity=polarity, expires_at=expires_at, source=source,
         )
 
     async def nuke(self) -> int:
@@ -198,6 +204,8 @@ class AsyncMemoryStore:
         overfetch: int = 4,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
+        include_expired: bool = False,
+        reranker: Reranker | None = None,
         touch: bool = True,
         explain: bool = False,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
@@ -220,6 +228,8 @@ class AsyncMemoryStore:
             overfetch=overfetch,
             expand=expand,
             include_superseded=include_superseded,
+            include_expired=include_expired,
+            reranker=reranker,
             touch=touch,
             explain=explain,
         )
@@ -313,12 +323,41 @@ class AsyncMemoryStore:
         limit: int = 20,
         *,
         include_superseded: bool = False,
+        include_expired: bool = False,
     ) -> list[Memory]:
         return await self.run(
             self.sync.list_recent,
             limit,
             include_superseded=include_superseded,
+            include_expired=include_expired,
         )
+
+    async def purge_expired(
+        self, *, now: float | None = None, dry_run: bool = False
+    ) -> list[Memory]:
+        return await self.run(self.sync.purge_expired, now=now, dry_run=dry_run)
+
+    async def metrics(self) -> dict[str, Any]:
+        return await self.run(self.sync.metrics)
+
+    async def history(
+        self, memory_id: str, *, include_archives: bool = True
+    ) -> list[JournalEntry]:
+        return await self.run(
+            self.sync.history, memory_id, include_archives=include_archives)
+
+    async def state_at(
+        self, timestamp: float, *, include_archives: bool = True
+    ) -> list[Memory]:
+        return await self.run(
+            self.sync.state_at, timestamp, include_archives=include_archives)
+
+    async def get_at(
+        self, memory_id: str, timestamp: float, *, include_archives: bool = True
+    ) -> Memory | None:
+        return await self.run(
+            self.sync.get_at, memory_id, timestamp,
+            include_archives=include_archives)
 
     async def count(self) -> int:
         return await self.run(self.sync.count)

@@ -80,7 +80,7 @@ func TestRememberCmdExplicitZeroImportance(t *testing.T) {
 	if err := runCmd(t, store, newRememberCmd(), "-i", "0", "explicitly worthless"); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
-	mems, err := store.ListRecent(context.Background(), 1, false)
+	mems, err := store.ListRecent(context.Background(), 1, false, false)
 	if err != nil || len(mems) != 1 {
 		t.Fatalf("ListRecent: %v (%d)", err, len(mems))
 	}
@@ -94,7 +94,7 @@ func TestRememberCmdDefaultTypeSemantic(t *testing.T) {
 	if err := runCmd(t, store, newRememberCmd(), "an untyped note"); err != nil {
 		t.Fatalf("remember: %v", err)
 	}
-	mems, _ := store.ListRecent(context.Background(), 1, false)
+	mems, _ := store.ListRecent(context.Background(), 1, false, false)
 	if len(mems) != 1 || mems[0].Type != memory.Semantic {
 		t.Errorf("default type = %v, want semantic (config default_type)", mems)
 	}
@@ -208,5 +208,39 @@ func TestImportCmdRuntimeErrorFormatting(t *testing.T) {
 	}
 	if strings.Contains(s, "Usage:") {
 		t.Errorf("usage must be silenced for a runtime error, but it was dumped:\n%s", s)
+	}
+}
+
+func TestRememberCmdTTL(t *testing.T) {
+	store := newCmdTestStore(t)
+	if err := runCmd(t, store, newRememberCmd(), "--ttl", "100", "ephemeral note"); err != nil {
+		t.Fatalf("remember --ttl: %v", err)
+	}
+	mems, _ := store.ListRecent(context.Background(), 1, false, true)
+	if len(mems) != 1 || mems[0].ExpiresAt <= 0 {
+		t.Errorf("--ttl should set expires_at, got %+v", mems)
+	}
+}
+
+func TestPurgeCmd(t *testing.T) {
+	store := newCmdTestStore(t)
+	ctx := context.Background()
+	exp := float64(1.0)
+	store.Remember(ctx, "expired doc", memory.RememberOpts{ExpiresAt: &exp})
+	store.Remember(ctx, "live doc", memory.RememberOpts{})
+
+	// Dry-run: nothing deleted.
+	if err := runCmd(t, store, newPurgeCmd()); err != nil {
+		t.Fatalf("purge dry-run: %v", err)
+	}
+	if n, _ := store.Count(ctx); n != 2 {
+		t.Fatalf("dry-run should not delete, count=%d", n)
+	}
+	// Apply.
+	if err := runCmd(t, store, newPurgeCmd(), "--apply", "--yes"); err != nil {
+		t.Fatalf("purge apply: %v", err)
+	}
+	if n, _ := store.Count(ctx); n != 1 {
+		t.Errorf("after purge count=%d, want 1 (live doc)", n)
 	}
 }

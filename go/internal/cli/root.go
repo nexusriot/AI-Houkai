@@ -121,6 +121,7 @@ func NewRootCmd() *cobra.Command {
 		newSupersedeCmd(),
 		newRestoreCmd(),
 		newPruneCmd(),
+		newPurgeCmd(),
 		newReflectCmd(),
 		newMaintenanceCmd(),
 		newExportCmd(),

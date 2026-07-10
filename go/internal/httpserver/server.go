@@ -6,15 +6,20 @@
 //
 //	GET    /health                         liveness + memory count (skips auth)
 //	GET    /stats                          store statistics
-//	GET    /memories?limit=&include_superseded=
+//	GET    /metrics                        runtime counters + recall latency
+//	GET    /memories?limit=&include_superseded=&include_expired=
 //	                                       recent memories (list_recent)
-//	POST   /memories                       store a memory (remember)
+//	POST   /memories                       store a memory (remember; ttl_seconds/expires_at)
 //	GET    /memories/{id}                  fetch one memory
-//	PATCH  /memories/{id}                  edit fields in place (journaled)
+//	PATCH  /memories/{id}                  edit fields in place (journaled; expires_at)
 //	DELETE /memories/{id}                  forget one memory
 //	GET    /memories/{id}/neighbors?rel=&direction=&depth=
 //	                                       linked memories
-//	GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=
+//	GET    /memories/{id}/history          journaled timeline of one memory
+//	GET    /memories/{id}/at?ts=           reconstruct one memory as of a past time
+//	GET    /state_at?ts=                   reconstruct all live memories as of a past time
+//	POST   /purge_expired  {dry_run?}      hard-delete memories whose TTL passed
+//	GET    /recall?query=&k=&type=&tag=&min_importance=&source=&since=&until=&mode=&include_expired=&explain=
 //	POST   /recall                         same, via JSON body
 //	POST   /recall_pack                    token-budgeted context block
 //	POST   /auto_context                   fan-out context block for a task
@@ -40,6 +45,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
@@ -66,6 +72,14 @@ type Server struct {
 	path       string
 	collection string
 	token      string
+
+	// storeMu serialises every store call. Handlers run on separate goroutines,
+	// and store operations like Recall's access-count bump, Link, and Supersede
+	// are read-modify-write against the backend — concurrent handlers would
+	// clobber each other's metadata writes. Mirrors the Python HTTP server's
+	// store_lock, held tightly around just the store call (not the response
+	// write). Serve is the store's only in-process user, so this is sufficient.
+	storeMu sync.Mutex
 }
 
 // New builds a Server. path/collection are reported by /health and /stats;
@@ -79,12 +93,17 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.wrap(s.health))
 	mux.HandleFunc("GET /stats", s.wrap(s.stats))
+	mux.HandleFunc("GET /metrics", s.wrap(s.metrics))
 	mux.HandleFunc("GET /memories", s.wrap(s.list))
 	mux.HandleFunc("POST /memories", s.wrap(s.remember))
 	mux.HandleFunc("GET /memories/{id}", s.wrap(s.getOne))
 	mux.HandleFunc("PATCH /memories/{id}", s.wrap(s.edit))
 	mux.HandleFunc("DELETE /memories/{id}", s.wrap(s.forget))
 	mux.HandleFunc("GET /memories/{id}/neighbors", s.wrap(s.neighbors))
+	mux.HandleFunc("GET /memories/{id}/history", s.wrap(s.history))
+	mux.HandleFunc("GET /memories/{id}/at", s.wrap(s.getAt))
+	mux.HandleFunc("GET /state_at", s.wrap(s.stateAt))
+	mux.HandleFunc("POST /purge_expired", s.wrap(s.purgeExpired))
 	mux.HandleFunc("GET /recall", s.wrap(s.recall))
 	mux.HandleFunc("POST /recall", s.wrap(s.recall))
 	mux.HandleFunc("POST /recall_pack", s.wrap(s.recallPack))
@@ -196,7 +215,7 @@ type apiFunc func(r *http.Request) (int, any, error)
 
 func (s *Server) wrap(fn apiFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		status, payload, err := fn(r)
+		status, payload, err := s.callLocked(fn, r)
 		if err != nil {
 			var he *httpError
 			if errors.As(err, &he) {
@@ -214,6 +233,15 @@ func (s *Server) wrap(fn apiFunc) http.HandlerFunc {
 		}
 		writeJSON(w, status, payload)
 	}
+}
+
+// callLocked runs a handler while holding storeMu, releasing it (even on panic,
+// via defer) before the caller writes the response — the response write must
+// not hold the lock. Mirrors Python's `with store_lock: fn(...)`.
+func (s *Server) callLocked(fn apiFunc, r *http.Request) (int, any, error) {
+	s.storeMu.Lock()
+	defer s.storeMu.Unlock()
+	return fn(r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -246,10 +274,102 @@ func (s *Server) stats(r *http.Request) (int, any, error) {
 	return 200, st, nil
 }
 
+func (s *Server) metrics(r *http.Request) (int, any, error) {
+	m, err := s.store.Metrics(r.Context())
+	if err != nil {
+		return 0, nil, err
+	}
+	return 200, m, nil
+}
+
+func (s *Server) purgeExpired(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	dry := bodyBool(b, "dry_run")
+	purged, err := s.store.PurgeExpired(r.Context(), 0, dry)
+	if err != nil {
+		return 0, nil, err
+	}
+	ids := make([]string, len(purged))
+	for i, p := range purged {
+		ids[i] = p.ID
+	}
+	return 200, map[string]any{"purged": len(purged), "dry_run": dry, "ids": ids}, nil
+}
+
+func journalEntryDict(e memory.JournalEntry) map[string]any {
+	return map[string]any{
+		"ts": e.TS, "op": string(e.Op), "actor": e.Actor, "id": e.ID,
+		"before": e.Before, "after": e.After, "meta": e.Meta,
+		"summary": e.Summary(),
+	}
+}
+
+func (s *Server) history(r *http.Request) (int, any, error) {
+	id := r.PathValue("id")
+	entries, err := s.store.History(r.Context(), id)
+	if err != nil {
+		return 0, nil, err
+	}
+	// Distinguish an unknown id from a live memory with no journal history.
+	if len(entries) == 0 {
+		if _, gerr := s.store.GetByID(r.Context(), id); errors.Is(gerr, memory.ErrNotFound) {
+			return 0, nil, errStatus(404, "memory not found")
+		}
+	}
+	out := make([]map[string]any, len(entries))
+	for i, e := range entries {
+		out[i] = journalEntryDict(e)
+	}
+	return 200, map[string]any{"id": id, "history": out}, nil
+}
+
+func (s *Server) stateAt(r *http.Request) (int, any, error) {
+	raw := qsStr(r, "ts", "")
+	if raw == "" {
+		return 0, nil, errStatus(400, "missing required field: ts")
+	}
+	ts, err := parseTimeVal(raw)
+	if err != nil {
+		return 0, nil, err
+	}
+	mems, err := s.store.StateAt(r.Context(), ts)
+	if err != nil {
+		return 0, nil, err
+	}
+	out := make([]map[string]any, len(mems))
+	for i, m := range mems {
+		out[i] = memDict(m)
+	}
+	return 200, map[string]any{"ts": ts, "count": len(mems), "memories": out}, nil
+}
+
+func (s *Server) getAt(r *http.Request) (int, any, error) {
+	raw := qsStr(r, "ts", "")
+	if raw == "" {
+		return 0, nil, errStatus(400, "missing required field: ts")
+	}
+	ts, err := parseTimeVal(raw)
+	if err != nil {
+		return 0, nil, err
+	}
+	mem, err := s.store.GetAt(r.Context(), r.PathValue("id"), ts)
+	if err != nil {
+		return 0, nil, err
+	}
+	if mem == nil {
+		return 0, nil, errStatus(404, "memory did not exist at that time")
+	}
+	return 200, memDict(*mem), nil
+}
+
 func (s *Server) list(r *http.Request) (int, any, error) {
 	limit := qsInt(r, "limit", 20)
 	inc := qsBool(r, "include_superseded")
-	mems, err := s.store.ListRecent(r.Context(), limit, inc)
+	incExp := qsBool(r, "include_expired")
+	mems, err := s.store.ListRecent(r.Context(), limit, inc, incExp)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -276,6 +396,14 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		Source:     bodyStr(b, "source", ""),
 		Polarity:   int(bodyFloat(b, "polarity", 0)),
 		OnConflict: memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
+	}
+	// TTL: probe as float64 (JSON numbers) — an epoch needs float64 precision,
+	// which bodyFloatPtr (*float32) can't carry.
+	if v, ok := b["expires_at"].(float64); ok {
+		opts.ExpiresAt = &v
+	}
+	if v, ok := b["ttl_seconds"].(float64); ok {
+		opts.TTLSeconds = &v
 	}
 	mem, stored, conflicts, err := s.store.Remember(r.Context(), text, opts)
 	if err != nil {
@@ -347,6 +475,12 @@ func (s *Server) edit(r *http.Request) (int, any, error) {
 		n := int(bodyFloat(b, "polarity", 0))
 		opts.Polarity = &n
 		fields++
+	}
+	if raw, present := b["expires_at"]; present && raw != nil {
+		if v, ok := raw.(float64); ok { // 0 clears the TTL
+			opts.ExpiresAt = &v
+			fields++
+		}
 	}
 	if _, present := b["source"]; present {
 		src, _ := b["source"].(string) // null → "" (clears)
@@ -629,6 +763,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeSemantic))),
 			Overfetch:         4,
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
+			IncludeExpired:    bodyBool(b, "include_expired"),
 			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
 			Diversity:         bodyFloatPtr(b, "diversity"),
 			DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
@@ -656,6 +791,8 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		Mode:              memory.RecallMode(qsStr(r, "mode", string(memory.ModeSemantic))),
 		Overfetch:         4,
 		IncludeSuperseded: qsBool(r, "include_superseded"),
+		IncludeExpired:    qsBool(r, "include_expired"),
+		Explain:           qsBool(r, "explain"),
 	}, qsInt(r, "k", 5), nil
 }
 
@@ -664,9 +801,23 @@ func memDict(m memory.Memory) map[string]any {
 	for i, l := range m.Links {
 		links[i] = map[string]any{"to": l.To, "rel": l.Rel}
 	}
+	// Match Python's _mem_dict, which emits None (JSON null) for these when
+	// empty rather than "" / 0.
 	var superseded any
 	if m.SupersededBy != "" {
 		superseded = m.SupersededBy
+	}
+	var supersededAt any
+	if m.SupersededAt != 0 {
+		supersededAt = m.SupersededAt
+	}
+	var source any
+	if m.Source != "" {
+		source = m.Source
+	}
+	var expiresAt any
+	if m.ExpiresAt != 0 {
+		expiresAt = m.ExpiresAt
 	}
 	return map[string]any{
 		"id":            m.ID,
@@ -674,12 +825,15 @@ func memDict(m memory.Memory) map[string]any {
 		"type":          string(m.Type),
 		"tags":          m.Tags,
 		"importance":    m.Importance,
-		"source":        m.Source,
+		"source":        source,
 		"created_at":    m.CreatedAt,
 		"last_accessed": m.LastAccessed,
 		"access_count":  m.AccessCount,
+		"polarity":      m.Polarity,
 		"links":         links,
 		"superseded_by": superseded,
+		"superseded_at": supersededAt,
+		"expires_at":    expiresAt,
 	}
 }
 

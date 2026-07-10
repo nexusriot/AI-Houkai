@@ -94,6 +94,13 @@ def _get_embed_fn(model_name: str):
     )
 ConflictFn = Callable[["Memory", "Memory"], bool]
 
+# A reranker rescores a recall candidate pool with a stronger (usually
+# cross-encoder) relevance model. It receives the query and the candidate
+# memories (already filtered + first-stage ranked) and returns one score per
+# memory, in the same order; higher = more relevant. recall() re-sorts by the
+# returned scores and, in explain mode, records the first-stage score/rank.
+Reranker = Callable[[str, "list[Memory]"], "list[float]"]
+
 @dataclass
 class Link:
     """A directed, typed edge from one memory to another."""
@@ -236,6 +243,10 @@ class Memory:
     superseded_by: str  = ""    # id of the superseding memory, "" if active
     superseded_at: float = 0.0
     polarity:      int  = 0     # -1 / 0 / +1
+    # — expiry (TTL) —
+    # Unix timestamp after which the memory is treated as expired: hidden from
+    # recall/list and reclaimable by purge_expired(). 0.0 means "never expires".
+    expires_at:    float = 0.0
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -250,6 +261,7 @@ class Memory:
             "superseded_by": self.superseded_by,
             "superseded_at": self.superseded_at,
             "polarity":      self.polarity,
+            "expires_at":    self.expires_at,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -268,6 +280,7 @@ class Memory:
             "superseded_by": self.superseded_by,
             "superseded_at": self.superseded_at,
             "polarity":      self.polarity,
+            "expires_at":    self.expires_at,
         }
 
     @classmethod
@@ -286,6 +299,7 @@ class Memory:
             superseded_by=str(d.get("superseded_by") or ""),
             superseded_at=float(d.get("superseded_at") or 0.0),
             polarity=int(d.get("polarity") or 0),
+            expires_at=float(d.get("expires_at") or 0.0),
         )
 
     @classmethod
@@ -309,6 +323,9 @@ class Memory:
             superseded_by=str(meta.get("superseded_by", "")),
             superseded_at=float(meta.get("superseded_at", 0.0)),
             polarity=int(meta.get("polarity", 0)),
+            # Old rows written before TTL landed have no "expires_at" key;
+            # default 0.0 = never expires, so they keep showing up in recall.
+            expires_at=float(meta.get("expires_at", 0.0)),
         )
 
 
@@ -542,6 +559,7 @@ class MemoryStore:
         conflict_threshold: float = 0.80,
         contradiction_fn: ConflictFn | None = None,
         hybrid_weights: HybridWeights | None = None,
+        reranker: "Reranker | None" = None,
         importance_fn: "Callable[[str, str, list[str]], float] | None" = None,
         actor: str = "lib",
         journal_enabled: bool = True,
@@ -566,7 +584,15 @@ class MemoryStore:
         self._conflict_threshold = conflict_threshold
         self._contradiction_fn   = contradiction_fn
         self._hybrid_weights     = hybrid_weights
+        self._reranker           = reranker
         self._importance_fn      = importance_fn
+
+        # Process-local runtime metrics (not persisted; reset on restart).
+        self._metric_started = time.time()
+        self._metric_calls: dict[str, int] = {
+            "remember": 0, "recall": 0, "forget": 0, "edit": 0, "supersede": 0,
+        }
+        self._metric_recall_latency = {"count": 0, "total_s": 0.0, "max_s": 0.0}
 
         self._actor           = actor
         self._journal_enabled = journal_enabled
@@ -610,12 +636,24 @@ class MemoryStore:
         source: str | None = None,
         *,
         polarity: int = 0,
+        expires_at: float | None = None,
+        ttl_seconds: float | None = None,
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
     ) -> Memory:
         _validate_choice(type, MEMORY_TYPES, "type")
         if polarity not in (-1, 0, 1):
             raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
+        # Expiry: absolute epoch (expires_at) or relative (ttl_seconds from now).
+        # 0.0 / None means "never expires". They are mutually exclusive.
+        if expires_at is not None and ttl_seconds is not None:
+            raise ValueError("pass at most one of expires_at, ttl_seconds")
+        if ttl_seconds is not None:
+            if ttl_seconds <= 0:
+                raise ValueError("ttl_seconds must be > 0")
+            expires_at = time.time() + ttl_seconds
+        if expires_at is not None and expires_at < 0:
+            raise ValueError("expires_at must be >= 0")
         if on_conflict is not None:
             _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
         tags = list(tags)
@@ -635,12 +673,14 @@ class MemoryStore:
             importance=max(0.0, min(1.0, importance)),
             source=source,
             polarity=polarity,
+            expires_at=expires_at or 0.0,
         )
         self.collection.add(
             ids=[mem.id],
             documents=[mem.text],
             metadatas=[mem.to_metadata()],
         )
+        self._metric_calls["remember"] += 1
         self._journal("remember", mem.id, after=mem.to_dict())
 
         policy = on_conflict if on_conflict is not None else self._conflict_policy
@@ -672,6 +712,7 @@ class MemoryStore:
         if before is None:
             return False
         self.collection.delete(ids=[memory_id])
+        self._metric_calls["forget"] += 1
         self._journal("forget", memory_id, before=before.to_dict())
         return True
 
@@ -686,6 +727,7 @@ class MemoryStore:
         tags: Iterable[str] | None = None,
         importance: float | None = None,
         polarity: int | None = None,
+        expires_at: float | None = None,
         source: str | None = _UNSET,
     ) -> Memory:
         """Update fields of an existing memory in place, keeping its id.
@@ -716,6 +758,11 @@ class MemoryStore:
             mem.polarity = polarity
         if importance is not None:
             mem.importance = max(0.0, min(1.0, float(importance)))
+        if expires_at is not None:
+            # 0.0 clears the TTL; a negative value is nonsensical.
+            if expires_at < 0:
+                raise ValueError("expires_at must be >= 0")
+            mem.expires_at = float(expires_at)
         if tags is not None:
             new_tags = list(tags)
             _validate_tags(new_tags)
@@ -743,6 +790,7 @@ class MemoryStore:
             )
         else:
             self.collection.update(ids=[memory_id], metadatas=[mem.to_metadata()])
+        self._metric_calls["edit"] += 1
         self._journal("edit", memory_id, before=before, after=after)
         return mem
 
@@ -755,6 +803,26 @@ class MemoryStore:
         self.collection.delete(ids=ids)
         self._journal("nuke", "*", meta={"count": len(ids)})
         return len(ids)
+
+    def purge_expired(self, *, now: float | None = None,
+                      dry_run: bool = False) -> list[Memory]:
+        """Hard-delete memories whose TTL has passed. Returns those purged.
+
+        Expired memories are already hidden from recall/list; this reclaims
+        their storage. Unlike decay's ``prune`` this ignores ``protect_types``
+        — an explicit TTL is a stronger signal than the decay heuristic. Each
+        deletion is journaled per-row (``forget``, actor ``purge``), so it is
+        auditable and individually undoable. ``dry_run`` reports without
+        deleting.
+        """
+        t = now if now is not None else time.time()
+        expired = [m for m in self._get_all_memories()
+                   if m.expires_at and m.expires_at <= t]
+        if not dry_run and expired:
+            with self.as_actor("purge"):
+                for m in expired:
+                    self.forget(m.id)
+        return expired
 
     def recall(
         self,
@@ -776,6 +844,8 @@ class MemoryStore:
         overfetch: int = 4,
         expand: ExpandSpec | None = None,
         include_superseded: bool = False,
+        include_expired: bool = False,
+        reranker: "Reranker | None" = None,
         touch: bool = True,
         explain: bool = False,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
@@ -799,6 +869,12 @@ class MemoryStore:
         ``touch=False`` skips the access-count / last_accessed bump (read-only
         recall — e.g. for evaluation). ``explain=True`` returns
         ``(Memory, score, breakdown)`` triples with per-signal contributions.
+
+        ``include_expired`` keeps memories whose ``expires_at`` has passed
+        (hidden by default, like superseded). ``reranker`` (per-call override of
+        the store default) rescores the first-stage candidate pool with a
+        stronger relevance model before the top-``k`` cut; its returned score
+        replaces the blended score, and explain records the first-stage rank.
         """
         _validate_choice(mode, RECALL_MODES, "mode")
         _validate_choice(fusion, FUSIONS, "fusion")
@@ -811,17 +887,24 @@ class MemoryStore:
         if min_cosine is not None and not (-1.0 <= min_cosine <= 1.0):
             raise ValueError("min_cosine must be in [-1, 1]")
 
+        t0 = time.perf_counter()
+        self._metric_calls["recall"] += 1
+
         count = self.collection.count()
         if k <= 0 or count == 0:
+            self._record_recall_latency(time.perf_counter() - t0)
             return []
 
         need_emb = diversity is not None or dedup_threshold is not None
+        reranker = reranker if reranker is not None else self._reranker
 
         # The fast path (fetch exactly k) is only safe when no post-query
-        # filtering or re-selection can drop/reorder rows.
+        # filtering or re-selection can drop/reorder rows. Expiry filtering and
+        # reranking both do, so they force the overfetch pool too.
         no_post_filter = (
-            mode == "semantic" and include_superseded and tag is None
-            and not need_emb and min_cosine is None
+            mode == "semantic" and include_superseded and include_expired
+            and tag is None and not need_emb and min_cosine is None
+            and reranker is None
         )
         n_fetch = k if no_post_filter else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
@@ -851,6 +934,18 @@ class MemoryStore:
             scored = self._semantic_filter(
                 res, tag, include_superseded, w.polarity_weight, min_cosine, expl)
 
+        # Drop expired memories (post-filter, not a Chroma where-clause, so old
+        # rows without the expires_at key are unaffected). Done before rerank /
+        # top-k so an expired candidate can never occupy a returned slot.
+        if not include_expired:
+            now_ts = time.time()
+            scored = [(mem, s) for mem, s in scored
+                      if not (mem.expires_at and mem.expires_at <= now_ts)]
+
+        # Second-stage rerank over the surviving pool, before the top-k cut.
+        if reranker is not None and scored:
+            scored = self._apply_reranker(reranker, query, scored, expl)
+
         if need_emb:
             out = self._mmr_select(
                 scored, k, self._emb_map(res), diversity, dedup_threshold)
@@ -864,6 +959,7 @@ class MemoryStore:
         if expand is not None and expand.cap > 0:
             out = self._expand_links(out, expand, include_superseded, expl)
 
+        self._record_recall_latency(time.perf_counter() - t0)
         if explain:
             return [(mem, score, (expl.get(mem.id, {}) if expl else {}))
                     for mem, score in out]
@@ -1058,7 +1154,12 @@ class MemoryStore:
         limit: int = 20,
         *,
         include_superseded: bool = False,
+        include_expired: bool = False,
     ) -> list[Memory]:
+        if limit < 0:
+            # memories[:-1] would return everything *except* the oldest —
+            # nearly the whole store for a caller that asked for less than 0.
+            raise ValueError("limit must be >= 0")
         if self.collection.count() == 0:
             return []
         res = self.collection.get(include=["documents", "metadatas"])
@@ -1068,11 +1169,129 @@ class MemoryStore:
         ]
         if not include_superseded:
             memories = [m for m in memories if not m.superseded_by]
+        if not include_expired:
+            now_ts = time.time()
+            memories = [m for m in memories
+                        if not (m.expires_at and m.expires_at <= now_ts)]
         memories.sort(key=lambda m: m.created_at, reverse=True)
         return memories[:limit]
 
     def count(self) -> int:
         return self.collection.count()
+
+    def _record_recall_latency(self, dt: float) -> None:
+        m = self._metric_recall_latency
+        m["count"] += 1
+        m["total_s"] += dt
+        if dt > m["max_s"]:
+            m["max_s"] = dt
+
+    def metrics(self) -> dict[str, Any]:
+        """Process-local runtime metrics since this store was created.
+
+        Complements :meth:`stats` (content aggregates) with operational
+        counters and recall-latency percentiles. Per-instance and in-memory —
+        not persisted, reset on restart, and not shared across processes.
+        """
+        lat = self._metric_recall_latency
+        n = lat["count"]
+        return {
+            "uptime_seconds": round(time.time() - self._metric_started, 3),
+            "count": self.count(),
+            "calls": dict(self._metric_calls),
+            "recall_latency_ms": {
+                "count": n,
+                "avg": round(lat["total_s"] / n * 1000.0, 3) if n else 0.0,
+                "max": round(lat["max_s"] * 1000.0, 3),
+            },
+        }
+
+    @staticmethod
+    def _entry_touches(entry: JournalEntry, memory_id: str) -> bool:
+        """True if a journal entry concerns *memory_id*.
+
+        The journal files each entry under one primary ``id`` (the op's
+        subject), so a memory also appears as a link target (``dst_id``), the
+        superseding memory (``new_id``), or a restore's superseder
+        (``superseder_id``) — all recorded only in ``meta``. Catch those too so
+        a memory's timeline isn't missing edges pointing at it.
+        """
+        if entry.id == memory_id:
+            return True
+        m = entry.meta or {}
+        return memory_id in (m.get("dst_id"), m.get("new_id"),
+                             m.get("superseder_id"))
+
+    def history(self, memory_id: str, *,
+                include_archives: bool = True) -> list[JournalEntry]:
+        """Every journaled event touching *memory_id*, oldest first.
+
+        Covers the memory as an op's subject and as a link/supersede
+        counterpart (see :meth:`_entry_touches`). Store-wide ``nuke`` events
+        are not per-memory and are omitted (use ``journal_tail`` for those).
+        Bounded by journal retention (rotated archives past ``keep_days`` are
+        gone).
+        """
+        return [e for e in self.journal.read(include_archives=include_archives)
+                if self._entry_touches(e, memory_id)]
+
+    @staticmethod
+    def _replay_link(state: dict[str, dict], meta: dict, *, add: bool) -> None:
+        src, dst = meta.get("src_id"), meta.get("dst_id")
+        rel = meta.get("rel")
+        if not src or src not in state:
+            return
+        links = state[src].setdefault("links", [])
+        if add:
+            if not any(l.get("to") == dst and l.get("rel") == rel for l in links):
+                links.append({"to": dst, "rel": rel})
+        else:
+            # A rel=None unlink removes several rels, recorded in removed_rels.
+            rels = meta.get("removed_rels") or ([rel] if rel else None)
+            state[src]["links"] = [
+                l for l in links
+                if not (l.get("to") == dst and (rels is None or l.get("rel") in rels))
+            ]
+
+    def state_at(self, timestamp: float, *,
+                 include_archives: bool = True) -> list[Memory]:
+        """Reconstruct the live memories as of *timestamp* by replaying the journal.
+
+        Best-effort audit tool, not a source of record: it can only see
+        journaled snapshots, so it is accurate back to the oldest retained
+        entry, a ``nuke`` in the window clears reconstructed state (its
+        pre-nuke contents were never snapshotted), and memories written with
+        journaling disabled are invisible. Reconstructed memories carry no
+        embedding (the journal stores none).
+        """
+        state: dict[str, dict] = {}
+        for e in self.journal.read(until=timestamp, include_archives=include_archives):
+            if e.op in ("remember", "import", "edit", "supersede", "restore") and e.after:
+                state[e.id] = dict(e.after)
+            elif e.op == "forget":
+                state.pop(e.id, None)
+            elif e.op == "nuke":
+                state.clear()
+            elif e.op == "link":
+                self._replay_link(state, e.meta or {}, add=True)
+            elif e.op == "unlink":
+                self._replay_link(state, e.meta or {}, add=False)
+            elif e.op == "undo":
+                # An undo either restores a snapshot (before/after captured) or,
+                # for an undone remember, deletes the memory.
+                if e.after:
+                    state[e.id] = dict(e.after)
+                elif (e.meta or {}).get("of_op") == "remember":
+                    state.pop(e.id, None)
+        return [Memory.from_dict(d) for d in state.values()]
+
+    def get_at(self, memory_id: str, timestamp: float, *,
+               include_archives: bool = True) -> Memory | None:
+        """Reconstruct a single memory as of *timestamp* (see :meth:`state_at`)."""
+        for mem in self.state_at(timestamp, include_archives=include_archives):
+            if mem.id == memory_id:
+                return mem
+        return None
 
     def find_conflicts(
         self,
@@ -1165,6 +1384,7 @@ class MemoryStore:
         old.superseded_at = time.time()
         self.collection.update(ids=[old_id], metadatas=[old.to_metadata()])
         self._link_raw(new_id, old_id, "supersedes")
+        self._metric_calls["supersede"] += 1
         self._journal(
             "supersede", old_id,
             before=before, after=old.to_dict(),
@@ -1681,6 +1901,8 @@ class MemoryStore:
             superseder = entry.meta.get("superseder_id")
             if not superseder or self._get_by_id(superseder) is None:
                 return False
+            if self._get_by_id(entry.id) is None:
+                return False  # restored memory has since been forgotten
             self.supersede(old_id=entry.id, new_id=superseder)
             self._journal("undo", entry.id,
                           meta={"of": entry.ts, "of_op": entry.op})
@@ -1887,6 +2109,43 @@ class MemoryStore:
         basis = mem.created_at if w.recency_basis == "created" else mem.last_accessed
         age_d = max(0.0, (now - basis) / 86_400.0)
         return math.exp(-w.decay_rate * age_d)
+
+    def _apply_reranker(
+        self,
+        reranker: "Reranker",
+        query: str,
+        scored: list[tuple[Memory, float]],
+        explanations: dict | None,
+    ) -> list[tuple[Memory, float]]:
+        """Rescore the first-stage candidate pool with *reranker* and re-sort.
+
+        The reranker returns one score per candidate (same order); that score
+        replaces the blended first-stage score. In explain mode each memory's
+        breakdown gains a ``rerank`` block recording the first-stage score/rank
+        and the new score/rank, so the reordering stays auditable.
+        """
+        mems = [mem for mem, _ in scored]
+        rer_scores = list(reranker(query, mems))
+        if len(rer_scores) != len(mems):
+            raise ValueError(
+                f"reranker returned {len(rer_scores)} scores for "
+                f"{len(mems)} candidate(s)"
+            )
+        reranked = [(mem, float(s)) for mem, s in zip(mems, rer_scores)]
+        if explanations is not None:
+            for first_rank, (mem, first_score) in enumerate(scored):
+                entry = explanations.setdefault(mem.id, {})
+                entry["rerank"] = {
+                    "first_stage_score": round(first_score, 4),
+                    "first_stage_rank": first_rank,
+                }
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        if explanations is not None:
+            for new_rank, (mem, new_score) in enumerate(reranked):
+                rr = explanations.setdefault(mem.id, {}).setdefault("rerank", {})
+                rr["score"] = round(new_score, 4)
+                rr["rank"] = new_rank
+        return reranked
 
     def _semantic_filter(
         self,

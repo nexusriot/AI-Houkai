@@ -64,10 +64,13 @@ def _state_lock(state_path: str) -> Iterator[None]:
 class TickResult:
     ran_decay: bool = False
     ran_reflect: bool = False
+    ran_purge: bool = False
     decayed: int = 0
     reflected: int = 0
+    purged: int = 0
     decay_error: str | None = None
     reflect_error: str | None = None
+    purge_error: str | None = None
     # False when reflection ran in dry-run mode: `reflected` is then the
     # number of summaries that WOULD be created, not that were created.
     reflect_applied: bool = True
@@ -88,6 +91,11 @@ class TickResult:
                 parts.append(f"reflect created {self.reflected}")
             else:
                 parts.append(f"reflect would create {self.reflected} (dry-run)")
+        if self.ran_purge:
+            if self.purge_error:
+                parts.append(f"purge FAILED: {self.purge_error}")
+            else:
+                parts.append(f"purge removed {self.purged}")
         return " | ".join(parts) if parts else "nothing to do"
 
 
@@ -131,6 +139,7 @@ class MaintenanceScheduler:
         store,
         decay_every: int | None = 86_400,
         reflect_every: int | None = 604_800,
+        purge_every: int | None = 86_400,
         tick_interval: int = 300,
         state_path: str = "~/.ai_houkai/maintenance.state.json",
         decay_rate: float = 0.1,
@@ -145,6 +154,7 @@ class MaintenanceScheduler:
         self.store = store
         self.decay_every = decay_every
         self.reflect_every = reflect_every
+        self.purge_every = purge_every
         self.tick_interval = tick_interval
         self.state_path = state_path
         self.decay_rate = decay_rate
@@ -228,6 +238,20 @@ class MaintenanceScheduler:
                     result.reflect_error = str(exc)
                     logger.exception("Reflect run failed: %s", exc)
 
+        if self.purge_every is not None:
+            next_at = state.next_run_at(state.last_purge_at, self.purge_every, now=t)
+            if t >= next_at:
+                result.ran_purge = True
+                try:
+                    purged = self.store.purge_expired(now=t)
+                    result.purged = len(purged)
+                    state.last_purge_at = t
+                    state.total_purged += result.purged
+                    logger.info("Purge: removed %d expired memories", result.purged)
+                except Exception as exc:
+                    result.purge_error = str(exc)
+                    logger.exception("Purge run failed: %s", exc)
+
         state.save(self.state_path)
         return result
 
@@ -245,7 +269,7 @@ class MaintenanceScheduler:
         while not stop.is_set():
             try:
                 result = self.tick()
-                if result.ran_decay or result.ran_reflect:
+                if result.ran_decay or result.ran_reflect or result.ran_purge:
                     logger.info("Tick: %s", result.summary())
             except Exception as exc:
                 logger.exception("Unexpected error in tick: %s", exc)

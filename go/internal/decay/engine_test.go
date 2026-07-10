@@ -10,11 +10,13 @@ import (
 
 // fakeStore implements Storable for unit tests.
 type fakeStore struct {
-	mems   []memory.Memory
-	forgot []string
+	mems       []memory.Memory
+	forgot     []string
+	sawInclude bool // last includeSuperseded arg ListRecent was called with
 }
 
-func (f *fakeStore) ListRecent(_ context.Context, _ int, _ bool) ([]memory.Memory, error) {
+func (f *fakeStore) ListRecent(_ context.Context, _ int, includeSuperseded, _ bool) ([]memory.Memory, error) {
+	f.sawInclude = includeSuperseded
 	return f.mems, nil
 }
 
@@ -59,6 +61,21 @@ func TestPruneRemovesBelowThreshold(t *testing.T) {
 	}
 	if len(fs.forgot) != 1 || fs.forgot[0] != "drop" {
 		t.Errorf("Forget should have been called on 'drop', got %v", fs.forgot)
+	}
+}
+
+func TestPruneConsidersSupersededMemories(t *testing.T) {
+	// Prune must ask for superseded memories too, else soft-deleted entries
+	// never age out and the store grows without bound.
+	fs := &fakeStore{mems: []memory.Memory{
+		{ID: "keep", Type: memory.Semantic, Importance: 1.0, LastAccessed: ts(0)},
+	}}
+	e := New(fs, 0.1, 0.05, nil, 0)
+	if _, err := e.Prune(context.Background(), true); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if !fs.sawInclude {
+		t.Error("Prune called ListRecent with includeSuperseded=false; superseded memories will linger forever")
 	}
 }
 

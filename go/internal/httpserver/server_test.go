@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/nexusriot/ai-houkai/internal/httpserver"
@@ -306,5 +307,103 @@ func TestHealthOmitsCollection(t *testing.T) {
 	m := decode(t, resp)
 	if _, present := m["collection"]; present {
 		t.Error("/health must not expose the collection name")
+	}
+}
+
+func TestMemDictExposesPolarityAndSupersededAt(t *testing.T) {
+	// These fields exist in the Python API's _mem_dict; a client reading
+	// polarity to render contradiction state must not get undefined.
+	ts, _ := newTestServer(t, "")
+	post := func(payload string) map[string]any {
+		resp, err := http.Post(ts.URL+"/memories", "application/json",
+			bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decode(t, resp)
+	}
+
+	old := post(`{"text":"we use flake8 for linting","polarity":1}`)
+	if _, ok := old["polarity"]; !ok {
+		t.Error("memory dict missing 'polarity' key")
+	}
+	if pol, _ := old["polarity"].(float64); pol != 1 {
+		t.Errorf("polarity = %v, want 1", old["polarity"])
+	}
+	// superseded_at key must be present (null) on a live memory.
+	if v, ok := old["superseded_at"]; !ok || v != nil {
+		t.Errorf("superseded_at on live memory = %v (present=%v), want null/present", v, ok)
+	}
+
+	// After a supersede, superseded_at becomes a real timestamp.
+	newMem := post(`{"text":"we use ruff for linting","polarity":1}`)
+	body, _ := json.Marshal(map[string]any{"old_id": old["id"], "new_id": newMem["id"]})
+	resp, err := http.Post(ts.URL+"/supersede", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/memories/" + old["id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := decode(t, resp)
+	if got["superseded_by"] != newMem["id"] {
+		t.Errorf("superseded_by = %v, want %v", got["superseded_by"], newMem["id"])
+	}
+	if at, _ := got["superseded_at"].(float64); at <= 0 {
+		t.Errorf("superseded_at = %v, want a positive timestamp", got["superseded_at"])
+	}
+}
+
+func TestConcurrentWritesAreSerialized(t *testing.T) {
+	// Run with -race: the store lock must serialize read-modify-write handlers
+	// (Remember's add, Recall's access bump) so concurrent clients neither race
+	// nor lose writes. Before the lock, chromem's Count-then-Query in "list all"
+	// could also error mid-insert.
+	ts, _ := newTestServer(t, "")
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payload := fmt.Sprintf(`{"text":"concurrent memory number %d","type":"semantic"}`, i)
+			resp, err := http.Post(ts.URL+"/memories", "application/json",
+				bytes.NewReader([]byte(payload)))
+			if err != nil {
+				errs <- err
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode != 201 {
+				errs <- fmt.Errorf("status %d", resp.StatusCode)
+			}
+			// Interleave a read that touches (bumps access counts).
+			r2, err := http.Get(ts.URL + "/recall?query=concurrent&k=5")
+			if err != nil {
+				errs <- err
+				return
+			}
+			r2.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent request failed: %v", err)
+	}
+
+	// Every write must have landed exactly once.
+	resp, err := http.Get(ts.URL + "/memories?limit=1000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decode(t, resp)
+	items, _ := m["memories"].([]any)
+	if len(items) != n {
+		t.Errorf("stored %d memories, want %d (lost or duplicated writes)", len(items), n)
 	}
 }

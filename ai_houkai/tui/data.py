@@ -64,11 +64,20 @@ def search_view(store: MemoryStore, query: str, k: int = 50) -> View:
 
 def neighbors_view(store: MemoryStore, mem: Memory, depth: int = 1) -> View:
     results = store.neighbors(mem.id, direction="both", depth=depth)
+    # neighbors() yields one (memory, rel) pair per edge, so parallel links
+    # to the same target (A→B related + A→B refines) would repeat an id8 —
+    # a duplicate DataTable row key, which crashes the app. One row per
+    # target, rels joined.
+    by_id: dict[str, tuple[Memory, list[str]]] = {}
+    for m, rel in results:
+        entry = by_id.setdefault(short_id(m.id), (m, []))
+        if rel not in entry[1]:
+            entry[1].append(rel)
     return View(
         kind="neighbors",
-        title=f"Neighbors of {short_id(mem.id)} ({len(results)})",
-        rows=[mem_row(m, extra=rel) for m, rel in results],
-        memories={short_id(m.id): m for m, _ in results},
+        title=f"Neighbors of {short_id(mem.id)} ({len(by_id)})",
+        rows=[mem_row(m, extra=",".join(rels)) for m, rels in by_id.values()],
+        memories={id8: m for id8, (m, _) in by_id.items()},
     )
 
 

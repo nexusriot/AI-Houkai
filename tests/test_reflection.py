@@ -286,3 +286,23 @@ class TestPolarityClusterSeparation:
         clusters = engine.clusters()
         # neutral+positive should be able to cluster together
         assert isinstance(clusters, list)
+
+    def test_neutral_seed_does_not_bridge_opposite_polarities(
+        self, store: MemoryStore
+    ):
+        # Highest importance → seeds the cluster; its polarity is neutral.
+        # A seed-only polarity check would let it absorb both the +1 and
+        # the -1 memory, blending a contradiction into one summary.
+        store.remember("We use the ruff linter for this repository",
+                       type="episodic", polarity=0, importance=0.9)
+        store.remember("Always use the ruff linter for this repository",
+                       type="episodic", polarity=1, importance=0.5)
+        store.remember("Never use the ruff linter for this repository",
+                       type="episodic", polarity=-1, importance=0.5)
+        engine = ReflectionEngine(store, similarity_threshold=0.60,
+                                  min_cluster_size=2)
+        for cluster in engine.clusters():
+            polarities = {m.polarity for m in cluster}
+            assert not {-1, 1} <= polarities, (
+                "cluster merged explicitly opposite polarities"
+            )

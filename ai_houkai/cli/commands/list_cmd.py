@@ -29,6 +29,8 @@ def list_memories(
     since: Optional[str] = typer.Option(None, "--since", help="e.g. 7d, 2h, 2026-01-01"),
     sort: str = typer.Option("created", "--sort", help="created|importance"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
+    include_expired: bool = typer.Option(False, "--include-expired",
+                                         help="Also list memories whose TTL has passed"),
     fmt: str = typer.Option("auto", "--format", "-f", help="auto|rich|tsv|json"),
 ) -> None:
     """List most recently created memories."""
@@ -36,7 +38,8 @@ def list_memories(
     # Fetch everything: type/tag/since filter below, so a fixed fetch cap
     # would silently drop older matches.
     memories = store.list_recent(
-        limit=max(store.count(), 1), include_superseded=include_superseded)
+        limit=max(store.count(), 1), include_superseded=include_superseded,
+        include_expired=include_expired)
 
     if type:
         memories = [m for m in memories if m.type == type]

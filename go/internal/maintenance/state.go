@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/decay"
+	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
 )
 
@@ -22,8 +23,12 @@ type Config struct {
 	Interval    time.Duration // cadence of the foreground `maintenance run` loop
 	DecayRate   float32
 	MinScore    float32
-	Reflect     bool                       // run the reflection job at all
-	Consolidate reflectpkg.ConsolidateMode // what happens to reflected sources ("" = none)
+	// ProtectTypes are never pruned by the decay job. Without this the tick
+	// defaulted to decay's built-in ["procedural"], silently ignoring the
+	// user's configured protect_types and deleting memories they meant to keep.
+	ProtectTypes []memory.MemoryType
+	Reflect      bool                       // run the reflection job at all
+	Consolidate  reflectpkg.ConsolidateMode // what happens to reflected sources ("" = none)
 
 	// DecayEvery / ReflectEvery gate the jobs on a schedule: a job only runs
 	// when at least this many seconds have passed since its last recorded run
@@ -32,6 +37,8 @@ type Config struct {
 	// is no history, so a non-disabled job is always due.
 	DecayEvery   float64
 	ReflectEvery float64
+	// PurgeEvery gates the TTL-purge job on the same schedule semantics.
+	PurgeEvery float64
 
 	// FrequencyWeight > 0 makes frequently-recalled memories resist decay
 	// (forwarded to decay.Engine; 0 = recency-only, the default).
@@ -48,8 +55,10 @@ type Config struct {
 type State struct {
 	LastDecayAt    float64 `json:"last_decay_at"`
 	LastReflectAt  float64 `json:"last_reflect_at"`
+	LastPurgeAt    float64 `json:"last_purge_at"`
 	TotalDecayed   int     `json:"total_decayed"`
 	TotalReflected int     `json:"total_reflected"`
+	TotalPurged    int     `json:"total_purged"`
 }
 
 // LoadState reads the state file (a zero State if it is missing/unreadable).
@@ -77,8 +86,10 @@ func (s State) Save(path string) error {
 type TickResult struct {
 	RanDecay   bool
 	RanReflect bool
+	RanPurge   bool
 	Pruned     int
 	Reflected  int
+	Purged     int
 	Err        error
 }
 
@@ -147,7 +158,7 @@ func tickLocked(ctx context.Context, store decay.Storable, reflStore reflectpkg.
 
 	if jobDue(st.LastDecayAt, cfg.DecayEvery, nowUnix) {
 		res.RanDecay = true
-		de := decay.New(store, cfg.DecayRate, cfg.MinScore, nil, cfg.FrequencyWeight)
+		de := decay.New(store, cfg.DecayRate, cfg.MinScore, cfg.ProtectTypes, cfg.FrequencyWeight)
 		pruned, err := de.Prune(ctx, false)
 		if err != nil {
 			// One failing job must not prevent the other from running
@@ -180,10 +191,31 @@ func tickLocked(ctx context.Context, store decay.Storable, reflStore reflectpkg.
 		}
 	}
 
+	// TTL purge. The tick's store is the decay.Storable interface, which lacks
+	// PurgeExpired; type-assert to reach it (mirrors decay's actorScoped probe).
+	// A store without the method silently skips the job.
+	if px, ok := store.(expirable); ok && jobDue(st.LastPurgeAt, cfg.PurgeEvery, nowUnix) {
+		res.RanPurge = true
+		purged, err := px.PurgeExpired(ctx, nowUnix, false)
+		if err != nil {
+			res.Err = errors.Join(res.Err, err)
+		} else {
+			res.Purged = len(purged)
+			st.LastPurgeAt = nowUnix
+			st.TotalPurged += res.Purged
+		}
+	}
+
 	if statePath != "" {
 		_ = st.Save(statePath)
 	}
 	return res
+}
+
+// expirable is the optional store capability the purge job needs; the concrete
+// *memory.MemoryStore satisfies it, while a bare decay.Storable fake does not.
+type expirable interface {
+	PurgeExpired(ctx context.Context, now float64, dryRun bool) ([]memory.Memory, error)
 }
 
 // ReadPid returns the pid recorded in path (0 if absent/unparseable).

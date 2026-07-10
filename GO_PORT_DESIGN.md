@@ -1,11 +1,12 @@
 # AI-Houkai — Go Port Feasibility & Design
 
 Status: **implemented** — the port shipped in `go/` (merged 2026-06-10) and
-has since reached full feature parity with the Python version (15 MCP tools,
-pack/ingest/collections/TUI/installers/summarizers/HTTP-REST-API server). This file is the
-original 2026-05-20 feasibility study, kept as a historical record; the
-authoritative docs for the shipped port are [go/README.md](go/README.md)
-and [go/DESIGN.md](go/DESIGN.md).
+has since reached full feature parity with the Python version (22 MCP tools,
+pack/ingest/collections/TUI/installers/summarizers/HTTP-REST-API server, plus
+the later reranking / TTL-expiry / point-in-time-history / recall-explain /
+runtime-metrics additions). This file is the original 2026-05-20 feasibility
+study, kept as a historical record; the authoritative docs for the shipped
+port are [go/README.md](go/README.md) and [go/DESIGN.md](go/DESIGN.md).
 
 Source baseline at writing: ai-houkai 0.3.4 (Python, ~3.6 kLOC under `ai_houkai/`)
 

@@ -241,6 +241,47 @@ func TestTickScheduleGates(t *testing.T) {
 	}
 }
 
+func TestTickHonorsProtectTypes(t *testing.T) {
+	// A prunable memory of a protected type must survive the decay job.
+	// Without ProtectTypes plumbed through, the tick defaulted to protecting
+	// only "procedural" and silently deleted the user's configured types.
+	ctx := context.Background()
+	seed := func(store *memory.MemoryStore) {
+		// importance 0.01 < MinScore 0.05 even when fresh → prune candidate.
+		if _, _, _, err := store.Remember(ctx, "user disliked the verbose tone",
+			memory.RememberOpts{Type: memory.Feedback, Importance: memory.Float32Ptr(0.01)}); err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+	}
+
+	protectedStore := newStore(t)
+	seed(protectedStore)
+	cfg := Config{
+		DecayRate: 0.1, MinScore: 0.05,
+		ProtectTypes: []memory.MemoryType{memory.Feedback},
+	}
+	res := Tick(ctx, protectedStore, protectedStore, cfg, "", 1000)
+	if res.Err != nil {
+		t.Fatalf("Tick (protected): %v", res.Err)
+	}
+	if n, _ := protectedStore.Count(ctx); n != 1 {
+		t.Fatalf("protected feedback memory was pruned: count=%d, want 1", n)
+	}
+
+	// Control: without protection, the same memory is pruned (proves it was
+	// genuinely a prune candidate, so the survival above is due to protection).
+	unprotectedStore := newStore(t)
+	seed(unprotectedStore)
+	res = Tick(ctx, unprotectedStore, unprotectedStore,
+		Config{DecayRate: 0.1, MinScore: 0.05}, "", 1000)
+	if res.Err != nil {
+		t.Fatalf("Tick (unprotected): %v", res.Err)
+	}
+	if n, _ := unprotectedStore.Count(ctx); n != 0 {
+		t.Fatalf("unprotected feedback memory survived: count=%d, want 0", n)
+	}
+}
+
 func TestTickTakesStateLock(t *testing.T) {
 	// The tick cycle must hold a flock on <state>.lock so concurrent tickers
 	// (daemon + cron + MCP) serialise instead of double-running jobs.
@@ -413,3 +454,91 @@ func TestTickReflect(t *testing.T) {
 // `houkai maintenance run` process via exec + Setsid, which is neither
 // hermetic nor easily reapable in a unit test. Covered by manual/integration
 // testing instead.
+
+func TestStateHasPurgeFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	want := State{LastPurgeAt: 123.0, TotalPurged: 7}
+	if err := want.Save(path); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got := LoadState(path)
+	if got.LastPurgeAt != 123.0 || got.TotalPurged != 7 {
+		t.Errorf("purge fields round-trip mismatch: %+v", got)
+	}
+}
+
+func TestOldStateFileWithoutPurgeFieldsLoads(t *testing.T) {
+	// Migration: a state file written before the purge fields existed.
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"last_decay_at": 5.0, "total_decayed": 2}`), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := LoadState(path)
+	if got.LastPurgeAt != 0 || got.TotalPurged != 0 {
+		t.Errorf("missing purge fields should default to 0: %+v", got)
+	}
+	if got.LastDecayAt != 5.0 {
+		t.Errorf("existing fields should still load: %+v", got)
+	}
+}
+
+func TestTickPurgesExpiredWhenOverdue(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	store.Remember(ctx, "expired doc", memory.RememberOpts{ExpiresAt: f64(1.0)})
+	store.Remember(ctx, "live doc", memory.RememberOpts{})
+	statePath := filepath.Join(t.TempDir(), "state.json")
+
+	// decay/reflect disabled; purge_every=1 with no history → immediately due.
+	cfg := Config{DecayEvery: -1, ReflectEvery: -1, PurgeEvery: 1}
+	res := Tick(ctx, store, store, cfg, statePath, nowSec())
+	if res.Err != nil {
+		t.Fatalf("Tick: %v", res.Err)
+	}
+	if !res.RanPurge || res.Purged != 1 {
+		t.Fatalf("ranPurge=%v purged=%d, want true/1", res.RanPurge, res.Purged)
+	}
+	if n, _ := store.Count(ctx); n != 1 {
+		t.Fatalf("only the live memory should remain, count=%d", n)
+	}
+	st := LoadState(statePath)
+	if st.LastPurgeAt == 0 || st.TotalPurged != 1 {
+		t.Errorf("purge state not persisted: %+v", st)
+	}
+}
+
+func TestTickSkipsPurgeWhenFresh(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	store.Remember(ctx, "expired doc", memory.RememberOpts{ExpiresAt: f64(1.0)})
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	now := nowSec()
+	(State{LastPurgeAt: now}).Save(statePath)
+
+	cfg := Config{DecayEvery: -1, ReflectEvery: -1, PurgeEvery: 86_400}
+	res := Tick(ctx, store, store, cfg, statePath, now)
+	if res.RanPurge {
+		t.Error("purge should be gated (fresh last_purge_at)")
+	}
+	if n, _ := store.Count(ctx); n != 1 {
+		t.Errorf("gated purge should not delete, count=%d", n)
+	}
+}
+
+func TestTickPurgeDisabled(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	store.Remember(ctx, "expired doc", memory.RememberOpts{ExpiresAt: f64(1.0)})
+	cfg := Config{DecayEvery: -1, ReflectEvery: -1, PurgeEvery: -1}
+	res := Tick(ctx, store, store, cfg, "", nowSec())
+	if res.RanPurge {
+		t.Error("purge_every < 0 must disable the job")
+	}
+	if n, _ := store.Count(ctx); n != 1 {
+		t.Errorf("disabled purge should not delete, count=%d", n)
+	}
+}
+
+func f64(v float64) *float64 { return &v }
+
+func nowSec() float64 { return float64(time.Now().Unix()) }
