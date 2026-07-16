@@ -71,6 +71,36 @@ class TestHttpServer:
         assert got["source"] == "api"
         assert got["tags"] == ["x"]
 
+    def test_remember_many_batch(self, server):
+        status, body = _req(server, "POST", "/memories/batch", {"items": [
+            {"text": "batch alpha", "tags": ["t1"]},
+            {"text": "batch beta", "type": "procedural", "importance": 0.9},
+        ]})
+        assert status == 201
+        assert body["stored"] == 2 and len(body["memories"]) == 2
+        got = {m["text"]: m for m in body["memories"]}
+        assert got["batch alpha"]["tags"] == ["t1"]
+        assert got["batch beta"]["type"] == "procedural"
+        _, health = _req(server, "GET", "/health")
+        assert health["count"] == 2
+
+    def test_remember_many_empty(self, server):
+        status, body = _req(server, "POST", "/memories/batch", {"items": []})
+        assert status == 201 and body["stored"] == 0
+
+    def test_remember_many_rejects_non_object_item(self, server):
+        status, _ = _req(server, "POST", "/memories/batch", {"items": ["bare string"]})
+        assert status == 400
+
+    def test_remember_many_missing_items_is_400(self, server):
+        status, _ = _req(server, "POST", "/memories/batch", {"nope": []})
+        assert status == 400
+
+    def test_remember_many_raise_policy_is_400(self, server):
+        status, _ = _req(server, "POST", "/memories/batch",
+                         {"items": [{"text": "x"}], "on_conflict": "raise"})
+        assert status == 400
+
     def test_recall_get_and_post(self, server):
         _req(server, "POST", "/memories", {"text": "neon authentication flow"})
         _req(server, "POST", "/memories", {"text": "banana bread recipe"})
@@ -138,6 +168,56 @@ class TestHttpServer:
     def test_bad_timestamp_is_400(self, server):
         status, body = _req(server, "GET", "/recall?query=x&since=garbage")
         assert status == 400
+
+
+class TestHttpRecallAdvancedParams:
+    """graph-proximity weight + graph-walk expansion (incl. rerank) must be
+    reachable over POST /recall and /recall_pack."""
+
+    _HUB = "kubernetes ingress controller configuration"
+
+    def _seed_hub(self, server):
+        _, hub = _req(server, "POST", "/memories",
+                      {"text": self._HUB, "type": "procedural"})
+        for i in range(5):
+            _, c = _req(server, "POST", "/memories",
+                        {"text": f"unrelated topic {i} apples oranges pears",
+                         "type": "episodic"})
+            _req(server, "POST", "/links",
+                 {"src_id": hub["id"], "dst_id": c["id"], "rel": "refines"})
+        return hub
+
+    def test_expand_rerank_respects_k(self, server):
+        self._seed_hub(server)
+        status, res = _req(server, "POST", "/recall", {
+            "query": self._HUB, "k": 1, "mode": "hybrid", "min_cosine": 0.99,
+            "expand": {"rels": ["refines"], "cap": 5, "rerank": True},
+        })
+        assert status == 200
+        assert len(res["results"]) <= 1
+
+    def test_expand_legacy_can_exceed_k(self, server):
+        self._seed_hub(server)
+        status, res = _req(server, "POST", "/recall", {
+            "query": self._HUB, "k": 1, "mode": "hybrid", "min_cosine": 0.99,
+            "expand": {"rels": ["refines"], "cap": 5, "rerank": False},
+        })
+        assert status == 200
+        assert len(res["results"]) > 1
+
+    def test_graph_weight_accepted(self, server):
+        _req(server, "POST", "/memories", {"text": "postgres replication tuning"})
+        status, res = _req(server, "POST", "/recall",
+                           {"query": "postgres", "mode": "hybrid", "graph": 0.3})
+        assert status == 200
+        assert isinstance(res["results"], list)
+
+    def test_recall_pack_graph_accepted(self, server):
+        _req(server, "POST", "/memories", {"text": "deploy the api to prod"})
+        status, res = _req(server, "POST", "/recall_pack",
+                           {"query": "deploy", "graph": 0.3, "token_budget": 200})
+        assert status == 200
+        assert "text" in res
 
 
 class TestHttpAuth:

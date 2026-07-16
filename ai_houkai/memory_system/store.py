@@ -19,9 +19,12 @@ import math
 import gzip
 import os
 import re
+import threading
 import time
 import uuid
 import warnings
+from collections import deque
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -124,6 +127,12 @@ class HybridWeights:
     importance:     float = 0.10
     decay_rate:     float = 0.10   # λ — shared with DecayEngine
     polarity_weight: float = 0.05  # additive bonus: +0.05 for polarity=+1, -0.05 for -1
+    # Graph-proximity weight. A candidate's connectedness (via links) to the
+    # other strong hits in the pool lifts its score — a lightweight HippoRAG-
+    # style associative signal. Additive on top of the core signals like
+    # ``polarity_weight``; 0.0 (default) disables the graph channel entirely so
+    # scoring is byte-identical to before. See :meth:`MemoryStore._graph_spread`.
+    graph:          float = 0.0
     # Which timestamp the recency term measures. "created" (default) scores by
     # how recently the fact was *learned* — stable across recalls. "accessed"
     # scores by how recently it was *retrieved*, which `_touch` moves on every
@@ -131,6 +140,9 @@ class HybridWeights:
     recency_basis:  Literal["created", "accessed"] = "created"
 
     def __post_init__(self) -> None:
+        # ``graph`` and ``polarity_weight`` are additive nudges on top of the
+        # core signals, so they are deliberately excluded from this guard: at
+        # least one *core* signal must carry weight.
         total = self.cosine + self.lexical + self.recency + self.importance
         if total <= 0:
             raise ValueError("HybridWeights: at least one weight must be > 0")
@@ -147,6 +159,60 @@ class ExpandSpec:
     # ``score * decay**(h-1)``. 1.0 (default) keeps every expanded node at
     # ``score`` regardless of distance (backward-compatible).
     decay: float = 1.0
+    # When True, expanded neighbours are merged into the candidate pool *before*
+    # the ``min_cosine`` gate, dedup, MMR diversity and the top-``k`` cut, so
+    # they compete for the k slots and can neither inject near-duplicates nor
+    # overflow k. When False (default) they are appended *after* the top-k cut,
+    # unfiltered — the original, backward-compatible behaviour.
+    rerank: bool = False
+
+
+@dataclass(frozen=True)
+class RememberItem:
+    """One entry for :meth:`MemoryStore.remember_many`.
+
+    Mirrors the per-memory arguments of :meth:`MemoryStore.remember`; omitted
+    fields fall back to the same defaults (``importance=None`` → auto-score when
+    an importance function is configured, else ``0.5``).
+    """
+    text:        str
+    type:        MemoryType = "semantic"
+    tags:        tuple[str, ...] = ()
+    importance:  float | None = None
+    source:      str | None = None
+    polarity:    int = 0
+    expires_at:  float | None = None
+    ttl_seconds: float | None = None
+
+
+_REMEMBER_ITEM_FIELDS = (
+    "text", "type", "tags", "importance", "source",
+    "polarity", "expires_at", "ttl_seconds",
+)
+
+
+def _coerce_remember_item(item: "str | RememberItem | Mapping[str, Any]") -> dict[str, Any]:
+    """Normalise one ``remember_many`` entry into ``remember()``-style kwargs.
+
+    Accepts a bare ``str`` (text only), a :class:`RememberItem`, or a mapping of
+    the remember fields (handy for the JSON HTTP / MCP surfaces).
+    """
+    if isinstance(item, str):
+        return {"text": item}
+    if isinstance(item, RememberItem):
+        return {f: getattr(item, f) for f in _REMEMBER_ITEM_FIELDS}
+    if isinstance(item, Mapping):
+        unknown = set(item) - set(_REMEMBER_ITEM_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"unknown remember item field(s): {sorted(unknown)} "
+                f"(allowed: {', '.join(_REMEMBER_ITEM_FIELDS)})")
+        if "text" not in item:
+            raise ValueError("each remember_many item needs a 'text' field")
+        return dict(item)
+    raise TypeError(
+        "remember_many item must be str, RememberItem, or mapping — "
+        f"got {type(item).__name__}")
 
 
 @dataclass
@@ -575,6 +641,9 @@ class MemoryStore:
             path=path, settings=Settings(anonymized_telemetry=False)
         )
         embed_fn = _get_embed_fn(embedding_model)
+        # Kept so diagnostics (readiness / doctor) can actively probe the
+        # embedding backend rather than waiting for the first lazy embed.
+        self._embed_fn = embed_fn
         self.collection = self.client.get_or_create_collection(
             name=collection,
             embedding_function=embed_fn,
@@ -591,8 +660,18 @@ class MemoryStore:
         self._metric_started = time.time()
         self._metric_calls: dict[str, int] = {
             "remember": 0, "recall": 0, "forget": 0, "edit": 0, "supersede": 0,
+            "link": 0, "unlink": 0, "restore": 0, "purge_expired": 0,
+            "export": 0, "import": 0,
         }
         self._metric_recall_latency = {"count": 0, "total_s": 0.0, "max_s": 0.0}
+        # Bounded ring of recent recall latencies (seconds) for percentiles.
+        self._metric_latency_samples: deque[float] = deque(maxlen=1024)
+        # (timestamp, result) of the last ready readiness() probe — see the
+        # cache_ttl arg on readiness(). Guarded by a lock so concurrent callers
+        # (the store is otherwise not thread-safe, but readiness is a natural
+        # target for parallel health probes) can't tear the read-modify-write.
+        self._readiness_cache: tuple[float, dict[str, Any]] | None = None
+        self._readiness_lock = threading.Lock()
 
         self._actor           = actor
         self._journal_enabled = journal_enabled
@@ -627,6 +706,57 @@ class MemoryStore:
             before=before, after=after, meta=meta or {},
         ))
 
+    def _build_memory(
+        self,
+        text: str,
+        type: MemoryType = "semantic",
+        tags: Iterable[str] = (),
+        importance: float | None = None,
+        source: str | None = None,
+        *,
+        polarity: int = 0,
+        expires_at: float | None = None,
+        ttl_seconds: float | None = None,
+    ) -> Memory:
+        """Validate inputs and construct a :class:`Memory` — no store write, no
+        journal, no conflict scan.
+
+        Shared by :meth:`remember` and :meth:`remember_many` so both agree on
+        validation, TTL resolution and importance auto-scoring.
+        """
+        _validate_choice(type, MEMORY_TYPES, "type")
+        if polarity not in (-1, 0, 1):
+            raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
+        # Expiry: absolute epoch (expires_at) or relative (ttl_seconds from now).
+        # 0.0 / None means "never expires". They are mutually exclusive.
+        if expires_at is not None and ttl_seconds is not None:
+            raise ValueError("pass at most one of expires_at, ttl_seconds")
+        if ttl_seconds is not None:
+            if ttl_seconds <= 0:
+                raise ValueError("ttl_seconds must be > 0")
+            expires_at = time.time() + ttl_seconds
+        if expires_at is not None and expires_at < 0:
+            raise ValueError("expires_at must be >= 0")
+        tags = list(tags)
+        _validate_tags(tags)
+        # importance=None → auto-score when an importance_fn is configured,
+        # else keep the historical 0.5 default.
+        if importance is None:
+            if self._importance_fn is not None:
+                importance = self._importance_fn(text, type, list(tags))
+            else:
+                importance = 0.5
+        return Memory(
+            id=str(uuid.uuid4()),
+            text=text.strip(),
+            type=type,
+            tags=list(tags),
+            importance=max(0.0, min(1.0, importance)),
+            source=source,
+            polarity=polarity,
+            expires_at=expires_at or 0.0,
+        )
+
     def remember(
         self,
         text: str,
@@ -641,39 +771,11 @@ class MemoryStore:
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
     ) -> Memory:
-        _validate_choice(type, MEMORY_TYPES, "type")
-        if polarity not in (-1, 0, 1):
-            raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
-        # Expiry: absolute epoch (expires_at) or relative (ttl_seconds from now).
-        # 0.0 / None means "never expires". They are mutually exclusive.
-        if expires_at is not None and ttl_seconds is not None:
-            raise ValueError("pass at most one of expires_at, ttl_seconds")
-        if ttl_seconds is not None:
-            if ttl_seconds <= 0:
-                raise ValueError("ttl_seconds must be > 0")
-            expires_at = time.time() + ttl_seconds
-        if expires_at is not None and expires_at < 0:
-            raise ValueError("expires_at must be >= 0")
         if on_conflict is not None:
             _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
-        tags = list(tags)
-        _validate_tags(tags)
-        # importance=None → auto-score when an importance_fn is configured,
-        # else keep the historical 0.5 default.
-        if importance is None:
-            if self._importance_fn is not None:
-                importance = self._importance_fn(text, type, list(tags))
-            else:
-                importance = 0.5
-        mem = Memory(
-            id=str(uuid.uuid4()),
-            text=text.strip(),
-            type=type,
-            tags=list(tags),
-            importance=max(0.0, min(1.0, importance)),
-            source=source,
-            polarity=polarity,
-            expires_at=expires_at or 0.0,
+        mem = self._build_memory(
+            text, type, tags, importance, source,
+            polarity=polarity, expires_at=expires_at, ttl_seconds=ttl_seconds,
         )
         self.collection.add(
             ids=[mem.id],
@@ -706,6 +808,92 @@ class MemoryStore:
                     raise ConflictError(conflicts)
 
         return mem
+
+    def remember_many(
+        self,
+        items: "Iterable[str | RememberItem | Mapping[str, Any]]",
+        *,
+        batch_size: int = 128,
+        on_conflict: Literal["ignore", "warn", "supersede"] | None = None,
+        contradiction_fn: ConflictFn | None = None,
+    ) -> list[Memory]:
+        """Store many memories with batched embedding.
+
+        Each *item* is a ``str`` (text only), a :class:`RememberItem`, or a
+        mapping of remember()-style fields. Embedding is batched: every
+        ``batch_size`` items are written in ONE ``collection.add``, so N
+        documents cost ``ceil(N / batch_size)`` encode passes instead of N. One
+        journal ``remember`` entry is written per id (so :meth:`undo` stays
+        per-memory); the stored memories are returned in input order.
+
+        Validation is all-or-nothing — a bad item raises before anything is
+        written.
+
+        Conflict handling runs *after* the write, per item, in input order:
+
+        * ``ignore`` — no scan (fastest; the natural choice for bulk loads).
+        * ``warn`` — scan every item, emit one aggregated warning.
+        * ``supersede`` — earlier items win: a later near-duplicate is
+          superseded by the earlier one, and an item already superseded within
+          this call is skipped, so no intra-batch supersede cycles form.
+        * ``raise`` is rejected — partial-batch rollback is ill-defined for a
+          bulk insert; use :meth:`remember` per item if you need it.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        policy = on_conflict if on_conflict is not None else self._conflict_policy
+        _validate_choice(policy, CONFLICT_POLICIES, "on_conflict")
+        if policy == "raise":
+            raise ValueError(
+                "on_conflict='raise' is not supported by remember_many() — "
+                "bulk rollback is ill-defined; use remember() per item")
+
+        # Build + validate every item first, so a bad item aborts before any
+        # write (all-or-nothing on validation).
+        mems = [self._build_memory(**_coerce_remember_item(it)) for it in items]
+        if not mems:
+            return []
+
+        for start in range(0, len(mems), batch_size):
+            chunk = mems[start:start + batch_size]
+            self.collection.add(
+                ids=[m.id for m in chunk],
+                documents=[m.text for m in chunk],
+                metadatas=[m.to_metadata() for m in chunk],
+            )
+            for m in chunk:
+                self._metric_calls["remember"] += 1
+                self._journal("remember", m.id, after=m.to_dict())
+
+        if policy != "ignore":
+            cfn = contradiction_fn or self._contradiction_fn
+            flagged: list[tuple[Memory, list[Conflict]]] = []
+            superseded: set[str] = set()
+            for m in mems:
+                if m.id in superseded:
+                    continue
+                conflicts = self._check_conflicts(m, self._conflict_threshold, cfn)
+                if not conflicts:
+                    continue
+                if policy == "warn":
+                    flagged.append((m, conflicts))
+                elif policy == "supersede":
+                    for c in conflicts:
+                        if c.b.id in superseded:
+                            continue
+                        self.supersede(old_id=c.b.id, new_id=m.id)
+                        superseded.add(c.b.id)
+            if policy == "warn" and flagged:
+                detail = "; ".join(
+                    f"{m.id!r}: " + ", ".join(f"{c.kind}({c.b.id!r})" for c in cs)
+                    for m, cs in flagged)
+                warnings.warn(
+                    f"remember_many(): {len(flagged)} item(s) with conflict(s): {detail}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        return mems
 
     def forget(self, memory_id: str) -> bool:
         before = self._get_by_id(memory_id)
@@ -815,6 +1003,7 @@ class MemoryStore:
         auditable and individually undoable. ``dry_run`` reports without
         deleting.
         """
+        self._metric_calls["purge_expired"] += 1
         t = now if now is not None else time.time()
         expired = [m for m in self._get_all_memories()
                    if m.expires_at and m.expires_at <= t]
@@ -946,17 +1135,51 @@ class MemoryStore:
         if reranker is not None and scored:
             scored = self._apply_reranker(reranker, query, scored, expl)
 
+        emb_by_id = self._emb_map(res) if need_emb else {}
+
+        # Graph expansion with rerank=True: merge expanded neighbours into the
+        # candidate pool BEFORE selection so they pass the same min_cosine gate,
+        # dedup, MMR diversity and top-k cut as primary hits — rather than being
+        # appended after the cut (rerank=False), where they could inject
+        # near-duplicates or overflow k.
+        if expand is not None and expand.cap > 0 and expand.rerank:
+            # Pre-seed the visited set with the WHOLE scored pool (not just the
+            # top-k frontier) so expansion never re-reaches — and clobbers the
+            # explain entry of — a candidate that is already scored below k.
+            pool_ids = {mem.id for mem, _ in scored}
+            extra = self._collect_expansion(
+                scored[:k], expand, include_superseded, expl, seen_ids=pool_ids)
+            if extra:
+                # Expanded nodes carry an absolute hop score (~spec.score) tuned
+                # to the weighted [0,1] scale; RRF scores live near 1/rrf_k, so
+                # a raw 0.70 would bury every primary hit. Express the hop score
+                # as a fraction of the strongest primary so it competes on the
+                # pool's own scale regardless of fusion mode.
+                top = max((s for _, s in scored), default=1.0)
+                extra = [(m, min(1.0, max(0.0, hs)) * top) for m, hs in extra]
+                if need_emb:
+                    # MMR/dedup need embeddings; fetch the expanded nodes' stored
+                    # vectors and drop any we can't resolve so they cannot slip
+                    # past the dedup gate with a free (0.0) novelty penalty.
+                    fetched = self._emb_for_ids([m.id for m, _ in extra])
+                    emb_by_id.update(fetched)
+                    extra = [(m, s) for m, s in extra if m.id in emb_by_id]
+                if extra:
+                    scored = scored + extra
+                    scored.sort(key=lambda x: x[1], reverse=True)
+
         if need_emb:
             out = self._mmr_select(
-                scored, k, self._emb_map(res), diversity, dedup_threshold)
+                scored, k, emb_by_id, diversity, dedup_threshold)
         else:
             out = scored[:k]
 
         if touch and out:
             self._touch_many([mem for mem, _ in out])
 
-        # Expand via outgoing links
-        if expand is not None and expand.cap > 0:
+        # Expand via outgoing links (rerank=False): appended after the top-k
+        # cut, unfiltered — the backward-compatible default.
+        if expand is not None and expand.cap > 0 and not expand.rerank:
             out = self._expand_links(out, expand, include_superseded, expl)
 
         self._record_recall_latency(time.perf_counter() - t0)
@@ -1179,12 +1402,68 @@ class MemoryStore:
     def count(self) -> int:
         return self.collection.count()
 
+    def probe_embedding(
+        self, text: str = "ai-houkai health probe"
+    ) -> dict[str, Any]:
+        """Actively embed a short probe string to confirm the embedding backend
+        is reachable, and report its output dimension + latency.
+
+        The embedding function is otherwise only invoked lazily on the first
+        real write/recall, so a misconfigured model or unreachable provider
+        would surface much later; this forces the check now.
+        """
+        t0 = time.perf_counter()
+        try:
+            vec = self._embed_fn([text])[0]
+        except Exception as exc:  # noqa: BLE001 — surface any backend failure
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "ok": True,
+            "dim": len(vec),
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+        }
+
+    def readiness(self, *, cache_ttl: float = 0.0) -> dict[str, Any]:
+        """Readiness probe: is the store reachable and the embedder working?
+
+        Returns ``{"ready": bool, "checks": {...}}`` where each check carries its
+        own ``ok`` flag. Unlike a liveness check this exercises the real
+        dependencies (backend count + an actual embed), so orchestrators can
+        distinguish "process up" from "able to serve requests".
+
+        ``cache_ttl`` (seconds) memoises a **ready** result so a frequently
+        polled readiness endpoint does not issue one embedding call per request
+        (which, for a billed/rate-limited remote embedder, is a cost/DoS
+        hazard). Not-ready results are never cached, so recovery is detected on
+        the very next probe.
+        """
+        if cache_ttl > 0:
+            with self._readiness_lock:
+                cached = self._readiness_cache
+            if cached is not None:
+                ts, result = cached
+                if result.get("ready") and (time.time() - ts) < cache_ttl:
+                    return result
+        checks: dict[str, Any] = {}
+        try:
+            checks["store"] = {"ok": True, "count": self.count()}
+        except Exception as exc:  # noqa: BLE001
+            checks["store"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        checks["embedder"] = self.probe_embedding()
+        ready = all(bool(c.get("ok")) for c in checks.values())
+        result = {"ready": ready, "checks": checks}
+        if cache_ttl > 0 and ready:
+            with self._readiness_lock:
+                self._readiness_cache = (time.time(), result)
+        return result
+
     def _record_recall_latency(self, dt: float) -> None:
         m = self._metric_recall_latency
         m["count"] += 1
         m["total_s"] += dt
         if dt > m["max_s"]:
             m["max_s"] = dt
+        self._metric_latency_samples.append(dt)
 
     def metrics(self) -> dict[str, Any]:
         """Process-local runtime metrics since this store was created.
@@ -1195,6 +1474,15 @@ class MemoryStore:
         """
         lat = self._metric_recall_latency
         n = lat["count"]
+        samples = sorted(self._metric_latency_samples)
+
+        def _pct(p: float) -> float:
+            if not samples:
+                return 0.0
+            idx = int(round((p / 100.0) * (len(samples) - 1)))
+            idx = min(max(idx, 0), len(samples) - 1)
+            return round(samples[idx] * 1000.0, 3)
+
         return {
             "uptime_seconds": round(time.time() - self._metric_started, 3),
             "count": self.count(),
@@ -1203,6 +1491,7 @@ class MemoryStore:
                 "count": n,
                 "avg": round(lat["total_s"] / n * 1000.0, 3) if n else 0.0,
                 "max": round(lat["max_s"] * 1000.0, 3),
+                "p50": _pct(50), "p95": _pct(95), "p99": _pct(99),
             },
         }
 
@@ -1407,12 +1696,14 @@ class MemoryStore:
             before=before, after=mem.to_dict(),
             meta={"superseder_id": superseder_id},
         )
+        self._metric_calls["restore"] += 1
         return True
 
     def link(self, src_id: str, dst_id: str, rel: str = "related") -> None:
         """Add a directed link src → dst with the given relation (idempotent)."""
         added = self._link_raw(src_id, dst_id, rel)
         if added:
+            self._metric_calls["link"] += 1
             self._journal(
                 "link", src_id,
                 meta={"src_id": src_id, "dst_id": dst_id, "rel": rel},
@@ -1442,6 +1733,7 @@ class MemoryStore:
         Returns number of links removed."""
         removed_rels = self._unlink_raw(src_id, dst_id, rel)
         if removed_rels:
+            self._metric_calls["unlink"] += 1
             # removed_rels is what makes the entry undoable: a rel=None
             # unlink may drop several differently-typed edges at once.
             self._journal(
@@ -1585,6 +1877,7 @@ class MemoryStore:
         ``created_at`` ascending order so two exports of the same store
         produce byte-identical files modulo the header timestamp.
         """
+        self._metric_calls["export"] += 1
         types_set = set(types) if types else None
         tags_set  = set(tags)  if tags  else None
         out_path = Path(path)
@@ -1681,6 +1974,7 @@ class MemoryStore:
         if not in_path.exists():
             raise FileNotFoundError(in_path)
 
+        self._metric_calls["import"] += 1
         summary = ImportSummary()
         collisions: list[tuple[str, str]] = []
 
@@ -1995,6 +2289,19 @@ class MemoryStore:
         embs = raw[0]
         return {ids[i]: list(embs[i]) for i in range(len(ids)) if i < len(embs)}
 
+    def _emb_for_ids(self, ids: list[str]) -> dict[str, list[float]]:
+        """Fetch stored embeddings for specific ids — used to run MMR / dedup
+        over graph-expanded nodes that were not part of the query result and so
+        carry no embedding from it."""
+        if not ids:
+            return {}
+        res = self.collection.get(ids=ids, include=["embeddings"])
+        got = res.get("ids") or []
+        embs = res.get("embeddings")
+        if embs is None:
+            return {}
+        return {got[i]: list(embs[i]) for i in range(len(got)) if i < len(embs)}
+
     def _mmr_select(
         self,
         scored: list[tuple[Memory, float]],
@@ -2240,6 +2547,25 @@ class MemoryStore:
                 }
             candidates.append((mem, score))
 
+        # Graph-proximity term: spread activation from the candidates' base
+        # relevance over the intra-pool link graph, then add ``graph`` × the
+        # normalised spread. Skipped entirely (byte-identical) when graph == 0
+        # or the pool has no internal edges.
+        if w.graph > 0:
+            spread = self._graph_spread(candidates)
+            if spread:
+                rescored: list[tuple[Memory, float]] = []
+                for mem, score in candidates:
+                    g = spread.get(mem.id, 0.0)
+                    new_score = score + w.graph * g
+                    if explanations is not None and mem.id in explanations:
+                        e = explanations[mem.id]
+                        e["graph"] = round(g, 4)
+                        e["weights"]["graph"] = round(w.graph, 4)
+                        e["score"] = round(new_score, 4)
+                    rescored.append((mem, new_score))
+                candidates = rescored
+
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates
 
@@ -2292,10 +2618,20 @@ class MemoryStore:
             return []
 
         n = len(rows)
+        # Graph-proximity signal (rank-transformed like the others so it stays
+        # scale-free): spread activation over the intra-pool link graph seeded
+        # by cosine relevance. Only added when graph > 0 and the pool actually
+        # has internal edges.
         signals = [
             ("cosine", w.cosine), ("lexical", w.lexical),
             ("recency", w.recency), ("importance", w.importance),
         ]
+        if w.graph > 0:
+            spread = self._graph_spread([(r["mem"], r["cosine"]) for r in rows])
+            for r in rows:
+                r["graph"] = spread.get(r["mem"].id, 0.0)
+            if any(r["graph"] > 0 for r in rows):
+                signals.append(("graph", w.graph))
         ranks: dict[str, list[int]] = {}
         for name, wt in signals:
             if wt <= 0:
@@ -2328,16 +2664,28 @@ class MemoryStore:
         out.sort(key=lambda x: x[1], reverse=True)
         return out
 
-    def _expand_links(
+    def _collect_expansion(
         self,
         out: list[tuple[Memory, float]],
         spec: ExpandSpec,
         include_superseded: bool,
         explanations: dict | None = None,
+        *,
+        seen_ids: set[str] | None = None,
     ) -> list[tuple[Memory, float]]:
         """Breadth-first graph expansion honouring ``spec.depth`` (multi-hop) with
-        a per-hop ``spec.decay`` applied to the assigned ``spec.score``."""
-        seen = {m.id for m, _ in out}
+        a per-hop ``spec.decay`` applied to ``spec.score``. Returns only the
+        newly-reached ``(memory, score)`` neighbours (not concatenated with
+        *out*), so the caller decides whether to append them (``rerank=False``)
+        or merge them into the scoring pool (``rerank=True``).
+
+        ``seen_ids`` pre-populates the visited set: nodes in it are never
+        re-reached (so their existing explain entries are left intact). The BFS
+        still fans out from *out* — pass a superset of *out* to expand from the
+        top-k while shielding the rest of an already-scored pool.
+        """
+        seen = set(seen_ids) if seen_ids is not None else set()
+        seen |= {m.id for m, _ in out}
         extra: list[tuple[Memory, float]] = []
         added = 0
         frontier = [m.id for m, _ in out]
@@ -2374,4 +2722,74 @@ class MemoryStore:
                     if added >= spec.cap:
                         break
             frontier = next_frontier
-        return out + extra
+        return extra
+
+    def _expand_links(
+        self,
+        out: list[tuple[Memory, float]],
+        spec: ExpandSpec,
+        include_superseded: bool,
+        explanations: dict | None = None,
+    ) -> list[tuple[Memory, float]]:
+        """Append graph-expanded neighbours after the top-k cut (``rerank=False``)."""
+        return out + self._collect_expansion(
+            out, spec, include_superseded, explanations)
+
+    def _graph_spread(
+        self,
+        scored: list[tuple[Memory, float]],
+        *,
+        damping: float = 0.5,
+        iters: int = 3,
+    ) -> dict[str, float]:
+        """Personalised-PageRank-lite over the links *within* the candidate pool.
+
+        Seeds activation from each candidate's (min-max normalised) base
+        relevance and spreads it across intra-pool link edges — treated as
+        undirected, so both a memory's outgoing links and their reverse are
+        followed. Returns ``{id: spread}`` min-max normalised to ``[0, 1]``, or
+        ``{}`` when the pool has no internal edges (letting the caller skip the
+        graph term). Restricting the walk to the pool keeps it O(pool·links)
+        with no full-store scan and no per-node :meth:`neighbors` call.
+        """
+        n = len(scored)
+        if n == 0:
+            return {}
+        idx = {mem.id: i for i, (mem, _) in enumerate(scored)}
+        vals = [s for _, s in scored]
+        lo, hi = min(vals), max(vals)
+        span = hi - lo
+        seed = [((v - lo) / span if span > 1e-12 else 1.0) for v in vals]
+        ssum = sum(seed) or 1.0
+        seed = [s / ssum for s in seed]
+
+        adj: list[set[int]] = [set() for _ in range(n)]
+        for mem, _ in scored:
+            i = idx[mem.id]
+            for lnk in mem.links:
+                j = idx.get(lnk.to)
+                if j is not None and j != i:
+                    adj[i].add(j)
+                    adj[j].add(i)
+        if not any(adj):
+            return {}
+
+        activation = list(seed)
+        for _ in range(max(1, iters)):
+            nxt = [(1.0 - damping) * seed[i] for i in range(n)]
+            for i in range(n):
+                deg = len(adj[i])
+                if deg == 0:
+                    # Isolated node: keep its own mass (restart to itself).
+                    nxt[i] += damping * activation[i]
+                    continue
+                share = damping * activation[i] / deg
+                for j in adj[i]:
+                    nxt[j] += share
+            activation = nxt
+
+        lo2, hi2 = min(activation), max(activation)
+        span2 = hi2 - lo2
+        if span2 <= 1e-12:
+            return {}
+        return {scored[i][0].id: (activation[i] - lo2) / span2 for i in range(n)}

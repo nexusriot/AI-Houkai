@@ -4,8 +4,9 @@ Run with:
     ai-houkai-mcp
     # or: python -m ai_houkai.mcp_server.server
 
-Tools exposed (22):
+Tools exposed (23):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?, expires_at?, ttl_seconds?)
+    remember_many(items, batch_size?, on_conflict?)
     edit(memory_id, text?, type?, tags?, importance?, polarity?, source?, clear_source?, expires_at?)
     recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?, include_superseded?, include_expired?, explain?)
     recall_pack(query, token_budget?, type?, tag?, min_importance?, source?, since?, until?, mode?, max_items?, compress?, compress_threshold?, compress_min_group?)
@@ -123,6 +124,32 @@ def remember(
         }
     return {"id": mem.id, "stored": True, "importance": mem.importance,
             "expires_at": mem.expires_at or None}
+
+
+@mcp.tool()
+def remember_many(
+    items: list[dict[str, Any]],
+    batch_size: int = 128,
+    on_conflict: str | None = None,
+) -> dict[str, Any]:
+    """Store many memories in one batched, embedding-efficient call.
+    items: a list of objects, each with a required "text" plus optional "type",
+    "tags", "importance", "source", "polarity", "expires_at", "ttl_seconds"
+    (the same fields as remember). Embedding is batched, so N items cost
+    ceil(N / batch_size) encode passes instead of N.
+    on_conflict: ignore | warn | supersede (default: store policy). "raise" is
+    not supported in bulk — use remember per item.
+    Returns {stored, ids}.
+    """
+    try:
+        mems = get_store().remember_many(
+            items,
+            batch_size=batch_size,
+            on_conflict=on_conflict,  # type: ignore[arg-type]
+        )
+    except (ValueError, TypeError) as e:
+        return {"stored": 0, "error": str(e)}
+    return {"stored": len(mems), "ids": [m.id for m in mems]}
 
 
 @mcp.tool()

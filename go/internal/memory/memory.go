@@ -66,6 +66,12 @@ type HybridWeights struct {
 	// PolarityWeight is an additive bonus of +weight for polarity=+1 and
 	// -weight for polarity=-1 (0 disables the nudge).
 	PolarityWeight float32
+	// Graph is the graph-proximity weight: a candidate's connectedness (via
+	// links) to the other strong hits in the pool lifts its score — a
+	// lightweight HippoRAG-style associative signal. Additive on top of the
+	// core signals like PolarityWeight; 0 (default) disables the graph channel
+	// so scoring is byte-identical to before. See graphSpread.
+	Graph float32
 	// RecencyBasis selects which timestamp the recency term measures:
 	// "created" (default) scores by how recently the fact was learned — stable
 	// across recalls; "accessed" scores by how recently it was retrieved
@@ -89,6 +95,13 @@ type ExpandSpec struct {
 	// neighbour is scored Score*Decay^(h-1). 0 or 1 keeps every expanded node
 	// at Score regardless of distance (backward-compatible).
 	Decay float32
+	// Rerank, when true, merges expanded neighbours into the candidate pool
+	// before dedup, MMR diversity and the top-k cut, so they compete for the k
+	// slots and can neither inject near-duplicates nor overflow k. The
+	// min_cosine gate does not apply to them — they are graph-justified, not
+	// cosine-justified. When false (default) they are appended AFTER the top-k
+	// cut, unfiltered — the original, backward-compatible behaviour.
+	Rerank bool
 }
 
 type ConflictKind string

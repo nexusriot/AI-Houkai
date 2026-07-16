@@ -1,9 +1,9 @@
 # AI-Houkai — Architecture & Design
 
 > This document covers the **Python** implementation (`ai_houkai/`). The Go
-> port under `go/` has the same feature surface (22 MCP tools, identical
+> port under `go/` has the same feature surface (23 MCP tools, identical
 > `.ahkai` format and journal line format) but its own internals — see
-> [go/DESIGN.md](go/DESIGN.md).
+> [go/DESIGN.md](../go/DESIGN.md).
 
 ## Table of Contents
 
@@ -132,7 +132,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 22 tools
+│   └── server.py                 FastMCP server — 23 tools
 ├── http_server/
 │   ├── __init__.py
 │   └── server.py                 stdlib JSON HTTP/REST server (houkai serve)
@@ -145,7 +145,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── commands/
 │       ├── remember.py           houkai remember
 │       ├── recall.py             houkai recall
-│       ├── pack.py               houkai pack
+│       ├── pack.py               houkai pack / auto-context
 │       ├── list_cmd.py           houkai list
 │       ├── show.py               houkai show
 │       ├── forget.py             houkai forget
@@ -153,14 +153,17 @@ ai_houkai/                        pip package name: ai-houkai
 │       ├── edit.py               houkai edit / tag / bump
 │       ├── link.py               houkai link / unlink / neighbors / graph
 │       ├── conflicts.py          houkai conflicts / supersede / restore
-│       ├── decay.py              houkai prune  (wraps DecayEngine)
+│       ├── decay.py              houkai prune / purge  (DecayEngine + TTL)
 │       ├── reflect.py            houkai reflect (wraps ReflectionEngine)
 │       ├── maintenance.py        houkai maintenance tick/run/start/stop/status
 │       ├── journal.py            houkai journal tail/show/undo
 │       ├── io.py                 houkai export / import / info / backup
 │       ├── ingest.py             houkai ingest
 │       ├── serve.py              houkai serve  (HTTP/REST front-end)
-│       └── stats.py              houkai stats
+│       ├── stats.py              houkai stats
+│       ├── doctor.py             houkai doctor  (diagnostics / readiness)
+│       ├── tui_cmd.py            houkai tui  (Textual browser)
+│       └── collections.py        houkai collections (group)
 └── installers/
     ├── __init__.py               re-exports ClaudeCodeInstaller, CursorInstaller, OpenCodeInstaller
     ├── common.py                 shared command resolver, JSON patcher, verify_server, memory guide
@@ -441,7 +444,7 @@ of ≥ `compress_min_group` (default `2`) members is folded into a single
 `- (compressed)` summary line that is packed if it fits the remaining budget,
 surfaced separately as `compressed_groups`.
 
-![recall_pack greedy token-budget packing, default vs compress=True](docs/resources/recall_pack_budget.png)
+![recall_pack greedy token-budget packing, default vs compress=True](resources/recall_pack_budget.png)
 
 *Greedy fit to the default `token_budget = 800`: items are admitted in rank
 order until the budget is exhausted; an item too large for the remaining space
@@ -480,13 +483,13 @@ reinforcement = 1 + frequency_weight × ln(1 + access_count)
 | `protect_types` | `("procedural",)` | Types immune to pruning |
 | `frequency_weight` | `0.0` | Recall reinforcement strength (0 = off) |
 
-![Exponential decay curves for importance 0.90/0.50/0.30 against the 0.05 prune line](docs/resources/decay_curves.png)
+![Exponential decay curves for importance 0.90/0.50/0.30 against the 0.05 prune line](resources/decay_curves.png)
 
 *With λ = 0.1 a memory crosses the `min_score = 0.05` prune line at ~29 days
 (importance 0.90), ~23 days (0.50), or ~18 days (0.30); the dotted line marks
 the ≈6.9-day half-life.*
 
-![Decay survival region over importance × idle days](docs/resources/decay_heatmap.png)
+![Decay survival region over importance × idle days](resources/decay_heatmap.png)
 
 *The same score as a 2-D field — everything above the red `0.05` contour is
 retained, everything below is pruned.*
@@ -504,7 +507,7 @@ then exceed `importance`; `min_score` is compared against the reinforced
 value. Configurable via `[maintenance.decay].frequency_weight`,
 `houkai prune --frequency-weight`, and the `MaintenanceScheduler`.
 
-![Reinforcement multiplier and the extra survival days recalls buy](docs/resources/reinforcement.png)
+![Reinforcement multiplier and the extra survival days recalls buy](resources/reinforcement.png)
 
 *The multiplier grows with `ln(1 + access_count)`, so each extra recall resists
 decay a little less than the last; the right panel converts that into days of
@@ -529,12 +532,12 @@ Score examples with λ=0.1 (no reinforcement, `frequency_weight=0`):
 | 0.1 | ~7 days | Fast-changing environments |
 | 0.2 | ~3.5 days | Ephemeral session contexts |
 
-![Decay curves for λ = 0.05/0.10/0.20 at importance 0.50](docs/resources/halflife.png)
+![Decay curves for λ = 0.05/0.10/0.20 at importance 0.50](resources/halflife.png)
 
 *Turning λ up steepens the forgetting curve: 0.05 → ~14-day half-life,
 0.10 → ~7, 0.20 → ~3.5.*
 
-![Half-life as a function of decay_rate, t½ = ln2/λ](docs/resources/halflife_vs_lambda.png)
+![Half-life as a function of decay_rate, t½ = ln2/λ](resources/halflife_vs_lambda.png)
 
 *Half-life is `ln(2)/λ`, so it falls off hyperbolically as λ rises — the three
 marked points are the defaults from the table above.*
@@ -689,13 +692,14 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 ## 8. MCP Server
 
-`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose twenty-two tools:
+`ai_houkai/mcp_server/server.py` uses **FastMCP** to expose twenty-three tools:
 
 **Core tools**
 
 | Tool | Key parameters | Returns |
 |---|---|---|
 | `remember` | `text`, `type?`, `tags?`, `importance?`, `source?`, `on_conflict?`, `polarity?`, `expires_at?`, `ttl_seconds?` | `{id, stored, importance, expires_at}` or `{stored:false, conflicts:[…]}` |
+| `remember_many` | `items` (each `{text, type?, tags?, importance?, source?, polarity?, expires_at?, ttl_seconds?}`), `batch_size?`, `on_conflict?` | `{stored, ids}` — batched bulk write (`ceil(N/batch)` encodes); `on_conflict="raise"` unsupported |
 | `edit` | `memory_id`, `text?`, `type?`, `tags?`, `importance?`, `polarity?`, `source?`, `expires_at?` | `{ok, id, text, type, tags, importance, polarity, source, expires_at}` or `{ok:false, error}` — in-place, journaled, undoable |
 | `recall` | `query`, `k?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `overfetch?`, `include_superseded?`, `include_expired?`, `explain?` | `list[{id,text,type,tags,importance,score,created_at,superseded_by,expires_at,explain?}]` |
 | `recall_pack` | `query`, `token_budget?`, `type?`, `tag?`, `min_importance?`, `source?`, `since?`, `until?`, `mode?`, `max_items?`, `include_superseded?`, `compress?`, `compress_threshold?`, `compress_min_group?` | `{text, used_tokens, budget, truncated, items:[{id,text,type,tags,importance,score,tokens}], compressed_groups:[{ids,text,tokens,count}]}` |
@@ -1006,13 +1010,14 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 751 tests across 31 files
+### 831 tests across 34 files
 
 | File | Tests | What it covers |
 |---|---|---|
 | `test_maintenance.py` | 74 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating, **TTL purge job** (gating, state persistence, disabled) |
-| `test_http_server.py` | 56 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain` |
+| `test_http_server.py` | 65 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain`, POST-`/recall` advanced knobs (`graph` weight + `expand` rerank gating), and `POST /memories/batch` bulk write (`remember_many`) |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
+| `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
 | `test_pack.py` | 54 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
 | `test_validation.py` | 44 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
@@ -1020,14 +1025,15 @@ LLM API  ──►  assistant reply to user
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_reflection.py` | 24 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources, polarity-cluster separation |
-| `test_summarizers.py` | 22 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
+| `test_async_store.py` | 24 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose |
+| `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_journal.py` | 22 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
 | `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
-| `test_async_store.py` | 22 | `AsyncMemoryStore`: coroutine API parity with sync store, executor lifecycle, aclose |
 | `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
 | `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
 | `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
-| `test_mcp_server.py` | 19 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain` |
+| `test_remember_many.py` | 20 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
+| `test_mcp_server.py` | 22 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
 | `test_export_import.py` | 17 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
 | `test_tui.py` | 15 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search), parallel-link row collapse |
@@ -1035,11 +1041,12 @@ LLM API  ──►  assistant reply to user
 | `test_installers.py` | 14 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
+| `test_doctor.py` | 11 | **Diagnostics**: `probe_embedding`/`readiness` (incl. embedder-failure, cache TTL, no-cache-on-failure), `GET /ready` (200/503, auth-exempt, sanitized body), `houkai doctor` CLI (text + `--json`) |
 | `test_history.py` | 10 | **History / point-in-time**: `history()` timeline (incl. link/supersede counterparts), `state_at` / `get_at` replay, nuke reset, link-delta replay |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
-| `test_dispatch.py` | 8 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
+| `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 | `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
-| `test_metrics.py` | 5 | **Runtime metrics**: op counters, recall-latency recording, empty-recall counting, backend count |
+| `test_metrics.py` | 7 | **Runtime metrics**: op counters (incl. link/unlink/restore/purge mutators), recall-latency recording + p50/p95/p99 percentiles, empty-recall counting, backend count |
 | `test_fd_hygiene.py` | 1 | ChromaDB file-descriptor reclamation across many store open/close cycles |
 
 ### Test isolation strategy
@@ -1186,8 +1193,9 @@ final = α·cosine + β·BM25_local + γ·recency + δ·importance + ζ·polarit
 | γ recency         | 0.15 |
 | δ importance      | 0.10 |
 | ζ polarity_weight | 0.05 |
+| η graph           | 0.00 |
 
-![Hybrid blend weights and a worked candidate ranking](docs/resources/hybrid_weights.png)
+![Hybrid blend weights and a worked candidate ranking](resources/hybrid_weights.png)
 
 *Cosine dominates at 0.55; the worked example shows how the additive blend
 ranks an exact-and-fresh hit (A, 0.95) above a strong keyword-only match
@@ -1210,10 +1218,43 @@ because every recall hit `_touch`-bumps `last_accessed`.
 **BM25 is computed locally** over the cosine over-fetch pool only — no
 second index, O(1) additional storage.
 
-![BM25 term-frequency saturation for k1 = 1.0/1.5/2.5](docs/resources/bm25_saturation.png)
+![BM25 term-frequency saturation for k1 = 1.0/1.5/2.5](resources/bm25_saturation.png)
 
 *BM25's `k1 = 1.5, b = 0.75` saturate term frequency: the 10th occurrence of a
 term adds far less than the 1st, unlike a linear tf count.*
+
+#### Graph-proximity fusion (`η graph`)
+
+Off by default (`graph = 0.0`, a byte-for-byte no-op). When set, a candidate's
+**connectedness to the other strong hits in the pool** lifts its score — a
+lightweight, HippoRAG-style associative signal. `_graph_spread` runs
+personalised-PageRank-lite (`damping = 0.5`, 3 iterations) over the links
+*within the candidate pool only*, treated as **undirected** (so both a memory's
+outgoing links and their reverse are followed), seeded by each candidate's
+min-max-normalised base relevance. The spread is min-max normalised to `[0, 1]`
+and folded in per fusion mode: an additive `η · spread` term for the weighted
+blend, and a rank-transformed extra signal for RRF (so it stays scale-free).
+Restricting the walk to the pool keeps it `O(pool · links)` — no full-store scan
+and no per-node `neighbors()` call. Returns nothing (and the term is skipped)
+when the pool has no internal edges.
+
+> **Scope.** Like the other `HybridWeights` terms, `graph` only takes effect in
+> `mode="hybrid"` — a default `semantic` recall ignores custom weights. And both
+> `graph` and `ExpandSpec.rerank` are currently reachable only through the
+> `recall(weights=…, expand=…)` **library API** (Python and Go), not the CLI,
+> HTTP, or MCP surface — exposing the knobs there is a Roadmap follow-up.
+
+#### Gated graph expansion (`ExpandSpec.rerank`)
+
+Graph-walk expansion (below) normally *appends* neighbours after the top-`k`
+cut, where they bypass the relevance floor, dedup and diversity selection and
+can overflow `k`. Setting `ExpandSpec.rerank=True` instead **merges** the
+expanded neighbours into the candidate pool *before* `min_cosine` / dedup / MMR
+/ top-`k`, so they compete for the `k` slots on equal footing and can neither
+inject near-duplicates nor exceed `k`. Expanded nodes carry no query-embedding,
+so they are re-fetched/re-embedded for MMR/dedup; `min_cosine` (a query-relevance
+gate) does not apply to them since they are graph-justified, not cosine-justified.
+`rerank=False` (default) preserves the original append-after behaviour.
 
 #### Fusion modes
 
@@ -1228,7 +1269,7 @@ the BM25-vs-cosine magnitude mismatch), but its scores are **pool-relative**
 That is why `auto_context_pack` (which fans out over several different query
 pools and dedupes by score) deliberately does **not** expose `fusion="rrf"`.
 
-![Reciprocal Rank Fusion contributions per signal](docs/resources/rrf_fusion.png)
+![Reciprocal Rank Fusion contributions per signal](resources/rrf_fusion.png)
 
 *RRF sums `weight / (60 + rank)` across signals. Scores are tiny by design —
 only the relative order matters — which is exactly what makes it immune to the
@@ -1252,7 +1293,7 @@ BM25-vs-cosine magnitude mismatch the weighted blend has to normalise around.*
 - `explain=True` returns `(Memory, score, breakdown)` triples.
 - `diversity` / `dedup_threshold` also apply in `mode="semantic"`.
 
-![MMR relevance-versus-novelty trade-off and the crossover λ](docs/resources/mmr_tradeoff.png)
+![MMR relevance-versus-novelty trade-off and the crossover λ](resources/mmr_tradeoff.png)
 
 *MMR's `λ · relevance − (1 − λ) · redundancy`: below the crossover λ a novel,
 slightly-less-relevant item beats a near-duplicate of something already
@@ -1290,6 +1331,8 @@ store.recall(query, k, min_cosine=0.2)                   # absolute relevance ga
 store.recall(query, k, touch=False, explain=True)        # read-only + breakdowns
 store.recall(query, k, reranker=my_cross_encoder)        # second-stage rerank
 store.recall(query, k, include_expired=True)             # keep TTL-expired hits
+store.recall(query, k, mode="hybrid",
+             weights=HybridWeights(graph=0.15))          # graph-proximity fusion
 
 # Graph-walk expansion after scoring (multi-hop BFS)
 store.recall(query, k,
@@ -1297,6 +1340,10 @@ store.recall(query, k,
                                depth=2, cap=5, score=0.70, decay=0.8))
 #   hop-h neighbour scored score·decay**(h-1); decay=1.0 (default) = old
 #   distance-independent behaviour; depth>1 now does a real BFS over links.
+store.recall(query, k,
+             expand=ExpandSpec(rels=("refines",), cap=5, rerank=True))
+#   rerank=True merges expanded nodes into the pool BEFORE dedup/MMR/top-k
+#   (they compete for the k slots); rerank=False (default) appends after.
 
 # Metadata filters — provenance + creation-time window
 store.recall(query, k, source="git", since=ts_a, until=ts_b)
@@ -1308,8 +1355,8 @@ The `explain=True` breakdown shape **varies by scoring path**:
 
 | Path | Breakdown keys |
 |---|---|
-| weighted hybrid | `cosine`, `lexical`, `recency`, `importance`, `polarity`, `weights`, `score` |
-| `fusion="rrf"`  | `signals` (per-signal `{rank, contribution}`), `polarity`, `rrf_k`, `score` |
+| weighted hybrid | `cosine`, `lexical`, `recency`, `importance`, `polarity`, `weights`, `score` (plus `graph` + `weights.graph` when `graph > 0`) |
+| `fusion="rrf"`  | `signals` (per-signal `{rank, contribution}`, incl. `graph` when `graph > 0`), `polarity`, `rrf_k`, `score` |
 | semantic        | `cosine`, `polarity`, `score` |
 | graph-expanded  | `{source:"graph_expansion", rel, hop, score}` |
 
@@ -1406,7 +1453,7 @@ relative span like `"7d"` / `"24h"` (→ now minus that span).
 
 ## 15. Extension Points
 
-> The designs in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/) are now implemented (§12–14).
+> The designs in [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md) are now implemented (§12–14).
 > Hybrid retrieval scoring is built in (§14, `mode="hybrid"`), and scheduled
 > maintenance shipped as the `ai_houkai.maintenance` subsystem (§17) — no
 > hand-rolled threads needed.  The sketches below remain valid as quick
@@ -1470,12 +1517,12 @@ server (`AI_HOUKAI_AUTO_IMPORTANCE=1`):
 - **Low** (0.35): hedged/passing observations
 - Modifiers: +0.10 procedural/feedback, −0.15 questions, −0.10 fragments
 
-![Heuristic importance tiers with example phrases](docs/resources/importance_tiers.png)
+![Heuristic importance tiers with example phrases](resources/importance_tiers.png)
 
 *Each bar is the score the shipped `score_importance()` actually returns for
 the quoted phrase; the highest matching tier wins.*
 
-![Importance base tier through modifiers to the final clamped value](docs/resources/importance_waterfall.png)
+![Importance base tier through modifiers to the final clamped value](resources/importance_waterfall.png)
 
 *Base tier → modifiers → final, clamped to `[0.05, 0.98]`. A procedural
 instruction saturates at the 0.98 ceiling (0.90 tier + 0.10 type bonus), while
@@ -1513,7 +1560,7 @@ friendly install hint if the extras are absent.
 
 ```
 houkai (bin)
-  └── ai_houkai/cli/main.py          Typer app; registers 27 commands plus
+  └── ai_houkai/cli/main.py          Typer app; registers 30 commands plus
                                      three sub-command groups (maintenance,
                                      journal, collections); shared
                                      --store / --collection flags
@@ -1546,6 +1593,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `remember` | `remember.py` | `store.remember()` |
 | `recall` | `recall.py` | `store.recall()` |
 | `pack` | `pack.py` | `store.recall_pack()` |
+| `auto-context` | `pack.py` | `store.auto_context_pack()` — multi-angle fan-out packing |
 | `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
 | `show` | `show.py` | `store._get_by_id()` |
 | `forget` | `forget.py` | `store.forget()` |
@@ -1568,6 +1616,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `info` | `io.py` | inspect a `.ahkai` archive without importing |
 | `backup` | `io.py` | `shutil.copytree(.chroma → backups/<ts>/)` |
 | `stats` | `stats.py` | `store.list_recent()` + Counter; `--health` reuses the engine decay formula (incl. frequency reinforcement) with `decay_rate` / `min_score` / `protect_types` / `frequency_weight` loaded from `[maintenance.decay]` config (overridable via `--decay-rate` / `--frequency-weight`) so its at-risk count matches `prune()` |
+| `doctor` | `doctor.py` | `store.readiness()` + config/embed-dim/journal checks — active embedder probe (latency + dim), embed-dim guardrail; `--json`; exits non-zero on failure |
 | `ingest` | `ingest.py` | `chunk_text()` → one `store.remember()` per chunk |
 | `serve` | `serve.py` | `http_server.serve()` — starts JSON HTTP API on `--host`/`--port`, optional `--token` |
 | `tui` | `tui_cmd.py` | `HoukaiTui` (Textual; needs the `tui` extra) |
@@ -1835,10 +1884,12 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 | Method & path | Store call |
 |---|---|
 | `GET /health` | `count()` — always reachable (liveness, skips auth); returns only `{status, count}`, omitting the collection name |
+| `GET /ready` | `readiness()` — backend + embedder probe; **200** when ready, **503** otherwise; skips auth like `/health`. Body is deliberately minimal (overall flag + per-check `ok` only — no error strings / dim / latency / paths), and the probe is cached ~5 s so rapid polling can't hammer a billed remote embedder |
 | `GET /stats` | path / collection / count |
 | `GET /metrics` | `metrics()` — runtime counters + recall latency (§22) |
 | `GET /memories` | `list_recent(limit, include_superseded, include_expired)` |
 | `POST /memories` | `remember(...)` incl. `ttl_seconds` / `expires_at` → 201, or 409 on `ConflictError` |
+| `POST /memories/batch` | `remember_many(items, batch_size?, on_conflict?)` → 201 `{stored, memories}`; 400 on a bad item or `on_conflict="raise"` |
 | `GET /memories/{id}` | `_get_by_id` → 404 if absent |
 | `PATCH /memories/{id}` | `edit(...)` incl. `expires_at` — in-place, journaled; 404 if absent, 400 on bad field |
 | `DELETE /memories/{id}` | `forget` → 404 if absent |
@@ -1847,8 +1898,8 @@ core memory layer, mirroring the project's lean-deps stance (cf. the stdlib
 | `GET /memories/{id}/at?ts=` | `get_at(id, ts)` → 404 if it didn't exist then (§18) |
 | `GET /state_at?ts=` | `state_at(ts)` → all live memories reconstructed as of `ts` (§18) |
 | `POST /purge_expired` | `purge_expired(dry_run?)` → count + ids (§21) |
-| `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until`/`include_expired`/`explain` |
-| `POST /recall_pack` | `recall_pack(...)` |
+| `GET\|POST /recall` | `recall(...)` incl. `source`/`since`/`until`/`include_expired`/`explain`; the POST body also carries the advanced knobs (`fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph` weight, and an `expand` object incl. `rerank`) that don't map onto a query string |
+| `POST /recall_pack` | `recall_pack(...)` incl. `graph` weight + `expand` (rerank) |
 | `POST /links` · `POST /unlink` | `link` / `unlink` |
 | `POST /supersede` · `POST /conflicts` | `supersede` / `find_conflicts` |
 
@@ -1976,14 +2027,20 @@ store.metrics()
 # {
 #   "uptime_seconds": 1234.5,
 #   "count": 812,                         # live backend count
-#   "calls": {"remember": 40, "recall": 210, "forget": 3, "edit": 12, "supersede": 5},
-#   "recall_latency_ms": {"count": 210, "avg": 8.3, "max": 141.2},
+#   "calls": {"remember": 40, "recall": 210, "forget": 3, "edit": 12,
+#             "supersede": 5, "link": 18, "unlink": 2, "restore": 1,
+#             "purge_expired": 4, "export": 1, "import": 1},
+#   "recall_latency_ms": {"count": 210, "avg": 8.3, "max": 141.2,
+#                         "p50": 6.1, "p95": 22.7, "p99": 58.4},
 # }
 ```
 
-Counters are bumped inside `remember` / `recall` / `forget` / `edit` /
-`supersede`; recall wraps its body to record wall-clock latency (the empty-store
-early return still counts, so the numbers match call volume). The registry is
+Counters are bumped inside every mutating op — `remember` / `recall` / `forget`
+/ `edit` / `supersede` plus `link` / `unlink` / `restore` / `purge_expired` /
+`export` / `import`. Recall wraps its body to record wall-clock latency (the
+empty-store early return still counts, so the numbers match call volume) and
+keeps a bounded ring of the last 1024 samples to derive **p50/p95/p99**
+percentiles (exact over the window) alongside `avg`/`max`. The registry is
 **in-memory and per-instance** — not persisted, reset on restart, and not
 shared across processes — so it is a cheap liveness/throughput signal for a
 long-running server, not a durable analytics store. In the Go port it is

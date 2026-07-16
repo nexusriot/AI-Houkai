@@ -11,6 +11,7 @@ import typer
 from ai_houkai.cli import output as out
 from ai_houkai.memory_system.importance import score_importance
 from ai_houkai.memory_system.ingest import chunk_text
+from ai_houkai.memory_system.store import RememberItem
 
 
 def ingest(
@@ -96,13 +97,22 @@ def ingest(
 
     # friendly_errors: a bad --type/--tag surfaces as a one-line error, not a
     # traceback. Journal as "ingest" — "import" is the .ahkai importer's actor.
+    # One batched write — collapses N per-chunk encodes into ceil(N/batch)
+    # (see MemoryStore.remember_many). on_conflict="ignore": ingesting raw
+    # document chunks shouldn't trigger conflict management (near-duplicate
+    # chunks — shared headings/boilerplate — are normal source material).
     with store.as_actor("ingest"), out.friendly_errors():
-        for label, chunk, imp in plan:
-            store.remember(
-                text=chunk,
-                type=type,
-                tags=list(tags),
-                importance=imp,
-                source=source or f"ingest:{label}",
-            )
+        store.remember_many(
+            [
+                RememberItem(
+                    text=chunk,
+                    type=type,
+                    tags=tuple(tags),
+                    importance=imp,
+                    source=source or f"ingest:{label}",
+                )
+                for label, chunk, imp in plan
+            ],
+            on_conflict="ignore",
+        )
     typer.echo(f"Stored {len(plan)} memories.")

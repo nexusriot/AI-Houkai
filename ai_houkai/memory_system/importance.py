@@ -1,7 +1,7 @@
 """Heuristic importance auto-assignment.
 
 ``score_importance(text, type, tags)`` rates a memory 0..1 without an LLM,
-following the tiers sketched in DESIGN.md §15:
+following the tiers sketched in docs/DESIGN.md §15:
 
     0.90+  explicit standing instructions, corrections, user preferences
     0.75   decisions, conventions, policies

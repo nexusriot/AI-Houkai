@@ -22,6 +22,7 @@ from .store import (
     PackedMemory,
     PackResult,
     RECALL_MODES,
+    RememberItem,
     Reranker,
     extract_key_phrases,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "PackedMemory",
     "RECALL_MODES",
     "ReflectionEngine",
+    "RememberItem",
     "Reranker",
     "build_summarizer",
     "extract_key_phrases",

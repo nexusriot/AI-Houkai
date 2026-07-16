@@ -24,6 +24,7 @@ from ai_houkai.cli.commands.decay import prune, purge
 from ai_houkai.cli.commands.reflect import reflect
 from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
 from ai_houkai.cli.commands.stats import stats
+from ai_houkai.cli.commands.doctor import doctor
 from ai_houkai.cli.commands.ingest import ingest
 from ai_houkai.cli.commands.serve import serve
 from ai_houkai.cli.commands.collections import collections_app
@@ -112,6 +113,7 @@ def _register() -> None:
     app.command("info")(info_cmd)
     app.command("backup")(backup)
     app.command("stats")(stats)
+    app.command("doctor")(doctor)
     app.command("ingest")(ingest)
     app.command("serve")(serve)
     app.command("tui")(tui)

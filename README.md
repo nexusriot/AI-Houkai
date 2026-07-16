@@ -24,23 +24,26 @@ and periodic reflection that condenses experience into knowledge.
 | **Conflict detection** | Duplicate / contradiction scan with configurable policies |
 | **Hybrid retrieval** | Cosine + BM25 + recency (creation-time by default) + importance + polarity blended scoring; CJK/Korean lexical tokenization |
 | **Retrieval controls** | RRF fusion · MMR diversity · near-duplicate dedup · `min_cosine` relevance gate · read-only/`explain` recall |
+| **Graph-proximity fusion** | Opt-in `HybridWeights.graph` — PPR-lite spread over the link graph lifts candidates connected to strong hits; gated expansion (`ExpandSpec.rerank`) routes expanded nodes through the same dedup/MMR/top-k as primary hits |
 | **Reranking** | Pluggable second-stage `reranker` (e.g. a cross-encoder) rescores the candidate pool before the top-k cut |
 | **TTL / expiry** | Per-memory `ttl_seconds`/`expires_at` — expired memories hidden from recall, reclaimed by `purge_expired` |
 | **History / point-in-time** | `history()` timeline per memory + `state_at()`/`get_at()` journal replay ("what did I know as of T?") |
-| **Runtime metrics** | `metrics()` — op counters + recall latency, via `GET /metrics` and the `metrics` MCP tool |
+| **Runtime metrics** | `metrics()` — op counters (all mutators) + recall latency (avg/max + p50/p95/p99), via `GET /metrics` and the `metrics` MCP tool |
 | **Retrieval eval** | `ai_houkai.eval` — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set |
 | **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
 | **Importance auto-assignment** | Heuristic 0–1 scoring from text (instructions > decisions > completions > observations) |
 | **Bulk ingest** | `houkai ingest` — chunk files/stdin into memories (markdown-aware) |
+| **Batch write** | `remember_many` / `POST /memories/batch` / MCP `remember_many` — bulk store with batched embedding (`ceil(N/batch)` encode passes instead of N) |
 | **Collections** | `houkai collections` — list/create/delete/copy namespaces in one store |
 | **TUI browser** | `houkai tui` — Textual UI: search, detail pane, link-graph walking |
 | **Scheduled maintenance** | Automatic decay + reflection daemon — cron, foreground loop, or background daemon |
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
 | **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
-| **MCP server** | 22 tools for any MCP client (Claude Code, Claude Desktop) |
-| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links/history/metrics), optional bearer-token auth |
-| **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, I/O |
+| **MCP server** | 23 tools for any MCP client (Claude Code, Claude Desktop) |
+| **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links/history/metrics), `/health` + `/ready` probes, optional bearer-token auth |
+| **Diagnostics** | `houkai doctor` — active embedder probe (latency + dim), embed-dim guardrail, store/journal checks; `GET /ready` readiness endpoint (200/503, auth-exempt, minimal body, ~5 s cached) |
+| **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, diagnostics, I/O |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
 ## Layout
@@ -67,7 +70,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (22 tools)
+│   │   └── server.py             # FastMCP server (23 tools)
 │   ├── http_server/
 │   │   ├── __init__.py
 │   │   └── server.py             # stdlib JSON HTTP/REST server (houkai serve)
@@ -97,7 +100,8 @@ AI-Houkai/
 │   │       ├── serve.py          # houkai serve
 │   │       ├── collections.py    # houkai collections list/create/delete/copy
 │   │       ├── tui_cmd.py        # houkai tui
-│   │       └── stats.py          # houkai stats
+│   │       ├── stats.py          # houkai stats
+│   │       └── doctor.py         # houkai doctor — diagnostics / readiness
 │   ├── tui/
 │   │   ├── data.py               # view models: recent/search/neighbors + Navigator
 │   │   └── app.py                # HoukaiTui — Textual memory browser
@@ -121,13 +125,15 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 751 tests across 31 files
+├── tests/                        # 803 tests across 33 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
 │   ├── test_reflection.py        # ReflectionEngine unit tests
 │   ├── test_dispatch.py          # cross-provider _dispatch_tool tests
 │   ├── test_hybrid.py            # hybrid retrieval scoring
+│   ├── test_graph_fusion.py      # graph-proximity fusion + gated expansion
+│   ├── test_doctor.py            # doctor CLI + /ready readiness probe
 │   ├── test_links.py             # typed links / neighbors / subgraph
 │   ├── test_conflicts.py         # conflict detection + supersede/restore
 │   ├── test_cli.py               # houkai CLI round-trips (incl. nuke)
@@ -613,10 +619,12 @@ Endpoints (all JSON in / JSON out):
 | Method & path | Purpose |
 |---|---|
 | `GET /health` | liveness + memory count (always open) |
+| `GET /ready` | readiness — backend + embedder probe; `200`/`503`; auth-exempt, minimal body, ~5 s cached |
 | `GET /stats` | store statistics |
 | `GET /metrics` | runtime counters + recall latency |
 | `GET /memories?limit=&include_superseded=&include_expired=` | recent memories |
 | `POST /memories` | store a memory (`remember`; accepts `ttl_seconds`/`expires_at`) |
+| `POST /memories/batch` | bulk store (`remember_many`; `{items:[…], batch_size?, on_conflict?}`) with batched embedding |
 | `GET /memories/{id}` | fetch one |
 | `PATCH /memories/{id}` | edit fields in place (journaled, undoable; `expires_at`) |
 | `DELETE /memories/{id}` | forget one |
@@ -643,8 +651,8 @@ curl -s -X PATCH localhost:8077/memories/<id> -d '{"importance":0.9}'
 ```
 
 **Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
-request must carry `Authorization: Bearer <secret>`; `/health` stays open for
-liveness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
+request must carry `Authorization: Bearer <secret>`; `/health` and `/ready`
+stay open for liveness/readiness probes. The server binds `127.0.0.1` by default — set `--host 0.0.0.0`
 (or `AI_HOUKAI_HTTP_HOST`) only behind a trusted network or reverse proxy.
 
 **Concurrency:** the server is multi-threaded but serialises all store access
@@ -692,10 +700,13 @@ diversity/dedup, `min_cosine`, read-only/`explain` recall, created-based
 recency, multi-hop link decay, CJK tokenization), context packing with
 compression, decay/reflection with LLM summarizers, bulk ingest, collections,
 importance auto-assignment, installers for Claude Code / Cursor / OpenCode, and
-a Bubble Tea TUI. The five recent additions — pluggable **reranking**,
-**TTL/expiry** (+ maintenance purge), **point-in-time history**, recall
-**explain**, and runtime **metrics** — are ported too. The only Python-only
-piece is the retrieval-eval harness (`ai_houkai.eval`).
+a Bubble Tea TUI, and diagnostics (`houkai doctor` + `GET /ready`). The recent
+additions — pluggable **reranking**, **TTL/expiry** (+ maintenance purge),
+**point-in-time history**, recall **explain**, runtime **metrics**,
+**graph-proximity fusion** (`HybridWeights.Graph`) and **gated graph expansion**
+(`ExpandSpec.Rerank`) — are ported too; the graph/rerank knobs are library-level
+in both ports, not yet on the CLI/HTTP/MCP surface. The only Python-only piece
+is the retrieval-eval harness (`ai_houkai.eval`).
 Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean
 instead of bundled sentence-transformers, and the store is
 [chromem-go](https://github.com/philippgille/chromem-go) — not
@@ -704,13 +715,15 @@ format bridges the two. See [go/README.md](go/README.md).
 
 ## Design docs
 
-In-depth design notes live in [DESIGN.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/DESIGN.md).
+In-depth design notes live in [docs/DESIGN.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/docs/DESIGN.md).
 The original feature proposals for hybrid retrieval, conflict detection, and
 memory linking — all now shipped — are archived in
 [PROPOSALS.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/PROPOSALS.md).
 The Go port has its own internals doc in [go/DESIGN.md](go/DESIGN.md); the
 original porting feasibility study is archived in
 [GO_PORT_DESIGN.md](GO_PORT_DESIGN.md).
+Forward-looking feature recommendations live in
+[docs/ROADMAP.md](https://raw.githubusercontent.com/nexusriot/AI-Houkai/main/docs/ROADMAP.md).
 
 ## Run the tests
 

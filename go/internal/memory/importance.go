@@ -9,7 +9,7 @@ import (
 // Heuristic importance auto-assignment.
 //
 // ScoreImportance rates a memory 0..1 without an LLM, following the tiers
-// sketched in DESIGN.md §15:
+// sketched in docs/DESIGN.md §15:
 //
 //	0.90+  explicit standing instructions, corrections, user preferences
 //	0.75   decisions, conventions, policies

@@ -91,6 +91,63 @@ func TestHealthIsOpen(t *testing.T) {
 	}
 }
 
+func TestRememberManyBatchEndpoint(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	body := `{"items":[{"text":"batch alpha","tags":["t1"]},{"text":"batch beta","type":"procedural","importance":0.9}]}`
+	resp, err := http.Post(ts.URL+"/memories/batch", "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 201 {
+		t.Fatalf("batch status = %d, want 201", resp.StatusCode)
+	}
+	got := decode(t, resp)
+	if stored, _ := got["stored"].(float64); stored != 2 {
+		t.Fatalf("stored = %v, want 2", got["stored"])
+	}
+	if mems, _ := got["memories"].([]any); len(mems) != 2 {
+		t.Errorf("memories len = %d, want 2", len(mems))
+	}
+	// Confirm both landed via /health count.
+	h := decode(t, mustGet(t, ts.URL+"/health"))
+	if c, _ := h["count"].(float64); c != 2 {
+		t.Errorf("count = %v, want 2", h["count"])
+	}
+}
+
+func TestRememberManyBatchRejectsNonObjectItem(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	resp, err := http.Post(ts.URL+"/memories/batch", "application/json",
+		bytes.NewReader([]byte(`{"items":["bare string"]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestRememberManyBatchRaiseIs400(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	resp, err := http.Post(ts.URL+"/memories/batch", "application/json",
+		bytes.NewReader([]byte(`{"items":[{"text":"x"}],"on_conflict":"raise"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func mustGet(t *testing.T, url string) *http.Response {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 func TestRememberGetForgetRoundTrip(t *testing.T) {
 	ts, _ := newTestServer(t, "")
 
@@ -180,6 +237,52 @@ func TestRecallBadSinceIs400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Errorf("bad since: status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestRecallExpandRerankOverHTTP(t *testing.T) {
+	// graph-walk expansion + rerank gating must be reachable over POST /recall.
+	ts, _ := newTestServer(t, "")
+	post := func(path, payload string) map[string]any {
+		resp, err := http.Post(ts.URL+path, "application/json", bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decode(t, resp)
+	}
+	hub := post("/memories", `{"text":"kubernetes ingress controller configuration","type":"procedural"}`)
+	hubID, _ := hub["id"].(string)
+	for i := 0; i < 5; i++ {
+		child := post("/memories", fmt.Sprintf(`{"text":"unrelated topic %d apples oranges","type":"episodic"}`, i))
+		post("/links", fmt.Sprintf(`{"src_id":%q,"dst_id":%q,"rel":"refines"}`, hubID, child["id"].(string)))
+	}
+	q := `{"query":"kubernetes ingress controller configuration","k":1,"mode":"hybrid","min_cosine":0.99,"expand":{"rels":["refines"],"cap":5,"rerank":%t}}`
+	gated := post("/recall", fmt.Sprintf(q, true))
+	if n := len(gated["results"].([]any)); n > 1 {
+		t.Fatalf("rerank=true must respect k=1 over HTTP, got %d", n)
+	}
+	legacy := post("/recall", fmt.Sprintf(q, false))
+	if n := len(legacy["results"].([]any)); n <= 1 {
+		t.Fatalf("rerank=false should append beyond k over HTTP, got %d", n)
+	}
+}
+
+func TestRecallGraphWeightOverHTTP(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	resp, err := http.Post(ts.URL+"/memories", "application/json",
+		bytes.NewReader([]byte(`{"text":"postgres replication tuning"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	resp2, err := http.Post(ts.URL+"/recall", "application/json",
+		bytes.NewReader([]byte(`{"query":"postgres","mode":"hybrid","graph":0.3}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := decode(t, resp2)
+	if _, ok := body["results"].([]any); !ok {
+		t.Fatalf("graph-weighted recall should return a results list: %v", body)
 	}
 }
 
