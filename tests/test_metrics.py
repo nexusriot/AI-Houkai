@@ -8,8 +8,13 @@ from ai_houkai.memory_system import MemoryStore
 class TestMetrics:
     def test_fresh_store_has_zeroed_counters(self, store: MemoryStore):
         m = store.metrics()
-        assert m["calls"] == {"remember": 0, "recall": 0, "forget": 0,
-                              "edit": 0, "supersede": 0}
+        # All tracked ops start at zero, including the mutators added later
+        # (link/unlink/restore/purge_expired/export/import).
+        assert m["calls"] == {
+            "remember": 0, "recall": 0, "forget": 0, "edit": 0, "supersede": 0,
+            "link": 0, "unlink": 0, "restore": 0, "purge_expired": 0,
+            "export": 0, "import": 0,
+        }
         assert m["recall_latency_ms"]["count"] == 0
         assert m["count"] == 0
         assert m["uptime_seconds"] >= 0
@@ -31,6 +36,22 @@ class TestMetrics:
         assert calls["supersede"] == 1
         assert calls["forget"] == 1
 
+    def test_mutator_counters_track_operations(self, store: MemoryStore):
+        # Previously-uncounted mutators must now increment.
+        a = store.remember("alpha")
+        b = store.remember("beta")
+        store.link(a.id, b.id, rel="related")
+        store.unlink(a.id, b.id)
+        c = store.remember("gamma")
+        store.supersede(old_id=c.id, new_id=a.id)
+        store.restore(c.id)
+        store.purge_expired(dry_run=True)
+        calls = store.metrics()["calls"]
+        assert calls["link"] == 1
+        assert calls["unlink"] == 1
+        assert calls["restore"] == 1
+        assert calls["purge_expired"] == 1
+
     def test_recall_latency_recorded(self, store: MemoryStore):
         store.remember("something to find")
         store.recall("something", k=1)
@@ -39,6 +60,15 @@ class TestMetrics:
         assert lat["count"] == 2
         assert lat["avg"] >= 0.0
         assert lat["max"] >= lat["avg"]
+
+    def test_recall_latency_percentiles(self, store: MemoryStore):
+        store.remember("something to find")
+        for _ in range(5):
+            store.recall("something", k=1)
+        lat = store.metrics()["recall_latency_ms"]
+        # Percentiles are present and monotonic, and bounded by max.
+        assert lat["p50"] <= lat["p95"] <= lat["p99"] <= lat["max"]
+        assert lat["p50"] >= 0.0
 
     def test_empty_recall_still_counts(self, store: MemoryStore):
         # recall on an empty store returns [] early but must still be counted.

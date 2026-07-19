@@ -28,6 +28,7 @@ operations that have not yet been wrapped (pass-through via ``run()``)::
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Literal, TypeVar
 
@@ -43,6 +44,7 @@ from .store import (
     MemoryStore,
     MemoryType,
     PackResult,
+    RememberItem,
     Reranker,
 )
 from .journal import JournalEntry
@@ -154,6 +156,22 @@ class AsyncMemoryStore:
             polarity=polarity,
             expires_at=expires_at,
             ttl_seconds=ttl_seconds,
+            on_conflict=on_conflict,
+            contradiction_fn=contradiction_fn,
+        )
+
+    async def remember_many(
+        self,
+        items: "Iterable[str | RememberItem | Mapping[str, Any]]",
+        *,
+        batch_size: int = 128,
+        on_conflict: Literal["ignore", "warn", "supersede"] | None = None,
+        contradiction_fn: ConflictFn | None = None,
+    ) -> list[Memory]:
+        return await self.run(
+            self.sync.remember_many,
+            items,
+            batch_size=batch_size,
             on_conflict=on_conflict,
             contradiction_fn=contradiction_fn,
         )
@@ -361,6 +379,14 @@ class AsyncMemoryStore:
 
     async def count(self) -> int:
         return await self.run(self.sync.count)
+
+    async def probe_embedding(
+        self, text: str = "ai-houkai health probe"
+    ) -> dict[str, Any]:
+        return await self.run(self.sync.probe_embedding, text)
+
+    async def readiness(self, *, cache_ttl: float = 0.0) -> dict[str, Any]:
+        return await self.run(self.sync.readiness, cache_ttl=cache_ttl)
 
 
     async def link(self, src_id: str, dst_id: str, rel: str = "related") -> None:

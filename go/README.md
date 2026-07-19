@@ -170,8 +170,9 @@ info <file>            Inspect an .ahkai header without touching the store
 journal tail/show/undo Browse and reverse audit-journal entries
 backup                 Snapshot the chromem-go directory
 stats                  Aggregate counters
+doctor                 Diagnose store/embedder/config health (--json); non-zero exit on failure
 config                 Show resolved config + search order
-serve                  JSON HTTP/REST API over the store (optional bearer auth)
+serve                  JSON HTTP/REST API over the store (optional bearer auth; /health + /ready probes)
 install                Register MCP server (claude-code | cursor | opencode)
 ```
 
@@ -489,9 +490,11 @@ Endpoints (all JSON in / JSON out):
 | Method & path                                          | Purpose                                          |
 | ------------------------------------------------------ | ------------------------------------------------ |
 | `GET /health`                                          | liveness + memory count (always open)            |
+| `GET /ready`                                           | readiness — backend + embedder probe, 200/503 (always open; minimal body, cached ~5s) |
 | `GET /stats`                                           | store statistics                                 |
 | `GET /memories?limit=&include_superseded=`             | recent memories                                  |
 | `POST /memories`                                       | store a memory (`remember`) → 201, or 409        |
+| `POST /memories/batch`                                 | bulk store (`remember_many`) → 201               |
 | `GET /memories/{id}`                                   | fetch one                                        |
 | `PATCH /memories/{id}`                                 | edit fields in place (journaled)                 |
 | `DELETE /memories/{id}`                                | forget one                                       |
@@ -692,7 +695,7 @@ Version is derived from `git describe --tags --always --dirty` and injected at
 link time. Override with `VERSION=1.2.3 make build`. A `go build` without
 `-ldflags` falls back to the in-source default in
 [`internal/version/version.go`](internal/version/version.go) (currently
-`0.4.0`).
+`0.5.0`).
 
 ---
 
@@ -704,8 +707,8 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The Go port exposes **22 MCP tools** — `remember`, `recall`, `recall_pack`,
-`auto_context`, `forget`, `purge_expired`, `edit`, `list_recent`, `stats`,
+The Go port exposes **23 MCP tools** — `remember`, `remember_many`, `recall`,
+`recall_pack`, `auto_context`, `forget`, `purge_expired`, `edit`, `list_recent`, `stats`,
 `metrics`, `history`, `state_at`, `get_at`, `link`, `unlink`, `neighbors`,
 `find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`, `export`,
 `import`. This matches the Python reference port, including the advanced
@@ -718,6 +721,16 @@ pluggable **reranking** (a store-config Go `func`, not a request param),
 purge job), **point-in-time** `history`/`state_at`/`get_at`, and runtime
 `metrics`. The tools keep the same names and behaviour, so existing clients
 keep working.
+
+Two ranking features from the latest cycle live at the **library level** in both
+ports — not (yet) on the MCP/CLI/HTTP surface: **graph-proximity fusion**
+(`HybridWeights.Graph`, a PPR-lite spread over intra-pool links; `0` = no-op) and
+**gated graph expansion** (`ExpandSpec.Rerank`, merges expanded neighbours into
+the candidate pool before dedup/MMR/top-k instead of appending after). In Go,
+pass explicit core weights alongside `Graph` — a lone `HybridWeights{Graph: …}`
+zeroes cosine/lexical/recency/importance and is rejected by `Recall`'s
+weight-sum guard. Diagnostics (`houkai doctor` + the auth-exempt `GET /ready`
+probe) are also at parity.
 
 Behavioural parity notes (all matching Python):
 

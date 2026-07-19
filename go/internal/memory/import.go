@@ -72,6 +72,7 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 		return summary, err
 	}
 	defer f.Close()
+	s.recordCall("import")
 	gr, err := gzip.NewReader(f)
 	if err != nil {
 		return summary, fmt.Errorf("%s: not gzipped (%w)", path, err)

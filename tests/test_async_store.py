@@ -222,3 +222,19 @@ class TestAsyncAutoContext:
 
         after = asyncio.get_event_loop().run_until_complete(_inner())
         assert after.access_count == 0
+
+
+class TestAsyncDiagnostics:
+    """The async wrapper must expose the diagnostics surface at parity with
+    the sync store (probe_embedding / readiness)."""
+
+    def test_probe_embedding(self, astore):
+        probe = _run(astore.probe_embedding())
+        assert probe["ok"] is True
+        assert probe["dim"] > 0
+
+    def test_readiness_ok(self, astore):
+        r = _run(astore.readiness())
+        assert r["ready"] is True
+        assert r["checks"]["store"]["ok"] is True
+        assert r["checks"]["embedder"]["ok"] is True

@@ -103,19 +103,27 @@ paragraph, re-packs long paragraphs on sentence boundaries. Omit files
 			}
 
 			defer store.AsActor("import")()
-			for _, p := range plan {
+			// One batched write — collapses N per-chunk encodes into
+			// ceil(N/batch) (see MemoryStore.RememberMany). Ingesting raw
+			// document chunks shouldn't trigger conflict management, so ignore.
+			batch := make([]memory.RememberItem, len(plan))
+			for i, p := range plan {
 				src := source
 				if src == "" {
 					src = "ingest:" + p.label
 				}
-				if _, _, _, err := store.Remember(cmd.Context(), p.chunk, memory.RememberOpts{
-					Type:       memory.MemoryType(memType),
-					Tags:       tags,
-					Importance: memory.Float32Ptr(p.imp),
-					Source:     src,
-				}); err != nil {
-					return err
+				batch[i] = memory.RememberItem{
+					Text: p.chunk,
+					RememberOpts: memory.RememberOpts{
+						Type:       memory.MemoryType(memType),
+						Tags:       tags,
+						Importance: memory.Float32Ptr(p.imp),
+						Source:     src,
+					},
 				}
+			}
+			if _, err := store.RememberMany(cmd.Context(), batch, 128, memory.PolicyIgnore); err != nil {
+				return err
 			}
 			fmt.Printf("Stored %d memories.\n", len(plan))
 			return nil

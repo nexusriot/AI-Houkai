@@ -92,6 +92,12 @@ type MemoryStore struct {
 	recallCount   int
 	recallTotalS  float64
 	recallMaxS    float64
+	recallSamples []float64 // bounded ring of recent recall latencies (seconds)
+
+	// Cached last-ready readiness() result (see the cacheTTL arg on Readiness).
+	readinessMu     sync.Mutex
+	readinessTS     time.Time
+	readinessResult map[string]any
 }
 
 // NewMemoryStore creates a new store backed by the given vector backend + embedder.
@@ -104,6 +110,8 @@ func NewMemoryStore(backend vector.Backend, embedder embed.Embedder, cfg StoreCo
 		metricStarted: time.Now(),
 		metricCalls: map[string]int{
 			"remember": 0, "recall": 0, "forget": 0, "edit": 0, "supersede": 0,
+			"link": 0, "unlink": 0, "restore": 0, "purge_expired": 0,
+			"export": 0, "import": 0,
 		},
 	}
 	if cfg.JournalEnabled {
@@ -154,40 +162,39 @@ func (s *MemoryStore) journalEntry(op, id string, before, after, meta map[string
 
 // Remember stores a new memory and returns it. The text is stripped of
 // surrounding whitespace before storage (matching Python).
-func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
+// buildMemory validates inputs and constructs an in-memory Memory — no embed,
+// no backend write, no journal, no conflict scan. Shared by Remember and
+// RememberMany so both agree on validation, TTL resolution and importance
+// auto-scoring.
+func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error) {
 	text = strings.TrimSpace(text)
 	if opts.Type == "" {
 		opts.Type = Semantic
 	}
 	if err := validateChoice(string(opts.Type), MemoryTypes, "type"); err != nil {
-		return Memory{}, false, nil, err
+		return Memory{}, err
 	}
 	if err := validatePolarity(opts.Polarity); err != nil {
-		return Memory{}, false, nil, err
-	}
-	if opts.OnConflict != "" {
-		if err := validateChoice(string(opts.OnConflict), ConflictPolicies, "on_conflict"); err != nil {
-			return Memory{}, false, nil, err
-		}
+		return Memory{}, err
 	}
 	if err := validateTags(opts.Tags); err != nil {
-		return Memory{}, false, nil, err
+		return Memory{}, err
 	}
 
 	// Expiry: absolute epoch (ExpiresAt) or relative (TTLSeconds from now).
 	// nil / 0 means "never expires". They are mutually exclusive.
 	var expiresAt float64
 	if opts.ExpiresAt != nil && opts.TTLSeconds != nil {
-		return Memory{}, false, nil, validationErrorf("pass at most one of ExpiresAt, TTLSeconds")
+		return Memory{}, validationErrorf("pass at most one of ExpiresAt, TTLSeconds")
 	}
 	if opts.TTLSeconds != nil {
 		if *opts.TTLSeconds <= 0 {
-			return Memory{}, false, nil, validationErrorf("ttl_seconds must be > 0")
+			return Memory{}, validationErrorf("ttl_seconds must be > 0")
 		}
 		expiresAt = nowFloat() + *opts.TTLSeconds
 	} else if opts.ExpiresAt != nil {
 		if *opts.ExpiresAt < 0 {
-			return Memory{}, false, nil, validationErrorf("expires_at must be >= 0")
+			return Memory{}, validationErrorf("expires_at must be >= 0")
 		}
 		expiresAt = *opts.ExpiresAt
 	}
@@ -228,9 +235,22 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	if m.Tags == nil {
 		m.Tags = []string{}
 	}
+	return m, nil
+}
+
+func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
+	if opts.OnConflict != "" {
+		if err := validateChoice(string(opts.OnConflict), ConflictPolicies, "on_conflict"); err != nil {
+			return Memory{}, false, nil, err
+		}
+	}
+	m, err := s.buildMemory(text, opts)
+	if err != nil {
+		return Memory{}, false, nil, err
+	}
 
 	// Embed once — the same vector serves the insert and the conflict scan.
-	vecs, err := s.embedder.Embed(ctx, []string{text})
+	vecs, err := s.embedder.Embed(ctx, []string{m.Text})
 	if err != nil {
 		return Memory{}, false, nil, err
 	}
@@ -241,7 +261,7 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	// that was never created.
 	err = s.backend.Add(ctx, []vector.Item{{
 		ID:        m.ID,
-		Content:   text,
+		Content:   m.Text,
 		Embedding: vecs[0],
 		Metadata:  MemoryToMetadata(m),
 	}})
@@ -306,6 +326,130 @@ type RememberOpts struct {
 	// OnConflict overrides the store's configured conflict policy for this
 	// call only (empty = use the store default).
 	OnConflict ConflictPolicy
+}
+
+// RememberItem is one entry for RememberMany: a text plus the same optional
+// fields as RememberOpts. Its OnConflict field is ignored — the call-level
+// onConflict argument governs the whole batch.
+type RememberItem struct {
+	Text string
+	RememberOpts
+}
+
+// RememberMany stores many memories with batched embedding: every batchSize
+// items are embedded in ONE embedder call and written in ONE backend.Add, so N
+// documents cost ceil(N / batchSize) encode passes instead of N. One journal
+// "remember" entry is written per id (so Undo stays per-memory); the stored
+// memories are returned in input order.
+//
+// Validation is all-or-nothing — a bad item returns an error before any write.
+//
+// Conflict handling runs after the write, per item, in input order:
+//   - PolicyIgnore: no scan (fastest; the natural choice for bulk loads).
+//   - PolicyWarn: scan every item, log one aggregated line.
+//   - PolicySupersede: earlier items win — a later near-duplicate is superseded
+//     by the earlier one; an item already superseded within this call is
+//     skipped, so no intra-batch supersede cycles form.
+//   - PolicyRaise is rejected (bulk rollback is ill-defined; use Remember).
+func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, batchSize int, onConflict ConflictPolicy) ([]Memory, error) {
+	if batchSize < 1 {
+		return nil, validationErrorf("batch_size must be >= 1")
+	}
+	policy := s.cfg.ConflictPolicy
+	if onConflict != "" {
+		if err := validateChoice(string(onConflict), ConflictPolicies, "on_conflict"); err != nil {
+			return nil, err
+		}
+		policy = onConflict
+	}
+	if policy == PolicyRaise {
+		return nil, validationErrorf("on_conflict='raise' is not supported by RememberMany — bulk rollback is ill-defined; use Remember per item")
+	}
+
+	// Build + validate all up front so a bad item aborts before any write.
+	mems := make([]Memory, 0, len(items))
+	for i, it := range items {
+		m, err := s.buildMemory(it.Text, it.RememberOpts)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		mems = append(mems, m)
+	}
+	if len(mems) == 0 {
+		return []Memory{}, nil
+	}
+
+	// Batched embed + add; keep each vector to reuse for the conflict scan.
+	vecsAll := make([][]float32, len(mems))
+	for start := 0; start < len(mems); start += batchSize {
+		end := start + batchSize
+		if end > len(mems) {
+			end = len(mems)
+		}
+		chunk := mems[start:end]
+		texts := make([]string, len(chunk))
+		for j, m := range chunk {
+			texts[j] = m.Text
+		}
+		vecs, err := s.embedder.Embed(ctx, texts)
+		if err != nil {
+			return nil, err
+		}
+		batchItems := make([]vector.Item, len(chunk))
+		for j, m := range chunk {
+			vecsAll[start+j] = vecs[j]
+			batchItems[j] = vector.Item{
+				ID:        m.ID,
+				Content:   m.Text,
+				Embedding: vecs[j],
+				Metadata:  MemoryToMetadata(m),
+			}
+		}
+		if err := s.backend.Add(ctx, batchItems); err != nil {
+			return nil, err
+		}
+		for _, m := range chunk {
+			s.recordCall("remember")
+			s.journalEntry("remember", m.ID, nil, m.ToDict(), nil)
+		}
+	}
+
+	if policy != PolicyIgnore {
+		superseded := make(map[string]bool)
+		flagged := 0
+		for i, m := range mems {
+			if superseded[m.ID] {
+				continue
+			}
+			hits, err := s.backend.Query(ctx, vecsAll[i], 12)
+			if err != nil {
+				return mems, fmt.Errorf("conflict scan: %w", err)
+			}
+			conflicts := detectConflicts(m, hitsToMemoriesWithScore(hits), s.cfg.ConflictThreshold, s.cfg.ConflictFn)
+			if len(conflicts) == 0 {
+				continue
+			}
+			switch policy {
+			case PolicyWarn:
+				flagged++
+			case PolicySupersede:
+				for _, c := range conflicts {
+					if superseded[c.B.ID] {
+						continue
+					}
+					if err := s.doSupersede(ctx, c.B.ID, m.ID); err != nil {
+						return mems, fmt.Errorf("supersede conflict %s: %w", c.B.ID, err)
+					}
+					superseded[c.B.ID] = true
+				}
+			}
+		}
+		if policy == PolicyWarn && flagged > 0 {
+			log.Printf("ai-houkai: RememberMany: %d item(s) with conflict(s)", flagged)
+		}
+	}
+
+	return mems, nil
 }
 
 // Recall returns up to k memories matching query.
@@ -427,6 +571,14 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if w == (HybridWeights{}) {
 		w = DefaultWeights()
 	}
+	// Mirror Python's HybridWeights.__post_init__ guard: graph/polarity are
+	// additive nudges, so at least one *core* signal must carry weight. This
+	// catches the Go footgun HybridWeights{Graph: 0.15} — which, unlike the
+	// Python dataclass, does NOT retain the default core weights and would
+	// otherwise silently rank by the graph term alone.
+	if w.Cosine+w.Lexical+w.Recency+w.Importance <= 0 {
+		return nil, validationErrorf("HybridWeights: at least one core weight (cosine/lexical/recency/importance) must be > 0")
+	}
 
 	var expl map[string]map[string]any
 	if opts.Explain {
@@ -454,6 +606,88 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		scored, err = applyReranker(reranker, query, scored, expl)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Graph expansion with rerank=true: merge expanded neighbours into the
+	// candidate pool BEFORE selection so they pass the same dedup / MMR / top-k
+	// gates as primary hits — rather than being appended after the cut
+	// (rerank=false), where they could inject near-duplicates or overflow k.
+	if opts.Expand != nil && opts.Expand.Cap > 0 && opts.Expand.Rerank {
+		seed := scored
+		if len(seed) > k {
+			seed = seed[:k]
+		}
+		seedMWS := make([]MemoryWithScore, len(seed))
+		for i, sc := range seed {
+			seedMWS[i] = MemoryWithScore{Memory: sc.mem, Score: sc.score}
+		}
+		// Pre-seed the visited set with the WHOLE scored pool (not just the
+		// top-k frontier) so expansion never re-reaches — and clobbers the
+		// explain entry of — a candidate already scored below k.
+		poolIDs := make([]string, len(scored))
+		for i, sc := range scored {
+			poolIDs[i] = sc.mem.ID
+		}
+		extra, err := s.collectExpansion(ctx, seedMWS, opts.Expand, opts.IncludeSuperseded, expl, poolIDs)
+		if err != nil {
+			return nil, err
+		}
+		if len(extra) > 0 {
+			// Express the hop score as a fraction of the strongest primary so
+			// expanded nodes compete on the pool's own scale regardless of
+			// fusion (RRF scores are ~1/rrfK; a raw ~0.70 hop score would bury
+			// every primary hit).
+			top := float32(1.0)
+			if len(scored) > 0 {
+				top = scored[0].score
+				for _, sc := range scored {
+					if sc.score > top {
+						top = sc.score
+					}
+				}
+			}
+			var fresh []scoredCand
+			for _, e := range extra {
+				hs := e.Score
+				if hs < 0 {
+					hs = 0
+				} else if hs > 1 {
+					hs = 1
+				}
+				fresh = append(fresh, scoredCand{mem: e.Memory, score: hs * top})
+			}
+			if needEmb && len(fresh) > 0 {
+				// MMR/dedup need embeddings. Fetch the expanded nodes' STORED
+				// vectors (mirrors Python's _emb_for_ids) rather than re-embedding
+				// — same vectors the index was built from, no extra provider
+				// round-trip. Drop any node whose embedding can't be resolved so
+				// it cannot bypass the dedup gate with a free novelty bonus.
+				ids := make([]string, len(fresh))
+				for i, sc := range fresh {
+					ids[i] = sc.mem.ID
+				}
+				embByID := map[string][]float32{}
+				if items, gerr := s.backend.Get(ctx, ids); gerr == nil {
+					for _, it := range items {
+						if len(it.Embedding) > 0 {
+							embByID[it.ID] = it.Embedding
+						}
+					}
+				}
+				kept := fresh[:0]
+				for _, sc := range fresh {
+					if emb, ok := embByID[sc.mem.ID]; ok {
+						sc.emb = emb
+						kept = append(kept, sc)
+					}
+				}
+				fresh = kept
+			}
+			if len(fresh) > 0 {
+				scored = append(scored, fresh...)
+				sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+			}
 		}
 	}
 
@@ -486,8 +720,9 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		}
 	}
 
-	// Graph expansion.
-	if opts.Expand != nil && opts.Expand.Cap > 0 {
+	// Graph expansion (rerank=false): appended after the top-k cut, unfiltered
+	// — the backward-compatible default.
+	if opts.Expand != nil && opts.Expand.Cap > 0 && !opts.Expand.Rerank {
 		out, err = s.expandResults(ctx, out, opts.Expand, opts.IncludeSuperseded, expl)
 		if err != nil {
 			return nil, err
@@ -662,6 +897,74 @@ func (s *MemoryStore) Count(ctx context.Context) (int, error) {
 	return s.backend.Count(ctx)
 }
 
+// probeText is the string embedded to check the embedding backend is reachable.
+const probeText = "ai-houkai health probe"
+
+// ProbeEmbedding actively embeds a short probe string to confirm the embedding
+// backend is reachable, and reports its output dimension + latency. The
+// embedder is otherwise only invoked lazily on the first real write/recall, so
+// a misconfigured model or unreachable provider would surface much later.
+func (s *MemoryStore) ProbeEmbedding(ctx context.Context) map[string]any {
+	t0 := time.Now()
+	vecs, err := s.embedder.Embed(ctx, []string{probeText})
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	if len(vecs) == 0 || len(vecs[0]) == 0 {
+		return map[string]any{"ok": false, "error": "embedder returned no vector"}
+	}
+	latencyMs := math.Round(float64(time.Since(t0).Microseconds())/10) / 100
+	return map[string]any{"ok": true, "dim": len(vecs[0]), "latency_ms": latencyMs}
+}
+
+// Readiness probes whether the store is reachable and the embedder is working,
+// returning {"ready": bool, "checks": {...}}. Unlike a liveness check it
+// exercises the real dependencies (backend count + an actual embed), so
+// orchestrators can distinguish "process up" from "able to serve requests".
+//
+// cacheTTL > 0 memoises a ready result so a frequently polled readiness
+// endpoint does not issue one embedding call per request (a cost/DoS hazard for
+// a billed/rate-limited remote embedder). Not-ready results are never cached,
+// so recovery is detected on the next probe.
+func (s *MemoryStore) Readiness(ctx context.Context, cacheTTL time.Duration) map[string]any {
+	if cacheTTL > 0 {
+		s.readinessMu.Lock()
+		cached := s.readinessResult
+		fresh := time.Since(s.readinessTS) < cacheTTL
+		s.readinessMu.Unlock()
+		if cached != nil && fresh {
+			if ready, _ := cached["ready"].(bool); ready {
+				return cached
+			}
+		}
+	}
+
+	checks := map[string]any{}
+	if n, err := s.Count(ctx); err != nil {
+		checks["store"] = map[string]any{"ok": false, "error": err.Error()}
+	} else {
+		checks["store"] = map[string]any{"ok": true, "count": n}
+	}
+	checks["embedder"] = s.ProbeEmbedding(ctx)
+
+	ready := true
+	for _, c := range checks {
+		if m, ok := c.(map[string]any); ok {
+			if b, _ := m["ok"].(bool); !b {
+				ready = false
+			}
+		}
+	}
+	result := map[string]any{"ready": ready, "checks": checks}
+	if cacheTTL > 0 && ready {
+		s.readinessMu.Lock()
+		s.readinessTS = time.Now()
+		s.readinessResult = result
+		s.readinessMu.Unlock()
+	}
+	return result
+}
+
 func (s *MemoryStore) recordCall(name string) {
 	s.metricMu.Lock()
 	s.metricCalls[name]++
@@ -675,6 +978,11 @@ func (s *MemoryStore) recordRecallLatency(d time.Duration) {
 	s.recallTotalS += sec
 	if sec > s.recallMaxS {
 		s.recallMaxS = sec
+	}
+	// Bounded ring of recent samples for percentiles.
+	s.recallSamples = append(s.recallSamples, sec)
+	if len(s.recallSamples) > 1024 {
+		s.recallSamples = s.recallSamples[len(s.recallSamples)-1024:]
 	}
 	s.metricMu.Unlock()
 }
@@ -697,8 +1005,24 @@ func (s *MemoryStore) Metrics(ctx context.Context) (map[string]any, error) {
 	if n > 0 {
 		avgMs = math.Round(s.recallTotalS/float64(n)*1e3*1e3) / 1e3
 	}
-	maxMs := math.Round(s.recallMaxS * 1e3 * 1e3) / 1e3
+	maxMs := math.Round(s.recallMaxS*1e3*1e3) / 1e3
+	samples := make([]float64, len(s.recallSamples))
+	copy(samples, s.recallSamples)
 	s.metricMu.Unlock()
+
+	sort.Float64s(samples)
+	pct := func(p float64) float64 {
+		if len(samples) == 0 {
+			return 0.0
+		}
+		idx := int(math.Round(p / 100.0 * float64(len(samples)-1)))
+		if idx < 0 {
+			idx = 0
+		} else if idx >= len(samples) {
+			idx = len(samples) - 1
+		}
+		return math.Round(samples[idx]*1e3*1e3) / 1e3
+	}
 	return map[string]any{
 		"uptime_seconds": math.Round(time.Since(s.metricStarted).Seconds()*1e3) / 1e3,
 		"count":          count,
@@ -707,6 +1031,9 @@ func (s *MemoryStore) Metrics(ctx context.Context) (map[string]any, error) {
 			"count": n,
 			"avg":   avgMs,
 			"max":   maxMs,
+			"p50":   pct(50),
+			"p95":   pct(95),
+			"p99":   pct(99),
 		},
 	}, nil
 }
@@ -717,6 +1044,7 @@ func (s *MemoryStore) Metrics(ctx context.Context) (map[string]any, error) {
 // TTL is a stronger signal. Each deletion is journaled per-row (actor "purge").
 // dryRun reports without deleting. A now of 0 uses the current time.
 func (s *MemoryStore) PurgeExpired(ctx context.Context, now float64, dryRun bool) ([]Memory, error) {
+	s.recordCall("purge_expired")
 	if now == 0 {
 		now = nowFloat()
 	}
@@ -945,6 +1273,7 @@ func (s *MemoryStore) Link(ctx context.Context, srcID, dstID, rel string) error 
 		return err
 	}
 	if added {
+		s.recordCall("link")
 		s.journalEntry("link", srcID, nil, nil, map[string]any{
 			"src_id": srcID, "dst_id": dstID, "rel": rel,
 		})
@@ -989,6 +1318,7 @@ func (s *MemoryStore) Unlink(ctx context.Context, srcID, dstID, rel string) (int
 		return 0, err
 	}
 	if len(removedRels) > 0 {
+		s.recordCall("unlink")
 		// removed_rels is what makes the entry undoable: a rel="" unlink may
 		// drop several differently-typed edges at once.
 		s.journalEntry("unlink", srcID, nil, nil, map[string]any{
@@ -1307,6 +1637,7 @@ func (s *MemoryStore) Restore(ctx context.Context, memID string) (bool, error) {
 	}
 	// Remove the "supersedes" edge from the superseder, matching Python.
 	_, _ = s.unlinkRaw(ctx, superseder, m.ID, RelSupersedes)
+	s.recordCall("restore")
 	s.journalEntry("restore", m.ID, before, m.ToDict(),
 		map[string]any{"superseder_id": superseder})
 	return true, nil
@@ -1355,9 +1686,27 @@ func (s *MemoryStore) resolvePrefix(ctx context.Context, prefix string) (Memory,
 // expandResults performs breadth-first graph expansion of the recalled set,
 // honouring spec.Depth (multi-hop) with a per-hop spec.Decay applied to the
 // assigned spec.Score, mirroring Python's _expand_links.
+// expandResults appends graph-expanded neighbours after the top-k cut
+// (rerank=false) — the backward-compatible default.
 func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any) ([]MemoryWithScore, error) {
+	extra, err := s.collectExpansion(ctx, out, spec, includeSuperseded, expl, nil)
+	if err != nil {
+		return out, err
+	}
+	return append(out, extra...), nil
+}
+
+// collectExpansion runs the breadth-first graph walk and returns only the
+// newly-reached neighbours (not concatenated with out), so the caller decides
+// whether to append them (rerank=false) or merge them into the scoring pool
+// (rerank=true).
+// seenIDs pre-populates the visited set: nodes in it are never re-reached (so
+// their existing explain entries stay intact). The BFS still fans out from out
+// — pass a superset of out to expand from the top-k while shielding the rest of
+// an already-scored pool.
+func (s *MemoryStore) collectExpansion(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any, seenIDs []string) ([]MemoryWithScore, error) {
 	if spec == nil || spec.Cap <= 0 {
-		return out, nil
+		return nil, nil
 	}
 	decay := spec.Decay
 	if decay == 0 {
@@ -1367,7 +1716,10 @@ func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, 
 	if depth <= 0 {
 		depth = 1
 	}
-	seen := make(map[string]bool, len(out))
+	seen := make(map[string]bool, len(out)+len(seenIDs))
+	for _, id := range seenIDs {
+		seen[id] = true
+	}
 	frontier := make([]string, 0, len(out))
 	for _, r := range out {
 		seen[r.ID] = true
@@ -1423,7 +1775,7 @@ func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, 
 		}
 		frontier = next
 	}
-	return append(out, extra...), nil
+	return extra, nil
 }
 
 // relAllowed reports whether rel is one of the expansion relationships. An

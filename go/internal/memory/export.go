@@ -39,6 +39,7 @@ type ExportOpts struct {
 
 // Export streams the collection to a gzipped JSONL .ahkai file at path.
 func (s *MemoryStore) Export(ctx context.Context, path string, opts ExportOpts) (ExportSummary, error) {
+	s.recordCall("export")
 	t0 := time.Now()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return ExportSummary{}, err

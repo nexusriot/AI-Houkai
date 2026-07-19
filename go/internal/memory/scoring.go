@@ -25,6 +25,122 @@ type scoredCand struct {
 func round4(f float32) float64 { return math.Round(float64(f)*1e4) / 1e4 }
 func round6(f float32) float64 { return math.Round(float64(f)*1e6) / 1e6 }
 
+// graphSpread runs personalised-PageRank-lite over the links *within* the
+// candidate pool. It seeds activation from each candidate's (min-max
+// normalised) base relevance and spreads it across intra-pool link edges,
+// treated as undirected (both a memory's outgoing links and their reverse are
+// followed). Returns {id: spread} min-max normalised to [0, 1], or nil when the
+// pool has no internal edges (letting the caller skip the graph term).
+// Restricting the walk to the pool keeps it O(pool·links) with no full-store
+// scan. Neighbours are visited in sorted order so the result is deterministic.
+func graphSpread(mems []Memory, seeds []float32) map[string]float32 {
+	n := len(mems)
+	if n == 0 || len(seeds) != n {
+		return nil
+	}
+	idx := make(map[string]int, n)
+	for i, m := range mems {
+		idx[m.ID] = i
+	}
+	lo, hi := seeds[0], seeds[0]
+	for _, v := range seeds {
+		if v < lo {
+			lo = v
+		}
+		if v > hi {
+			hi = v
+		}
+	}
+	span := hi - lo
+	seed := make([]float64, n)
+	var ssum float64
+	for i, v := range seeds {
+		if span > 1e-12 {
+			seed[i] = float64((v - lo) / span)
+		} else {
+			seed[i] = 1.0
+		}
+		ssum += seed[i]
+	}
+	if ssum == 0 {
+		ssum = 1
+	}
+	for i := range seed {
+		seed[i] /= ssum
+	}
+
+	adjSet := make([]map[int]struct{}, n)
+	for i := range adjSet {
+		adjSet[i] = map[int]struct{}{}
+	}
+	hasEdge := false
+	for i, m := range mems {
+		for _, lnk := range m.Links {
+			if j, ok := idx[lnk.To]; ok && j != i {
+				adjSet[i][j] = struct{}{}
+				adjSet[j][i] = struct{}{}
+				hasEdge = true
+			}
+		}
+	}
+	if !hasEdge {
+		return nil
+	}
+	// Freeze adjacency into sorted slices for deterministic summation.
+	adj := make([][]int, n)
+	for i := range adjSet {
+		nb := make([]int, 0, len(adjSet[i]))
+		for j := range adjSet[i] {
+			nb = append(nb, j)
+		}
+		sort.Ints(nb)
+		adj[i] = nb
+	}
+
+	const damping = 0.5
+	const iters = 3
+	activation := make([]float64, n)
+	copy(activation, seed)
+	for it := 0; it < iters; it++ {
+		nxt := make([]float64, n)
+		for i := range nxt {
+			nxt[i] = (1.0 - damping) * seed[i]
+		}
+		for i := 0; i < n; i++ {
+			deg := len(adj[i])
+			if deg == 0 {
+				// Isolated node: keep its own mass (restart to itself).
+				nxt[i] += damping * activation[i]
+				continue
+			}
+			share := damping * activation[i] / float64(deg)
+			for _, j := range adj[i] {
+				nxt[j] += share
+			}
+		}
+		activation = nxt
+	}
+
+	lo2, hi2 := activation[0], activation[0]
+	for _, v := range activation {
+		if v < lo2 {
+			lo2 = v
+		}
+		if v > hi2 {
+			hi2 = v
+		}
+	}
+	span2 := hi2 - lo2
+	if span2 <= 1e-12 {
+		return nil
+	}
+	out := make(map[string]float32, n)
+	for i, m := range mems {
+		out[m.ID] = float32((activation[i] - lo2) / span2)
+	}
+	return out
+}
+
 // applyReranker rescores the first-stage candidate pool with reranker and
 // re-sorts descending. The reranker's score replaces the blended first-stage
 // score; in explain mode each memory's breakdown gains a "rerank" block
@@ -155,6 +271,35 @@ func (s *MemoryStore) scoreWeighted(cands []cand, bm25 []float32, w HybridWeight
 		}
 		out = append(out, scoredCand{mem: c.mem, score: score, emb: c.emb})
 	}
+
+	// Graph-proximity term: spread activation from the candidates' base
+	// relevance over the intra-pool link graph, then add graph × the normalised
+	// spread. Skipped entirely (byte-identical) when graph == 0 or the pool has
+	// no internal edges.
+	if w.Graph > 0 {
+		mems := make([]Memory, len(out))
+		seeds := make([]float32, len(out))
+		for i, sc := range out {
+			mems[i] = sc.mem
+			seeds[i] = sc.score
+		}
+		if spread := graphSpread(mems, seeds); spread != nil {
+			for i := range out {
+				g := spread[out[i].mem.ID]
+				out[i].score += w.Graph * g
+				if expl != nil {
+					if e := expl[out[i].mem.ID]; e != nil {
+						e["graph"] = round4(g)
+						if wm, ok := e["weights"].(map[string]any); ok {
+							wm["graph"] = round4(w.Graph)
+						}
+						e["score"] = round4(out[i].score)
+					}
+				}
+			}
+		}
+	}
+
 	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
 	return out
 }
@@ -164,9 +309,9 @@ func (s *MemoryStore) scoreWeighted(cands []cand, bm25 []float32, w HybridWeight
 // free — immune to the cosine-vs-BM25 magnitude mismatch of the weighted blend.
 func (s *MemoryStore) scoreRRF(cands []cand, bm25 []float32, w HybridWeights, tag string, inclSup bool, minCosine *float32, expl map[string]map[string]any, now float64, rrfK int) []scoredCand {
 	type rrfRow struct {
-		mem                                  Memory
-		emb                                  []float32
-		cosine, lexical, recency, importance float32
+		mem                                         Memory
+		emb                                         []float32
+		cosine, lexical, recency, importance, graph float32
 	}
 	var rows []rrfRow
 	for i, c := range cands {
@@ -195,6 +340,33 @@ func (s *MemoryStore) scoreRRF(cands []cand, bm25 []float32, w HybridWeights, ta
 		{"lexical", w.Lexical, func(r rrfRow) float32 { return r.lexical }},
 		{"recency", w.Recency, func(r rrfRow) float32 { return r.recency }},
 		{"importance", w.Importance, func(r rrfRow) float32 { return r.importance }},
+	}
+	// Graph-proximity signal (rank-transformed like the others so it stays
+	// scale-free): spread activation over the intra-pool link graph seeded by
+	// cosine relevance. Only added when graph > 0 and the pool has edges.
+	if w.Graph > 0 {
+		mems := make([]Memory, n)
+		seeds := make([]float32, n)
+		for i, r := range rows {
+			mems[i] = r.mem
+			seeds[i] = r.cosine
+		}
+		if spread := graphSpread(mems, seeds); spread != nil {
+			anyGraph := false
+			for i := range rows {
+				rows[i].graph = spread[rows[i].mem.ID]
+				if rows[i].graph > 0 {
+					anyGraph = true
+				}
+			}
+			if anyGraph {
+				signals = append(signals, struct {
+					name string
+					wt   float32
+					val  func(rrfRow) float32
+				}{"graph", w.Graph, func(r rrfRow) float32 { return r.graph }})
+			}
+		}
 	}
 	ranks := map[string][]int{}
 	for _, sig := range signals {

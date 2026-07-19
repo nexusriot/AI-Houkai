@@ -1,6 +1,6 @@
 # docs/resources — design charts
 
-Data charts for [`DESIGN.md`](../../DESIGN.md) and [`PROPOSALS.md`](../../PROPOSALS.md),
+Data charts for [`DESIGN.md`](../DESIGN.md) and [`PROPOSALS.md`](../../PROPOSALS.md),
 provided as **PNG** (embedded in the docs) and **SVG** (vector, selectable text).
 
 Every value is computed from the **shipped source**, not hand-copied:

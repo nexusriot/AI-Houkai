@@ -53,6 +53,22 @@ class TestMcpTools:
         assert out["importance"] == 0.9
         assert out["tags"] == ["t"]
 
+    def test_remember_many_tool(self, mcp_store):
+        out = srv.remember_many(items=[
+            {"text": "mcp batch one"},
+            {"text": "mcp batch two", "type": "procedural", "tags": ["t"]},
+        ])
+        assert out["stored"] == 2 and len(out["ids"]) == 2
+        assert srv.stats()["count"] == 2
+
+    def test_remember_many_raise_rejected(self, mcp_store):
+        out = srv.remember_many(items=[{"text": "x"}], on_conflict="raise")
+        assert out["stored"] == 0 and "error" in out
+
+    def test_remember_many_bad_item(self, mcp_store):
+        out = srv.remember_many(items=[{"bogus": 1}])
+        assert out["stored"] == 0 and "error" in out
+
     def test_edit_tool_error_dict_on_missing_id(self, mcp_store):
         out = srv.edit(memory_id="00000000-0000-4000-8000-000000000000",
                        text="nope")

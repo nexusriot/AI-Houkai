@@ -86,6 +86,44 @@ func TestMetricsEmptyRecallStillCounts(t *testing.T) {
 	}
 }
 
+func TestMetricsMutatorCountersTrackOps(t *testing.T) {
+	// Previously-uncounted mutators must now increment (parity with Python).
+	store := newTestStore(t)
+	ctx := context.Background()
+	a, _, _, _ := store.Remember(ctx, "alpha", RememberOpts{})
+	b, _, _, _ := store.Remember(ctx, "beta", RememberOpts{})
+	store.Link(ctx, a.ID, b.ID, "related")
+	store.Unlink(ctx, a.ID, b.ID, "")
+	c, _, _, _ := store.Remember(ctx, "gamma", RememberOpts{})
+	store.Supersede(ctx, c.ID, a.ID)
+	store.Restore(ctx, c.ID)
+	store.PurgeExpired(ctx, 0, true)
+
+	calls := mustMetrics(t, store)["calls"].(map[string]int)
+	for _, k := range []string{"link", "unlink", "restore", "purge_expired"} {
+		if calls[k] != 1 {
+			t.Errorf("%s counter = %d, want 1", k, calls[k])
+		}
+	}
+}
+
+func TestMetricsRecallLatencyPercentiles(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.Remember(ctx, "something to find", RememberOpts{})
+	for i := 0; i < 5; i++ {
+		store.Recall(ctx, "something", 1, RecallOpts{})
+	}
+	lat := mustMetrics(t, store)["recall_latency_ms"].(map[string]any)
+	p50 := lat["p50"].(float64)
+	p95 := lat["p95"].(float64)
+	p99 := lat["p99"].(float64)
+	max := lat["max"].(float64)
+	if !(p50 <= p95 && p95 <= p99 && p99 <= max) {
+		t.Errorf("percentiles must be monotonic and bounded by max: p50=%v p95=%v p99=%v max=%v", p50, p95, p99, max)
+	}
+}
+
 func mustMetrics(t *testing.T, store *MemoryStore) map[string]any {
 	t.Helper()
 	m, err := store.Metrics(context.Background())

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
@@ -15,13 +16,14 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 22 tools.
+// New wires up the MCP server with all 23 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
 	)
 
 	addRemember(s, store)
+	addRememberMany(s, store)
 	addRecall(s, store)
 	addRecallPack(s, store)
 	addAutoContext(s, store)
@@ -153,6 +155,86 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 			out["expires_at"] = m.ExpiresAt
 		}
 		return jsonText(out), nil
+	}
+}
+
+func addRememberMany(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("remember_many",
+		mcp.WithDescription("Store many memories in one batched, embedding-efficient call. Returns {stored, ids}."),
+		mcp.WithArray("items", mcp.Required(), mcp.Description("List of objects, each with a required \"text\" plus optional type/tags/importance/source/polarity/expires_at/ttl_seconds (same fields as remember)")),
+		mcp.WithNumber("batch_size", mcp.Description("Items per embed batch (default: 128)")),
+		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede (default: store policy); raise is not supported in bulk")),
+	)
+	s.AddTool(tool, rememberManyHandler(store))
+}
+
+// rememberManyHandler is exposed for tests.
+func rememberManyHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		rawItems, ok := req.GetArguments()["items"].([]any)
+		if !ok {
+			return jsonText(map[string]any{"stored": 0, "error": "items must be an array"}), nil
+		}
+		items := make([]memory.RememberItem, 0, len(rawItems))
+		for i, raw := range rawItems {
+			it, ok := raw.(map[string]any)
+			if !ok {
+				return jsonText(map[string]any{"stored": 0, "error": fmt.Sprintf("items[%d] must be an object", i)}), nil
+			}
+			text, _ := it["text"].(string)
+			if text == "" {
+				return jsonText(map[string]any{"stored": 0, "error": fmt.Sprintf("items[%d] missing 'text'", i)}), nil
+			}
+			var tags []string
+			if arr, ok := it["tags"].([]any); ok {
+				for _, t := range arr {
+					if sv, ok := t.(string); ok {
+						tags = append(tags, sv)
+					}
+				}
+			}
+			typ := memory.Semantic
+			if sv, ok := it["type"].(string); ok && sv != "" {
+				typ = memory.MemoryType(sv)
+			}
+			src, _ := it["source"].(string)
+			ri := memory.RememberItem{
+				Text: text,
+				RememberOpts: memory.RememberOpts{
+					Type:   typ,
+					Tags:   tags,
+					Source: src,
+				},
+			}
+			if v, ok := it["importance"].(float64); ok {
+				f := float32(v)
+				ri.Importance = &f
+			}
+			if v, ok := it["polarity"].(float64); ok {
+				ri.Polarity = int(v)
+			}
+			if v, ok := it["expires_at"].(float64); ok {
+				ri.ExpiresAt = &v
+			}
+			if v, ok := it["ttl_seconds"].(float64); ok {
+				ri.TTLSeconds = &v
+			}
+			items = append(items, ri)
+		}
+		batchSize := 128
+		if v, ok := req.GetArguments()["batch_size"].(float64); ok {
+			batchSize = int(v)
+		}
+		onConflict := memory.ConflictPolicy(req.GetString("on_conflict", ""))
+		mems, err := store.RememberMany(ctx, items, batchSize, onConflict)
+		if err != nil {
+			return jsonText(map[string]any{"stored": 0, "error": err.Error()}), nil
+		}
+		ids := make([]string, len(mems))
+		for i, m := range mems {
+			ids[i] = m.ID
+		}
+		return jsonText(map[string]any{"stored": len(mems), "ids": ids}), nil
 	}
 }
 

@@ -3,6 +3,7 @@
 Routes (all JSON in / JSON out):
 
     GET    /health                         liveness + memory count
+    GET    /ready                           readiness — backend + embedder probe (200/503)
     GET    /stats                          store statistics
     GET    /metrics                        runtime counters + recall latency
     GET    /memories?limit=&include_superseded=&include_expired=
@@ -27,8 +28,8 @@ Routes (all JSON in / JSON out):
     POST   /conflicts    {memory_id?,threshold?}   duplicate / contradiction scan
 
 Optional bearer-token auth: pass ``auth_token`` (or set ``AI_HOUKAI_HTTP_TOKEN``)
-and every request must carry ``Authorization: Bearer <token>``.  ``/health`` is
-always reachable so liveness probes work without the secret.
+and every request must carry ``Authorization: Bearer <token>``.  ``/health`` and
+``/ready`` stay reachable so liveness/readiness probes work without the secret.
 
 The handler is intentionally framework-free: a single regex routing table maps
 ``(method, path)`` to small functions taking ``(store, match, query, body)``.
@@ -46,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
-from ai_houkai.memory_system import MemoryStore
+from ai_houkai.memory_system import ExpandSpec, HybridWeights, MemoryStore, RememberItem
 from ai_houkai.memory_system.store import ConflictError, extract_key_phrases
 from ai_houkai.timeparse import parse_timestamp
 
@@ -208,6 +209,25 @@ def _health(store: MemoryStore, m, q, b):
     return 200, {"status": "ok", "count": store.count()}
 
 
+def _ready(store: MemoryStore, m, q, b):
+    # Readiness (distinct from the always-open liveness /health): exercises the
+    # backend and an actual embed so orchestrators learn whether the store can
+    # serve requests. 503 when any dependency check fails.
+    #
+    # Auth-exempt like /health, so the body is deliberately minimal: only the
+    # overall flag and a per-check ok bool. Raw error strings, provider
+    # latency/dim, and file paths are withheld so an unauthenticated probe can't
+    # enumerate backend internals — use `houkai doctor` (local/authenticated)
+    # for the detailed report. cache_ttl bounds embed calls under rapid polling.
+    r = store.readiness(cache_ttl=5.0)
+    safe = {
+        "ready": r["ready"],
+        "checks": {name: {"ok": bool(c.get("ok"))}
+                   for name, c in r["checks"].items()},
+    }
+    return (200 if r["ready"] else 503), safe
+
+
 def _stats(store: MemoryStore, m, q, b):
     return 200, {"count": store.count(), "path": store.path,
                  "collection": store.collection_name}
@@ -297,6 +317,43 @@ def _remember(store: MemoryStore, m, q, b):
     return 201, {"stored": True, **_mem_dict(mem)}
 
 
+def _remember_many(store: MemoryStore, m, q, b):
+    raw = b.get("items")
+    if not isinstance(raw, list):
+        raise HttpError(400, "body must include an 'items' array")
+    if not raw:
+        return 201, {"stored": 0, "memories": []}
+    items: list[RememberItem] = []
+    for i, it in enumerate(raw):
+        if not isinstance(it, dict):
+            raise HttpError(400, f"items[{i}]: must be an object")
+        text = it.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise HttpError(400, f"items[{i}]: missing or empty 'text'")
+        # Reuse the per-field body coercers on each item so a string tag,
+        # numeric-string importance, etc. behave exactly as on POST /memories.
+        items.append(RememberItem(
+            text=text,
+            type=it.get("type") or "semantic",
+            tags=tuple(_body_tags(it)),
+            importance=_body_float(it, "importance"),
+            source=it.get("source"),
+            polarity=_body_int(it, "polarity", 0),
+            expires_at=_body_float(it, "expires_at"),
+            ttl_seconds=_body_float(it, "ttl_seconds"),
+        ))
+    try:
+        mems = store.remember_many(
+            items,
+            batch_size=_body_int(b, "batch_size", 128),
+            on_conflict=b.get("on_conflict"),
+        )
+    except ValueError as e:
+        # bad type/tag/policy (incl. on_conflict='raise') → 400, not 500
+        raise HttpError(400, str(e))
+    return 201, {"stored": len(mems), "memories": [_mem_dict(x) for x in mems]}
+
+
 def _get_one(store: MemoryStore, m, q, b):
     mem = store._get_by_id(m.group("id"))
     if mem is None:
@@ -356,6 +413,39 @@ def _neighbors(store: MemoryStore, m, q, b):
     return 200, {"neighbors": [{**_mem_dict(mem), "rel": rel} for mem, rel in hits]}
 
 
+def _weights_from_body(b: dict[str, Any]) -> "HybridWeights | None":
+    """Build HybridWeights from a body ``graph`` field, or None to use the
+    store default. Only the graph-proximity weight is exposed over HTTP; the
+    dataclass keeps its default core weights, so ``graph`` is a pure add-on."""
+    graph = _body_float(b, "graph")
+    if graph is None:
+        return None
+    return HybridWeights(graph=graph)
+
+
+def _expand_from_body(b: dict[str, Any]) -> "ExpandSpec | None":
+    """Build ExpandSpec from a body ``expand`` object, or None for no
+    expansion. Unspecified fields fall back to ExpandSpec defaults."""
+    exp = b.get("expand")
+    if not isinstance(exp, dict):
+        return None
+    kwargs: dict[str, Any] = {}
+    rels = exp.get("rels")
+    if isinstance(rels, list) and rels:
+        kwargs["rels"] = tuple(str(r) for r in rels)
+    if exp.get("depth") is not None:
+        kwargs["depth"] = int(exp["depth"])
+    if exp.get("cap") is not None:
+        kwargs["cap"] = int(exp["cap"])
+    if exp.get("score") is not None:
+        kwargs["score"] = float(exp["score"])
+    if exp.get("decay") is not None:
+        kwargs["decay"] = float(exp["decay"])
+    if exp.get("rerank") is not None:
+        kwargs["rerank"] = bool(exp["rerank"])
+    return ExpandSpec(**kwargs)
+
+
 def _recall_params(q, b):
     """Pull recall arguments from a query string (GET) or JSON body (POST)."""
     if b:
@@ -374,6 +464,17 @@ def _recall_params(q, b):
             "include_superseded": _body_bool(b, "include_superseded"),
             "include_expired": _body_bool(b, "include_expired"),
             "explain": _body_bool(b, "explain"),
+            # Advanced retrieval tuning is POST-body-only (nested/typed values
+            # don't map cleanly onto a query string), matching the Go port's
+            # POST surface: fusion, MMR diversity, dedup, the min_cosine gate,
+            # the graph-proximity weight, and graph-walk expansion (incl.
+            # rerank gating).
+            "fusion": get("fusion") or "weighted",
+            "diversity": _body_float(b, "diversity"),
+            "dedup_threshold": _body_float(b, "dedup_threshold"),
+            "min_cosine": _body_float(b, "min_cosine"),
+            "weights": _weights_from_body(b),
+            "expand": _expand_from_body(b),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -445,9 +546,11 @@ def _recall_pack(store: MemoryStore, m, q, b):
         until=_time(b.get("until")),
         mode=b.get("mode") or "hybrid",
         fusion=b.get("fusion") or "weighted",
+        weights=_weights_from_body(b),
         diversity=_body_float(b, "diversity"),
         dedup_threshold=_body_float(b, "dedup_threshold"),
         min_cosine=_body_float(b, "min_cosine"),
+        expand=_expand_from_body(b),
         max_items=_body_int(b, "max_items", 50),
         include_superseded=_body_bool(b, "include_superseded"),
         header=b.get("header", "## Relevant memory"),
@@ -519,10 +622,12 @@ Route = tuple[str, "re.Pattern[str]", Callable, bool]  # method, pat, fn, needs_
 
 _ROUTES: list[Route] = [
     ("GET",    re.compile(r"^/health$"),                         _health,      False),
+    ("GET",    re.compile(r"^/ready$"),                          _ready,       False),
     ("GET",    re.compile(r"^/stats$"),                          _stats,       False),
     ("GET",    re.compile(r"^/metrics$"),                        _metrics,     False),
     ("GET",    re.compile(r"^/memories$"),                       _list,        False),
     ("POST",   re.compile(r"^/memories$"),                       _remember,    True),
+    ("POST",   re.compile(r"^/memories/batch$"),                 _remember_many, True),
     ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)$"),         _get_one,     False),
     ("PATCH",  re.compile(r"^/memories/(?P<id>[^/]+)$"),         _edit,        True),
     ("DELETE", re.compile(r"^/memories/(?P<id>[^/]+)$"),         _forget,      False),
@@ -606,7 +711,7 @@ def build_handler(
                 remaining -= len(chunk)
 
         def _authorized(self, path: str) -> bool:
-            if auth_token is None or path == "/health":
+            if auth_token is None or path in ("/health", "/ready"):
                 return True
             header = self.headers.get("Authorization", "")
             # Constant-time compare so a wrong token can't be recovered by

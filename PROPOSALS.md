@@ -3,7 +3,7 @@
 > **Status: all three shipped.** This document is the original design record
 > for hybrid retrieval, conflict/contradiction detection, and memory linking —
 > all now implemented and live. Kept for historical context; see
-> [DESIGN.md](DESIGN.md) for the current behaviour.
+> [docs/DESIGN.md](docs/DESIGN.md) for the current behaviour.
 
 Designs for three (now-implemented) features.
 
@@ -511,9 +511,9 @@ codebase already uses for `recall(type=…)`.
 
 When implementing, update:
 
-- `DESIGN.md` §3 (Data Model) — new fields, polarity, links serialisation.
-- `DESIGN.md` §5 (Memory Lifecycle) — supersede branch in the diagram.
-- `DESIGN.md` §7 (Reflection Engine) — new default `consolidate` mode.
-- `DESIGN.md` §8 (MCP Server) — five new tools.
+- `docs/DESIGN.md` §3 (Data Model) — new fields, polarity, links serialisation.
+- `docs/DESIGN.md` §5 (Memory Lifecycle) — supersede branch in the diagram.
+- `docs/DESIGN.md` §7 (Reflection Engine) — new default `consolidate` mode.
+- `docs/DESIGN.md` §8 (MCP Server) — five new tools.
 - `README.md` — quick examples for each.
 - `tests/` — new files `test_hybrid.py`, `test_conflicts.py`, `test_links.py`.

@@ -5,6 +5,7 @@
 // Routes (all JSON in / JSON out):
 //
 //	GET    /health                         liveness + memory count (skips auth)
+//	GET    /ready                           readiness — backend + embedder probe, 200/503 (skips auth)
 //	GET    /stats                          store statistics
 //	GET    /metrics                        runtime counters + recall latency
 //	GET    /memories?limit=&include_superseded=&include_expired=
@@ -29,8 +30,8 @@
 //	POST   /conflicts    {memory_id?,threshold?}   duplicate / contradiction scan
 //
 // Optional bearer-token auth: pass a token (or set AI_HOUKAI_HTTP_TOKEN) and
-// every request must carry "Authorization: Bearer <token>". /health is always
-// reachable so liveness probes work without the secret.
+// every request must carry "Authorization: Bearer <token>". /health and /ready
+// stay reachable so liveness/readiness probes work without the secret.
 package httpserver
 
 import (
@@ -92,10 +93,12 @@ func New(store *memory.MemoryStore, path, collection, token string) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.wrap(s.health))
+	mux.HandleFunc("GET /ready", s.wrap(s.ready))
 	mux.HandleFunc("GET /stats", s.wrap(s.stats))
 	mux.HandleFunc("GET /metrics", s.wrap(s.metrics))
 	mux.HandleFunc("GET /memories", s.wrap(s.list))
 	mux.HandleFunc("POST /memories", s.wrap(s.remember))
+	mux.HandleFunc("POST /memories/batch", s.wrap(s.rememberMany))
 	mux.HandleFunc("GET /memories/{id}", s.wrap(s.getOne))
 	mux.HandleFunc("PATCH /memories/{id}", s.wrap(s.edit))
 	mux.HandleFunc("DELETE /memories/{id}", s.wrap(s.forget))
@@ -203,7 +206,7 @@ func (c *captureWriter) finish() {
 }
 
 func (s *Server) authorized(r *http.Request) bool {
-	if s.token == "" || r.URL.Path == "/health" {
+	if s.token == "" || r.URL.Path == "/health" || r.URL.Path == "/ready" {
 		return true
 	}
 	return r.Header.Get("Authorization") == "Bearer "+s.token
@@ -262,6 +265,36 @@ func (s *Server) health(r *http.Request) (int, any, error) {
 	// Liveness only — the collection name is intentionally omitted so an
 	// unauthenticated probe cannot enumerate the store (matches Python).
 	return 200, map[string]any{"status": "ok", "count": n}, nil
+}
+
+func (s *Server) ready(r *http.Request) (int, any, error) {
+	// Readiness (distinct from the always-open liveness /health): exercises the
+	// backend and an actual embed so orchestrators learn whether the store can
+	// serve requests. 503 when any dependency check fails.
+	//
+	// Auth-exempt like /health, so the body is deliberately minimal: only the
+	// overall flag and a per-check ok bool. Raw error strings, provider
+	// latency/dim, and paths are withheld so an unauthenticated probe can't
+	// enumerate backend internals — use `houkai doctor` for the detailed
+	// report. The cacheTTL bounds embed calls under rapid polling.
+	rep := s.store.Readiness(r.Context(), 5*time.Second)
+	status := 200
+	if b, _ := rep["ready"].(bool); !b {
+		status = 503
+	}
+	safe := map[string]any{"ready": rep["ready"]}
+	if checks, ok := rep["checks"].(map[string]any); ok {
+		sc := map[string]any{}
+		for name, c := range checks {
+			okv := false
+			if m, ok := c.(map[string]any); ok {
+				okv, _ = m["ok"].(bool)
+			}
+			sc[name] = map[string]any{"ok": okv}
+		}
+		safe["checks"] = sc
+	}
+	return status, safe, nil
 }
 
 func (s *Server) stats(r *http.Request) (int, any, error) {
@@ -421,6 +454,61 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 	return 201, out, nil
 }
 
+func (s *Server) rememberMany(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	rawItems, ok := b["items"].([]any)
+	if !ok {
+		return 0, nil, errStatus(400, "body must include an 'items' array")
+	}
+	items := make([]memory.RememberItem, 0, len(rawItems))
+	for i, raw := range rawItems {
+		it, ok := raw.(map[string]any)
+		if !ok {
+			return 0, nil, errStatus(400, "items[%d]: must be an object", i)
+		}
+		text, err := requireStr(it, "text")
+		if err != nil {
+			return 0, nil, errStatus(400, "items[%d]: missing 'text'", i)
+		}
+		ri := memory.RememberItem{
+			Text: text,
+			RememberOpts: memory.RememberOpts{
+				Type:       memory.MemoryType(bodyStr(it, "type", string(memory.Semantic))),
+				Tags:       bodyStrSlice(it, "tags"),
+				Importance: bodyFloatPtr(it, "importance"),
+				Source:     bodyStr(it, "source", ""),
+				Polarity:   int(bodyFloat(it, "polarity", 0)),
+			},
+		}
+		if v, ok := it["expires_at"].(float64); ok {
+			ri.ExpiresAt = &v
+		}
+		if v, ok := it["ttl_seconds"].(float64); ok {
+			ri.TTLSeconds = &v
+		}
+		items = append(items, ri)
+	}
+	batchSize := 128
+	if v, ok := b["batch_size"].(float64); ok {
+		batchSize = int(v)
+	}
+	mems, err := s.store.RememberMany(
+		r.Context(), items, batchSize,
+		memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
+	)
+	if err != nil {
+		return 0, nil, err // validation (raise / bad item) → 400 via wrap
+	}
+	out := make([]map[string]any, len(mems))
+	for i, m := range mems {
+		out[i] = memDict(m)
+	}
+	return 201, map[string]any{"stored": len(mems), "memories": out}, nil
+}
+
 func (s *Server) getOne(r *http.Request) (int, any, error) {
 	mem, err := s.store.GetByID(r.Context(), r.PathValue("id"))
 	if errors.Is(err, memory.ErrNotFound) {
@@ -578,9 +666,11 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		MaxItems:          int(bodyFloat(b, "max_items", 50)),
 		IncludeSuperseded: bodyBool(b, "include_superseded"),
 		Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
+		Weights:           weightsFromBody(b),
 		Diversity:         bodyFloatPtr(b, "diversity"),
 		DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
 		MinCosine:         bodyFloatPtr(b, "min_cosine"),
+		Expand:            expandFromBody(b),
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
@@ -765,9 +855,11 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
 			IncludeExpired:    bodyBool(b, "include_expired"),
 			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
+			Weights:           weightsFromBody(b),
 			Diversity:         bodyFloatPtr(b, "diversity"),
 			DedupThreshold:    bodyFloatPtr(b, "dedup_threshold"),
 			MinCosine:         bodyFloatPtr(b, "min_cosine"),
+			Expand:            expandFromBody(b),
 			NoTouch:           !bodyBoolDef(b, "touch", true),
 			Explain:           bodyBool(b, "explain"),
 		}, int(bodyFloat(b, "k", 5)), nil
@@ -794,6 +886,58 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		IncludeExpired:    qsBool(r, "include_expired"),
 		Explain:           qsBool(r, "explain"),
 	}, qsInt(r, "k", 5), nil
+}
+
+// weightsFromBody builds HybridWeights from a body `graph` field. It starts
+// from DefaultWeights so exposing only `graph` doesn't zero the core weights
+// (which Recall would reject) — graph is a pure add-on. Absent → zero value,
+// which Recall replaces with DefaultWeights.
+func weightsFromBody(b map[string]any) memory.HybridWeights {
+	if p := bodyFloatPtr(b, "graph"); p != nil {
+		w := memory.DefaultWeights()
+		w.Graph = *p
+		return w
+	}
+	return memory.HybridWeights{}
+}
+
+// expandFromBody builds an *ExpandSpec from a body `expand` object (nil for no
+// expansion). Unspecified fields fall back to the same defaults as Python's
+// ExpandSpec so the two ports behave identically.
+func expandFromBody(b map[string]any) *memory.ExpandSpec {
+	raw, ok := b["expand"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	spec := &memory.ExpandSpec{
+		Rels:  []string{"refines", "example_of"},
+		Depth: 1, Cap: 5, Score: 0.70, Decay: 1.0,
+	}
+	if v, ok := raw["rels"].([]any); ok && len(v) > 0 {
+		rels := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				rels = append(rels, s)
+			}
+		}
+		spec.Rels = rels
+	}
+	if v, ok := raw["depth"].(float64); ok {
+		spec.Depth = int(v)
+	}
+	if v, ok := raw["cap"].(float64); ok {
+		spec.Cap = int(v)
+	}
+	if v, ok := raw["score"].(float64); ok {
+		spec.Score = float32(v)
+	}
+	if v, ok := raw["decay"].(float64); ok {
+		spec.Decay = float32(v)
+	}
+	if v, ok := raw["rerank"].(bool); ok {
+		spec.Rerank = v
+	}
+	return spec
 }
 
 func memDict(m memory.Memory) map[string]any {
