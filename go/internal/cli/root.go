@@ -87,6 +87,16 @@ func NewRootCmd() *cobra.Command {
 			storeCfg.Actor = "cli"
 			storeCfg.EmbeddingModel = embedModelName(cfg)
 			store := memory.NewMemoryStore(backend, embedder, storeCfg)
+			if cfg.Index == "sqlite" {
+				// A failure to open the index must not stop the CLI: the store
+				// works without it, just with full scans.
+				if err := store.EnableIndex(cmd.Context(), ""); err != nil {
+					fmt.Fprintf(os.Stderr,
+						"ai-houkai: sidecar index unavailable (%v) — using full scans\n", err)
+				}
+			} else if cfg.Index != "" {
+				return fmt.Errorf("index must be \"sqlite\" or empty — got %q", cfg.Index)
+			}
 
 			// Inject into context.
 			ctx := context.WithValue(cmd.Context(), storeKey, store)
@@ -119,6 +129,11 @@ func NewRootCmd() *cobra.Command {
 		newGraphCmd(),
 		newConflictsCmd(),
 		newSupersedeCmd(),
+		newMergeCmd(),
+		newVersionsCmd(),
+		newPathCmd(),
+		newTagsCmd(),
+		newTrashCmd(),
 		newRestoreCmd(),
 		newPruneCmd(),
 		newPurgeCmd(),
@@ -129,8 +144,14 @@ func NewRootCmd() *cobra.Command {
 		newInfoCmd(),
 		newBackupCmd(),
 		newStatsCmd(),
+		newMetricsCmd(),
+		newHistoryCmd(),
+		newStateAtCmd(),
+		newGetAtCmd(),
 		newDoctorCmd(),
+		newEvalCmd(),
 		newIngestCmd(),
+		newReindexCmd(),
 		newServeCmd(),
 		newCollectionsCmd(),
 		newTuiCmd(),

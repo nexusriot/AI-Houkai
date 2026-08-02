@@ -6,7 +6,8 @@ chromadb>=0.5.0
 sentence-transformers>=2.7.0
 
 # MCP server
-mcp>=1.2.0
+# <2: mcp 2.0.0 removed mcp.server.fastmcp (see pyproject for the full note).
+mcp>=1.2.0,<2
 
 # Claude agent example + anthropic: summarizer
 anthropic>=0.40.0

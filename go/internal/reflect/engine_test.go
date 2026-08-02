@@ -3,6 +3,7 @@ package reflect
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
@@ -210,4 +211,106 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// Tiered reflection (F1): the engine only ever clustered episodic memories, so
+// summaries were never themselves consolidated and a long-lived store
+// accumulated them without bound.
+
+// typedItem builds a vector.Item of an arbitrary type and tag set, so the
+// tier tests can seed existing summaries directly.
+func typedItem(id string, t memory.MemoryType, vec []float32, tags ...string) vector.Item {
+	m := memory.Memory{ID: id, Type: t, Importance: 0.5, Tags: tags}
+	return vector.Item{
+		ID: id, Content: "text-" + id, Embedding: vec,
+		Metadata: memory.MemoryToMetadata(m),
+	}
+}
+
+func TestReflectDefaultsToEpisodicOnly(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		typedItem("e1", memory.Episodic, []float32{1, 0, 0}),
+		typedItem("e2", memory.Episodic, []float32{1, 0, 0}),
+		typedItem("s1", memory.Semantic, []float32{1, 0, 0}),
+		typedItem("s2", memory.Semantic, []float32{1, 0, 0}),
+	}}
+	clusters, err := New(store, 0.9, 2, nil).Clusters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("clusters = %d, want 1", len(clusters))
+	}
+	for _, m := range clusters[0] {
+		if m.Type != memory.Episodic {
+			t.Errorf("clustered a %s memory by default", m.Type)
+		}
+	}
+}
+
+func TestReflectCanClusterOtherTypes(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		typedItem("f1", memory.Feedback, []float32{1, 0, 0}),
+		typedItem("f2", memory.Feedback, []float32{1, 0, 0}),
+	}}
+	e := New(store, 0.9, 2, nil)
+	e.Types = []memory.MemoryType{memory.Feedback}
+	clusters, err := e.Clusters(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 1 {
+		t.Fatalf("feedback memories were not clustered: %d", len(clusters))
+	}
+}
+
+func TestReflectTagsTheTier(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		typedItem("e1", memory.Episodic, []float32{1, 0, 0}),
+		typedItem("e2", memory.Episodic, []float32{1, 0, 0}),
+	}}
+	made, err := New(store, 0.9, 2, nil).Reflect(context.Background(), false, ConsolidateNone)
+	if err != nil || len(made) == 0 {
+		t.Fatalf("reflect = %d (%v)", len(made), err)
+	}
+	if LevelOf(made[0]) != 1 {
+		t.Errorf("tags = %v, want level:1", made[0].Tags)
+	}
+}
+
+func TestReflectMaxLevelCapsTheHierarchy(t *testing.T) {
+	// The guard against runaway re-summarisation eating the store.
+	seed := func() *fakeReflectStore {
+		return &fakeReflectStore{items: []vector.Item{
+			typedItem("s1", memory.Semantic, []float32{1, 0, 0}, "reflection", "level:1"),
+			typedItem("s2", memory.Semantic, []float32{1, 0, 0}, "reflection", "level:1"),
+		}}
+	}
+	capped := New(seed(), 0.9, 2, nil)
+	capped.Types = []memory.MemoryType{memory.Semantic}
+	capped.MaxLevel = 1
+	if made, _ := capped.Reflect(context.Background(), false, ConsolidateNone); len(made) != 0 {
+		t.Errorf("max_level=1 still produced %d summaries", len(made))
+	}
+
+	deeper := New(seed(), 0.9, 2, nil)
+	deeper.Types = []memory.MemoryType{memory.Semantic}
+	deeper.MaxLevel = 2
+	made, err := deeper.Reflect(context.Background(), false, ConsolidateNone)
+	if err != nil || len(made) == 0 {
+		t.Fatalf("max_level=2 reflect = %d (%v)", len(made), err)
+	}
+	if LevelOf(made[0]) != 2 {
+		t.Errorf("tags = %v, want level:2", made[0].Tags)
+	}
+	// The summary carries its own tier, not its members'.
+	levels := 0
+	for _, tag := range made[0].Tags {
+		if strings.HasPrefix(tag, "level:") {
+			levels++
+		}
+	}
+	if levels != 1 {
+		t.Errorf("tags = %v, want exactly one level tag", made[0].Tags)
+	}
 }

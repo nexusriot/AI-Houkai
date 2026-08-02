@@ -219,6 +219,7 @@ class TestCollectionsCommands:
         assert result.exit_code == 1
         assert "active collection" in result.output
 
+    @pytest.mark.needs_model
     def test_copy_preserves_memories_and_search(self, tmp_path):
         store_path = str(tmp_path / "chroma")
         _invoke(["remember", "The deploy target is the staging box", "--tag", "ops"],

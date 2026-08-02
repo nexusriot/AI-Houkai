@@ -9,6 +9,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/nexusriot/ai-houkai/internal/eval"
 	"github.com/nexusriot/ai-houkai/internal/maintenance"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	reflectpkg "github.com/nexusriot/ai-houkai/internal/reflect"
@@ -16,7 +17,7 @@ import (
 	"github.com/nexusriot/ai-houkai/internal/version"
 )
 
-// New wires up the MCP server with all 23 tools.
+// New wires up the MCP server with all 41 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
@@ -27,6 +28,7 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addRecall(s, store)
 	addRecallPack(s, store)
 	addAutoContext(s, store)
+	addGet(s, store)
 	addForget(s, store)
 	addEdit(s, store)
 	addListRecent(s, store)
@@ -39,12 +41,19 @@ func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
 	addLink(s, store)
 	addUnlink(s, store)
 	addNeighbors(s, store)
+	addSubgraph(s, store)
 	addFindConflicts(s, store)
 	addSupersede(s, store)
+	addRestore(s, store)
+	addUndo(s, store)
+	addNuke(s, store)
+	addEvalRecall(s, store)
+	addReady(s, store)
 	addMaintenanceTick(s, store)
 	addJournalTail(s, store)
 	addExport(s, store)
 	addImport(s, store)
+	addCurationTools(s, store)
 
 	return s
 }
@@ -92,6 +101,84 @@ func optFloat32(req mcp.CallToolRequest, key string) *float32 {
 	return nil
 }
 
+// weightsFromReq builds HybridWeights from a `graph` argument. It starts from
+// DefaultWeights so exposing only `graph` doesn't zero the core weights (which
+// Recall would reject) — graph is a pure add-on. Absent → zero value, which
+// Recall replaces with DefaultWeights.
+func weightsFromReq(req mcp.CallToolRequest) memory.HybridWeights {
+	if p := optFloat32(req, "graph"); p != nil {
+		w := memory.DefaultWeights()
+		w.Graph = *p
+		return w
+	}
+	return memory.HybridWeights{}
+}
+
+// expandFromReq builds an *ExpandSpec from flat `expand_*` arguments (nil for
+// no expansion). MCP tool schemas are flat, so the HTTP body's nested `expand`
+// object is spelled here as one argument per field; unspecified fields fall
+// back to the same defaults as Python's ExpandSpec.
+func expandFromReq(req mcp.CallToolRequest) *memory.ExpandSpec {
+	args := req.GetArguments()
+	keys := []string{"expand_rels", "expand_depth", "expand_cap",
+		"expand_score", "expand_decay", "expand_rerank"}
+	present := false
+	for _, k := range keys {
+		if _, ok := args[k]; ok {
+			present = true
+			break
+		}
+	}
+	if !present {
+		return nil
+	}
+	spec := &memory.ExpandSpec{
+		Rels:  []string{"refines", "example_of"},
+		Depth: 1, Cap: 5, Score: 0.70, Decay: 1.0,
+	}
+	if v, ok := args["expand_rels"].([]any); ok && len(v) > 0 {
+		rels := make([]string, 0, len(v))
+		for _, r := range v {
+			if s, ok := r.(string); ok {
+				rels = append(rels, s)
+			}
+		}
+		if len(rels) > 0 {
+			spec.Rels = rels
+		}
+	}
+	if v, ok := args["expand_depth"].(float64); ok {
+		spec.Depth = int(v)
+	}
+	if v, ok := args["expand_cap"].(float64); ok {
+		spec.Cap = int(v)
+	}
+	if v, ok := args["expand_score"].(float64); ok {
+		spec.Score = float32(v)
+	}
+	if v, ok := args["expand_decay"].(float64); ok {
+		spec.Decay = float32(v)
+	}
+	if v, ok := args["expand_rerank"].(bool); ok {
+		spec.Rerank = v
+	}
+	return spec
+}
+
+// withExpandArgs appends the flat expand_* argument declarations shared by the
+// recall and recall_pack tools.
+func withExpandArgs(opts ...mcp.ToolOption) []mcp.ToolOption {
+	return append(opts,
+		mcp.WithArray("expand_rels", mcp.Description("Graph-walk expansion: link rels to follow (default: refines, example_of)"),
+			mcp.Items(map[string]any{"type": "string"})),
+		mcp.WithNumber("expand_depth", mcp.Description("Graph-walk expansion: hop depth (default: 1)")),
+		mcp.WithNumber("expand_cap", mcp.Description("Graph-walk expansion: max neighbours added (default: 5)")),
+		mcp.WithNumber("expand_score", mcp.Description("Graph-walk expansion: score assigned to a hop-1 neighbour (default: 0.70)")),
+		mcp.WithNumber("expand_decay", mcp.Description("Graph-walk expansion: per-hop score multiplier beyond hop 1 (default: 1.0)")),
+		mcp.WithBoolean("expand_rerank", mcp.Description("Merge expanded neighbours into the pool BEFORE dedup/MMR/top-k instead of appending after")),
+	)
+}
+
 func jsonText(v any) *mcp.CallToolResult {
 	b, _ := json.Marshal(v)
 	return mcp.NewToolResultText(string(b))
@@ -114,6 +201,9 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
 		mcp.WithNumber("expires_at", mcp.Description("Absolute TTL as a Unix timestamp (hidden from recall once passed)")),
 		mcp.WithNumber("ttl_seconds", mcp.Description("Relative TTL in seconds from now. Pass at most one of expires_at/ttl_seconds")),
+		mcp.WithBoolean("pinned", mcp.Description("Standing instruction: always offered to recall_pack(include_pinned), never pruned by decay")),
+		mcp.WithString("trust", mcp.Description("trusted (default) | reported | untrusted — how much the memory's ORIGIN is trusted. Use untrusted for anything read from content the agent did not author")),
+		mcp.WithBoolean("idempotent", mcp.Description("No-op if a live memory already has the same normalised text: bump its access count and return it unchanged")),
 	)
 	s.AddTool(tool, rememberHandler(store))
 }
@@ -126,6 +216,9 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 			return errResult(err), nil
 		}
 		opts := memory.RememberOpts{
+			Pinned:     req.GetBool("pinned", false),
+			Trust:      memory.TrustLevel(req.GetString("trust", "")),
+			Idempotent: req.GetBool("idempotent", false),
 			Type:       memory.MemoryType(req.GetString("type", string(memory.Semantic))),
 			Tags:       req.GetStringSlice("tags", nil),
 			Importance: optFloat32(req, "importance"), // nil = unset → store default / ImportanceFn
@@ -239,7 +332,7 @@ func rememberManyHandler(store *memory.MemoryStore) func(context.Context, mcp.Ca
 }
 
 func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
-	tool := mcp.NewTool("recall",
+	recallOpts := []mcp.ToolOption{
 		mcp.WithDescription("Search memories semantically. Returns ranked list."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Search query")),
 		mcp.WithNumber("k", mcp.Description("Max results (default: 5)")),
@@ -259,7 +352,11 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("min_cosine", mcp.Description("Absolute cosine relevance floor in [-1,1]; drops weak hits (omit to disable)")),
 		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on the hits (default: true; false = read-only)")),
 		mcp.WithBoolean("explain", mcp.Description("Include a per-signal score breakdown on each result")),
-	)
+		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid mode only): lifts candidates linked to other strong hits. Omit/0 disables the channel")),
+		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; fts unions the best full-corpus matches from the sidecar index into the pool first (hybrid mode, index required)")),
+		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted (omit for no filter)")),
+	}
+	tool := mcp.NewTool("recall", withExpandArgs(recallOpts...)...)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
 		if err != nil {
@@ -287,6 +384,10 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			MinCosine:         optFloat32(req, "min_cosine"),
 			NoTouch:           !req.GetBool("touch", true),
 			Explain:           req.GetBool("explain", false),
+			Weights:           weightsFromReq(req),
+			Expand:            expandFromReq(req),
+			LexicalIndex:      memory.LexicalIndexMode(req.GetString("lexical_index", "")),
+			MinTrust:          memory.TrustLevel(req.GetString("min_trust", "")),
 		}
 		results, err := store.Recall(ctx, query, k, opts)
 		if err != nil {
@@ -324,11 +425,11 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 }
 
 func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
-	tool := mcp.NewTool("recall_pack",
-		mcp.WithDescription("Assemble the most relevant memories into a token-budgeted context block. "+
-			"Ranks with hybrid scoring (cosine + BM25 + recency + importance) by default, then greedily "+
-			"packs results until token_budget is reached. Returns a ready-to-inject `text` block plus the "+
-			"packed items. token_budget is a soft ceiling (estimated at ~4 chars/token) covering the "+
+	packOpts := []mcp.ToolOption{
+		mcp.WithDescription("Assemble the most relevant memories into a token-budgeted context block. " +
+			"Ranks with hybrid scoring (cosine + BM25 + recency + importance) by default, then greedily " +
+			"packs results until token_budget is reached. Returns a ready-to-inject `text` block plus the " +
+			"packed items. token_budget is a soft ceiling (estimated at ~4 chars/token) covering the " +
 			"memory lines, not the header."),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Search query")),
 		mcp.WithNumber("token_budget", mcp.Description("Token budget for the packed block (default: 800)")),
@@ -348,7 +449,14 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithBoolean("compress", mcp.Description("Fold budget-dropped, similar memories into compressed summary lines")),
 		mcp.WithNumber("compress_threshold", mcp.Description("Jaccard similarity for compression clustering (default: 0.30)")),
 		mcp.WithNumber("compress_min_group", mcp.Description("Minimum cluster size to compress (default: 2)")),
-	)
+		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid mode only): lifts candidates linked to other strong hits. Omit/0 disables the channel")),
+		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on the packed memories (default: true; false = read-only)")),
+		mcp.WithString("header", mcp.Description("Heading prepended to the block, not counted against token_budget (default: \"## Relevant memory\"; \"\" for none)")),
+		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; fts unions the best full-corpus matches from the sidecar index into the pool first (hybrid mode, index required)")),
+		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted")),
+		mcp.WithBoolean("include_pinned", mcp.Description("Prepend every pinned memory ahead of the ranked hits, so a standing instruction is present whether or not it matches the query. They compete for the same budget")),
+	}
+	tool := mcp.NewTool("recall_pack", withExpandArgs(packOpts...)...)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, err := req.RequireString("query")
 		if err != nil {
@@ -357,6 +465,12 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		since, until, err := parseSinceUntil(req)
 		if err != nil {
 			return errResult(err), nil
+		}
+		// Header is tri-state: absent = default heading, present (incl. "") =
+		// verbatim. A plain GetString would make "" indistinguishable from absent.
+		var header *string
+		if v, ok := req.GetArguments()["header"].(string); ok {
+			header = &v
 		}
 		pack, err := store.RecallPack(ctx, query, memory.PackOpts{
 			TokenBudget:       req.GetInt("token_budget", 800),
@@ -376,6 +490,13 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 			Compress:          req.GetBool("compress", false),
 			CompressThreshold: float32(req.GetFloat("compress_threshold", 0.30)),
 			CompressMinGroup:  req.GetInt("compress_min_group", 2),
+			Weights:           weightsFromReq(req),
+			Expand:            expandFromReq(req),
+			NoTouch:           !req.GetBool("touch", true),
+			Header:            header,
+			LexicalIndex:      memory.LexicalIndexMode(req.GetString("lexical_index", "")),
+			MinTrust:          memory.TrustLevel(req.GetString("min_trust", "")),
+			IncludePinned:     req.GetBool("include_pinned", false),
 		})
 		if err != nil {
 			return errResult(err), nil
@@ -431,6 +552,8 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithBoolean("compress", mcp.Description("Fold budget-dropped, similar memories into compressed summary lines")),
 		mcp.WithNumber("compress_threshold", mcp.Description("Jaccard similarity for compression clustering (default: 0.30)")),
 		mcp.WithNumber("compress_min_group", mcp.Description("Minimum cluster size to compress (default: 2)")),
+		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on every fan-out recall (default: true; false = read-only)")),
+		mcp.WithString("header", mcp.Description("Heading prepended to the block, not counted against token_budget (default: \"## Relevant memory\"; \"\" for none)")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		task, err := req.RequireString("task")
@@ -438,6 +561,10 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 			return errResult(err), nil
 		}
 		maxPhrases := req.GetInt("max_phrases", 3)
+		var header *string
+		if v, ok := req.GetArguments()["header"].(string); ok {
+			header = &v
+		}
 		pack, err := store.AutoContextPack(ctx, task, memory.AutoContextOpts{
 			TokenBudget:       req.GetInt("token_budget", 800),
 			MaxPhrases:        maxPhrases,
@@ -446,6 +573,8 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 			Compress:          req.GetBool("compress", false),
 			CompressThreshold: float32(req.GetFloat("compress_threshold", 0.30)),
 			CompressMinGroup:  req.GetInt("compress_min_group", 2),
+			NoTouch:           !req.GetBool("touch", true),
+			Header:            header,
 		})
 		if err != nil {
 			return errResult(err), nil
@@ -547,6 +676,53 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 	}
 }
 
+// memRecord renders a full memory record, shared by the get / restore /
+// subgraph tools. Mirrors Python's _mem_dict.
+func memRecord(m memory.Memory) map[string]any {
+	links := make([]map[string]string, len(m.Links))
+	for i, l := range m.Links {
+		links[i] = map[string]string{"to": l.To, "rel": l.Rel}
+	}
+	return map[string]any{
+		"id":            m.ID,
+		"text":          m.Text,
+		"type":          string(m.Type),
+		"tags":          m.Tags,
+		"importance":    m.Importance,
+		"source":        m.Source,
+		"polarity":      m.Polarity,
+		"created_at":    m.CreatedAt,
+		"last_accessed": m.LastAccessed,
+		"access_count":  m.AccessCount,
+		"superseded_by": m.SupersededBy,
+		"superseded_at": m.SupersededAt,
+		"expires_at":    m.ExpiresAt,
+		"links":         links,
+	}
+}
+
+func addGet(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("get",
+		mcp.WithDescription("Fetch one memory by its exact id (or 8-char prefix). A plain read: no "+
+			"access-count bump and no filtering — a superseded or expired memory is still returned. "+
+			"Use `recall` for ranked search and `get_at` for a past point in time."),
+		mcp.WithString("memory_id", mcp.Required(), mcp.Description("Memory UUID or 8-char prefix")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("memory_id")
+		if err != nil {
+			return errResult(err), nil
+		}
+		mem, err := store.GetByID(ctx, id)
+		if err != nil {
+			return jsonText(map[string]any{"found": false, "id": id}), nil
+		}
+		out := memRecord(mem)
+		out["found"] = true
+		return jsonText(out), nil
+	})
+}
+
 func addListRecent(s *server.MCPServer, store *memory.MemoryStore) {
 	tool := mcp.NewTool("list_recent",
 		mcp.WithDescription("List recently created memories."),
@@ -646,7 +822,7 @@ func addHistory(s *server.MCPServer, store *memory.MemoryStore) {
 		if err != nil {
 			return errResult(err), nil
 		}
-		entries, err := store.History(ctx, id)
+		entries, err := store.History(ctx, id, true)
 		if err != nil {
 			return errResult(err), nil
 		}
@@ -834,6 +1010,222 @@ func addSupersede(s *server.MCPServer, store *memory.MemoryStore) {
 			return errResult(err), nil
 		}
 		return jsonText(map[string]any{"ok": true, "old_id": oldID, "new_id": newID}), nil
+	})
+}
+
+func addRestore(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("restore",
+		mcp.WithDescription("Undo a supersede: clear the soft-delete so the memory is visible again. "+
+			"Also removes the 'supersedes' link the superseder gained. Returns restored:false when the "+
+			"memory does not exist or was not superseded."),
+		mcp.WithString("memory_id", mcp.Required(), mcp.Description("Memory UUID or 8-char prefix")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		id, err := req.RequireString("memory_id")
+		if err != nil {
+			return errResult(err), nil
+		}
+		var wasSupersededBy string
+		if mem, err := store.GetByID(ctx, id); err == nil {
+			wasSupersededBy = mem.SupersededBy
+		}
+		ok, err := store.Restore(ctx, id)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(map[string]any{
+			"restored": ok, "id": id, "was_superseded_by": wasSupersededBy,
+		}), nil
+	})
+}
+
+func addSubgraph(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("subgraph",
+		mcp.WithDescription("Return the link graph reachable from the given memory ids within depth hops. "+
+			"Follows OUTGOING links only (use `neighbors` with direction=\"in\" for the reverse). "+
+			"Returns {nodes, edges:[{src,dst,rel}]}."),
+		mcp.WithArray("memory_ids", mcp.Required(), mcp.Description("Seed memory ids"),
+			mcp.Items(map[string]any{"type": "string"})),
+		mcp.WithNumber("depth", mcp.Description("Hops to follow (default: 1)")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, ok := req.GetArguments()["memory_ids"].([]any)
+		if !ok || len(raw) == 0 {
+			return errResult(fmt.Errorf("memory_ids is required")), nil
+		}
+		ids := make([]string, 0, len(raw))
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				ids = append(ids, s)
+			}
+		}
+		graph, err := store.Subgraph(ctx, ids, req.GetInt("depth", 1))
+		if err != nil {
+			return errResult(err), nil
+		}
+		nodes := make([]map[string]any, len(graph.Nodes))
+		for i, n := range graph.Nodes {
+			nodes[i] = memRecord(n)
+		}
+		edges := make([]map[string]string, len(graph.Edges))
+		for i, e := range graph.Edges {
+			edges[i] = map[string]string{"src": e.From, "dst": e.To, "rel": e.Rel}
+		}
+		return jsonText(map[string]any{"nodes": nodes, "edges": edges}), nil
+	})
+}
+
+func addUndo(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("undo",
+		mcp.WithDescription("Reverse a journaled mutation — the newest one by default. Pass `ts` to undo "+
+			"the entry with that exact journal timestamp (as reported by journal_tail), or `memory_id` to "+
+			"undo the newest entry touching that memory. Undo refuses when the current state has diverged "+
+			"from the entry's \"after\" snapshot. The undo itself is journaled."),
+		mcp.WithNumber("ts", mcp.Description("Exact journal timestamp of the entry to reverse")),
+		mcp.WithString("memory_id", mcp.Description("Undo the newest entry touching this memory")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		j := store.Journal()
+		if j == nil {
+			return errResult(fmt.Errorf("journaling is disabled — nothing to undo")), nil
+		}
+		var entry *memory.JournalEntry
+		if p := optFloat32(req, "ts"); p != nil {
+			ts := req.GetFloat("ts", 0)
+			found, err := j.FindByTS(ts, 1e-3)
+			if err != nil || found == nil {
+				return errResult(fmt.Errorf("no journal entry at ts=%v", ts)), nil
+			}
+			entry = found
+		} else {
+			entries, err := j.Read(memory.ReadOpts{})
+			if err != nil {
+				return errResult(err), nil
+			}
+			memID := req.GetString("memory_id", "")
+			for i := len(entries) - 1; i >= 0; i-- {
+				if memID == "" || memory.EntryTouches(entries[i], memID) {
+					entry = &entries[i]
+					break
+				}
+			}
+			if entry == nil {
+				return errResult(fmt.Errorf("no journal entry to undo")), nil
+			}
+		}
+		ok, err := store.Undo(ctx, *entry)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(map[string]any{
+			"ok": ok, "op": entry.Op, "id": entry.ID, "ts": entry.TS, "actor": entry.Actor,
+		}), nil
+	})
+}
+
+func addNuke(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("nuke",
+		mcp.WithDescription("Delete EVERY memory in the collection. Irreversible. Guarded: pass "+
+			"confirm=\"DELETE ALL\" to proceed. The journal keeps a single 'nuke' entry with the count, "+
+			"but the memories themselves are gone — undo cannot bring them back."),
+		mcp.WithString("confirm", mcp.Required(), mcp.Description(`Must be exactly "DELETE ALL"`)),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if req.GetString("confirm", "") != "DELETE ALL" {
+			return jsonText(map[string]any{
+				"ok": false, "deleted": 0,
+				"error": `refusing to nuke: pass confirm="DELETE ALL"`,
+			}), nil
+		}
+		n, err := store.Nuke(ctx)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(map[string]any{"ok": true, "deleted": n}), nil
+	})
+}
+
+func addEvalRecall(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("eval_recall",
+		mcp.WithDescription("Score retrieval quality against a gold set. Read-only. Each case is "+
+			`{"query": str, "relevant_ids": [id, ...], "k"?: int, "mode"?: str}. Returns recall@k, `+
+			"precision@k, MRR, MAP and nDCG@k averaged over the cases, plus a per-case breakdown. "+
+			"Recall runs with touch=false, so evaluating never perturbs access counts or recency. "+
+			"Pass the ranking knobs to A/B a configuration."),
+		mcp.WithArray("cases", mcp.Required(), mcp.Description("Gold-set cases"),
+			mcp.Items(map[string]any{"type": "object"})),
+		mcp.WithNumber("k", mcp.Description("Default top-k when a case omits it (default: 5)")),
+		mcp.WithString("mode", mcp.Description("semantic|hybrid (default: hybrid)")),
+		mcp.WithString("fusion", mcp.Description("weighted (default) | rrf")),
+		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid only)")),
+		mcp.WithNumber("diversity", mcp.Description("MMR λ in [0,1]")),
+		mcp.WithNumber("dedup_threshold", mcp.Description("Drop near-duplicates above this cosine")),
+		mcp.WithNumber("min_cosine", mcp.Description("Absolute cosine relevance floor")),
+	)
+	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		raw, ok := req.GetArguments()["cases"].([]any)
+		if !ok || len(raw) == 0 {
+			return errResult(fmt.Errorf("no cases supplied")), nil
+		}
+		cases := make([]eval.Case, 0, len(raw))
+		for i, item := range raw {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				return errResult(fmt.Errorf("case %d: expected an object", i)), nil
+			}
+			query, _ := obj["query"].(string)
+			if query == "" {
+				return errResult(fmt.Errorf("case %d: missing 'query'", i)), nil
+			}
+			idsRaw, _ := obj["relevant_ids"].([]any)
+			if len(idsRaw) == 0 {
+				return errResult(fmt.Errorf(
+					"case %d: 'relevant_ids' must be a non-empty list", i)), nil
+			}
+			ids := make([]string, 0, len(idsRaw))
+			for _, v := range idsRaw {
+				if str, ok := v.(string); ok {
+					ids = append(ids, str)
+				}
+			}
+			c := eval.Case{Query: query, RelevantIDs: ids}
+			if v, ok := obj["k"].(float64); ok {
+				c.K = int(v)
+			}
+			if v, ok := obj["mode"].(string); ok {
+				c.Mode = v
+			}
+			cases = append(cases, c)
+		}
+
+		opts := eval.Options{
+			DefaultK:    req.GetInt("k", 5),
+			DefaultMode: req.GetString("mode", "hybrid"),
+			Recall: eval.RecallOpts{
+				Fusion:         req.GetString("fusion", ""),
+				Graph:          optFloat32(req, "graph"),
+				Diversity:      optFloat32(req, "diversity"),
+				DedupThreshold: optFloat32(req, "dedup_threshold"),
+				MinCosine:      optFloat32(req, "min_cosine"),
+			},
+		}
+		res, err := eval.Evaluate(ctx, eval.StoreAdapter{Store: store}, cases, opts)
+		if err != nil {
+			return errResult(err), nil
+		}
+		return jsonText(res), nil
+	})
+}
+
+func addReady(s *server.MCPServer, store *memory.MemoryStore) {
+	tool := mcp.NewTool("ready",
+		mcp.WithDescription("Readiness probe: is the store reachable and the embedder working? Returns "+
+			"{ready, checks:{store, embedder}} with the embedder check carrying its measured dimension "+
+			"and latency. Unlike the HTTP /ready endpoint this is not sanitized — an MCP client is "+
+			"already authenticated."),
+	)
+	s.AddTool(tool, func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return jsonText(store.Readiness(ctx, 0)), nil
 	})
 }
 

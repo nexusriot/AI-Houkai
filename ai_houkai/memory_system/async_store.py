@@ -336,6 +336,9 @@ class AsyncMemoryStore:
             compress_min_group=compress_min_group,
         )
 
+    async def get(self, memory_id: str) -> Memory | None:
+        return await self.run(self.sync.get, memory_id)
+
     async def list_recent(
         self,
         limit: int = 20,

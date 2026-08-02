@@ -17,7 +17,7 @@ def show(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
-    mem = store._get_by_id(full_id)
+    mem = store.get(full_id)
     if mem is None:
         typer.echo(f"Error: memory {id!r} not found", err=True)
         raise typer.Exit(1)
@@ -30,7 +30,7 @@ def show(
         current_id = mem.superseded_by
         while current_id and current_id not in seen:
             seen.add(current_id)
-            parent = store._get_by_id(current_id)
+            parent = store.get(current_id)
             if parent is None:
                 break
             typer.echo(f"  → {out.short_id(parent.id)}  {parent.text[:60]}")

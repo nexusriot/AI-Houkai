@@ -127,6 +127,12 @@ class DecayEngine:
             for mem, score in self.score_all(t):
                 if mem.type in self.protect_types:
                     continue
+                # A pinned memory is a standing instruction: decay must not
+                # reach it however stale it looks. Without this the only way to
+                # protect one is to inflate its importance, which distorts
+                # every search it appears in.
+                if mem.pinned:
+                    continue
                 if score < self.min_score:
                     if not dry_run:
                         self.store.forget(mem.id)

@@ -52,7 +52,11 @@ type Config struct {
 	DOKey             string            `toml:"do_api_key"`
 	DOModel           string            `toml:"do_model"`
 	EmbedDim          int               `toml:"embed_dim"`
-	Maintenance       MaintenanceConfig `toml:"maintenance"`
+	// Index enables the derived SQLite sidecar ("sqlite"); empty keeps the
+	// historical full-scan reads. An existing store needs `houkai reindex`
+	// after switching this on.
+	Index       string            `toml:"index"`
+	Maintenance MaintenanceConfig `toml:"maintenance"`
 }
 
 // MaintenanceConfig holds the [maintenance] config block.

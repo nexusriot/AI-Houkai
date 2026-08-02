@@ -185,7 +185,7 @@ func TestRememberManyJournalsPerIDAndUndo(t *testing.T) {
 	}
 	// Exactly one "remember" entry per id.
 	for _, m := range mems {
-		hist, err := store.History(ctx, m.ID)
+		hist, err := store.History(ctx, m.ID, true)
 		if err != nil {
 			t.Fatalf("History: %v", err)
 		}
@@ -200,7 +200,7 @@ func TestRememberManyJournalsPerIDAndUndo(t *testing.T) {
 		}
 	}
 	// Undo the second id's entry → only that memory disappears.
-	hist, _ := store.History(ctx, mems[1].ID)
+	hist, _ := store.History(ctx, mems[1].ID, true)
 	var entry JournalEntry
 	for _, e := range hist {
 		if e.Op == "remember" && e.ID == mems[1].ID {

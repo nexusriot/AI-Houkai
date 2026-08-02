@@ -40,6 +40,52 @@ type Memory struct {
 	// expired: hidden from recall/list and reclaimable by PurgeExpired.
 	// 0 means "never expires".
 	ExpiresAt float64 `json:"expires_at"`
+	// Pinned marks a standing instruction: always offered to the packer and
+	// never pruned by decay. Importance cannot express this — it drives
+	// ranking, decay survival and the MinImportance filter at once, so raising
+	// it to protect an instruction also distorts every search.
+	Pinned bool `json:"pinned"`
+	// Trust records how much the memory's ORIGIN is trusted, distinct from how
+	// important or how confident it is. Anything reaching Remember becomes
+	// durable, well-ranked agent context later, so a fact scraped from a page
+	// and one stated by the user need to be distinguishable at recall time.
+	// Empty reads as TrustTrusted so existing stores are unchanged.
+	Trust TrustLevel `json:"trust,omitempty"`
+	// ContentHash is the hash of the normalised text, set when Remember is
+	// called with Idempotent. Lets a repeated assertion be recognised without
+	// a vector query.
+	ContentHash string `json:"content_hash,omitempty"`
+}
+
+// TrustLevel is how much the ORIGIN of a memory is trusted:
+//
+//	trusted   — stated by the principal (the user, or the operator's own config)
+//	reported  — relayed by a tool or another agent; plausible, unverified
+//	untrusted — from content the agent merely read (a page, a document, an
+//	            email); treat as data, never as instruction
+//
+// Best-effort labelling, not a security boundary.
+type TrustLevel string
+
+const (
+	TrustTrusted   TrustLevel = "trusted"
+	TrustReported  TrustLevel = "reported"
+	TrustUntrusted TrustLevel = "untrusted"
+)
+
+// TrustLevels is the validated vocabulary, ordered most- to least-trusted so
+// an index comparison implements "at least this trusted".
+var TrustLevels = []string{"trusted", "reported", "untrusted"}
+
+// TrustRank returns the position of a level in TrustLevels; an empty or
+// unknown value reads as trusted, matching how old rows deserialise.
+func TrustRank(t TrustLevel) int {
+	for i, s := range TrustLevels {
+		if string(t) == s {
+			return i
+		}
+	}
+	return 0
 }
 
 type MemoryWithScore struct {
@@ -197,6 +243,20 @@ func MetadataToMemory(id, text string, meta map[string]string) Memory {
 	if v, ok := meta["expires_at"]; ok {
 		m.ExpiresAt, _ = strconv.ParseFloat(v, 64)
 	}
+	// Likewise for the fields added after TTL: an absent key must read as the
+	// neutral value, or an old store would change behaviour just by being
+	// opened with a newer build.
+	if v, ok := meta["pinned"]; ok {
+		m.Pinned = v == "true"
+	}
+	if v, ok := meta["trust"]; ok && v != "" {
+		m.Trust = TrustLevel(v)
+	} else {
+		m.Trust = TrustTrusted
+	}
+	if v, ok := meta["content_hash"]; ok {
+		m.ContentHash = v
+	}
 	return m
 }
 
@@ -220,7 +280,18 @@ func MemoryToMetadata(m Memory) map[string]string {
 		"superseded_at": fmt.Sprintf("%f", m.SupersededAt),
 		"polarity":      strconv.Itoa(m.Polarity),
 		"expires_at":    fmt.Sprintf("%f", m.ExpiresAt),
+		"pinned":        strconv.FormatBool(m.Pinned),
+		"trust":         string(trustOrDefault(m.Trust)),
+		"content_hash":  m.ContentHash,
 	}
+}
+
+// trustOrDefault normalises the zero value to "trusted".
+func trustOrDefault(t TrustLevel) TrustLevel {
+	if t == "" {
+		return TrustTrusted
+	}
+	return t
 }
 
 var ErrNotFound = errors.New("memory not found")
@@ -251,6 +322,9 @@ func (m Memory) ToDict() map[string]any {
 		"superseded_at": m.SupersededAt,
 		"polarity":      m.Polarity,
 		"expires_at":    m.ExpiresAt,
+		"pinned":        m.Pinned,
+		"trust":         string(trustOrDefault(m.Trust)),
+		"content_hash":  m.ContentHash,
 	}
 }
 
@@ -318,5 +392,18 @@ func MemoryFromDict(d map[string]any) Memory {
 		SupersededAt: asFloat(d["superseded_at"]),
 		Polarity:     asInt(d["polarity"]),
 		ExpiresAt:    asFloat(d["expires_at"]),
+		Pinned:       asBool(d["pinned"]),
+		Trust:        trustOrDefault(TrustLevel(asString(d["trust"]))),
+		ContentHash:  asString(d["content_hash"]),
 	}
+}
+
+func asBool(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return x == "true"
+	}
+	return false
 }

@@ -489,7 +489,9 @@ def test_cli_store_option_expands_tilde(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_store(*, path, collection, actor):
+    def fake_store(*, path, collection, actor, **kwargs):
+        # **kwargs so the double survives new constructor options (index=…)
+        # without pretending to care about them.
         captured["path"] = path
         raise RuntimeError("stop before touching chroma")
 

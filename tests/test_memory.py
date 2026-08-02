@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from ai_houkai.memory_system import Memory, MemoryStore
 
 
@@ -93,6 +95,7 @@ class TestRecall:
         hits = store.recall("how to release the API?", k=3)
         assert len(hits) > 0
 
+    @pytest.mark.needs_model
     def test_result_structure(self, store: MemoryStore):
         self._seed(store)
         hits = store.recall("deploy", k=1)

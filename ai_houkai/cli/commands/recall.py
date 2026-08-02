@@ -19,6 +19,9 @@ def recall(
     since: Optional[str] = typer.Option(None, "--since", help="Only memories created at/after (ISO date, epoch, or '7d')"),
     until: Optional[str] = typer.Option(None, "--until", help="Only memories created at/before (ISO date, epoch, or '7d')"),
     mode: str = typer.Option("semantic", "--mode", help="semantic|hybrid"),
+    min_trust: Optional[str] = typer.Option(
+        None, "--min-trust",
+        help="trusted|reported|untrusted — keep only memories at least this trusted"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
     include_expired: bool = typer.Option(False, "--include-expired",
                                          help="Also return memories whose TTL has passed"),
@@ -42,6 +45,7 @@ def recall(
             since=since_ts,
             until=until_ts,
             mode=mode,
+            min_trust=min_trust,
             include_superseded=include_superseded,
             include_expired=include_expired,
         )

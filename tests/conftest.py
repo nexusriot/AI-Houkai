@@ -21,10 +21,18 @@ tests/test_fd_hygiene.py for the regression guard.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from chromadb.api.shared_system_client import SharedSystemClient
 
 from ai_houkai.memory_system import MemoryStore
+from ai_houkai.memory_system import store as store_module
+from ai_houkai.testing import FakeEmbedder
+
+# Exposes the fake_store / fake_embedder fixtures shipped for downstream users
+# in ai_houkai.testing, so this suite dogfoods the same helpers.
+pytest_plugins = ["ai_houkai.testing"]
 
 
 def _release_chroma_fds() -> None:
@@ -62,6 +70,38 @@ def _release_chroma_systems():
     """
     yield
     _release_chroma_fds()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "needs_model: requires the real sentence-transformers embedder — the "
+        "assertion depends on actual semantic similarity, which the hash-based "
+        "FakeEmbedder cannot provide. Deselected in the fast CI job.",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_to_fake_embedder(request, monkeypatch):
+    """Swap the default local model for FakeEmbedder in most tests.
+
+    Patching ``local_embedder`` — the single place the store resolves its
+    default — covers *every* store built during a test, not just the ones
+    using the ``store`` fixture: the MCP server's lazy store, CLI runs under
+    CliRunner, HTTP fixtures, and direct constructions all inherit it.
+
+    Tests marked ``needs_model`` opt back into the real sentence-transformers
+    model because their assertions depend on genuine semantic similarity
+    (conflict thresholds, reflection clustering, ranking quality).
+    ``AI_HOUKAI_TEST_REAL_EMBEDDER=1`` forces the real model everywhere, which
+    is how that marker set was derived — re-run with it to re-derive.
+    """
+    if os.environ.get("AI_HOUKAI_TEST_REAL_EMBEDDER") == "1":
+        return
+    if request.node.get_closest_marker("needs_model") is not None:
+        return
+    monkeypatch.setattr(store_module, "local_embedder",
+                        lambda *_args, **_kwargs: FakeEmbedder())
 
 
 @pytest.fixture()

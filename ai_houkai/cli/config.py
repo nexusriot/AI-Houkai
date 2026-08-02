@@ -22,6 +22,10 @@ class Config:
     default_type: str
     default_importance: float | str   # a float, or "auto" → heuristic scorer
     editor: str
+    # "sqlite" enables the derived metadata/FTS sidecar index; None keeps the
+    # historical full-scan reads. An existing store needs `houkai reindex`
+    # after switching this on.
+    index: str | None = None
 
 
 @dataclass
@@ -100,6 +104,8 @@ def load() -> Config:
             file_cfg.get("default_importance", 0.5)
         ),
         editor=file_cfg.get("editor") or os.environ.get("EDITOR", "nano"),
+        index=(os.environ.get("AI_HOUKAI_INDEX")
+               or file_cfg.get("index")) or None,
     )
 
 

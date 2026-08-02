@@ -112,6 +112,7 @@ class TestRememberManyConflicts:
         assert store.count() == 2
         assert all(store._get_by_id(m.id).superseded_by == "" for m in out)
 
+    @pytest.mark.needs_model
     def test_warn_stores_all_and_warns_once(self, store):
         with pytest.warns(UserWarning, match=r"remember_many\(\)"):
             store.remember_many(
@@ -120,6 +121,7 @@ class TestRememberManyConflicts:
             )
         assert store.count() == 2
 
+    @pytest.mark.needs_model
     def test_supersede_earlier_wins_no_cycle(self, store):
         first, second = store.remember_many(
             ["Use ruff for linting", "Use ruff for linting please"],

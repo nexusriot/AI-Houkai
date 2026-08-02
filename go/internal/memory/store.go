@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nexusriot/ai-houkai/internal/embed"
+	"github.com/nexusriot/ai-houkai/internal/sidecar"
 	"github.com/nexusriot/ai-houkai/internal/vector"
 )
 
@@ -83,6 +86,10 @@ type MemoryStore struct {
 	cfg      StoreConfig
 	journal  *Journal
 	actor    string
+
+	// Optional derived SQLite index (see internal/sidecar). nil = the
+	// historical full-scan reads.
+	index *sidecar.Index
 
 	// Process-local runtime metrics (not persisted; reset on restart). Guarded
 	// by metricMu since HTTP/MCP handlers may call the store concurrently.
@@ -180,6 +187,11 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 	if err := validateTags(opts.Tags); err != nil {
 		return Memory{}, err
 	}
+	if opts.Trust != "" {
+		if err := validateChoice(string(opts.Trust), TrustLevels, "trust"); err != nil {
+			return Memory{}, err
+		}
+	}
 
 	// Expiry: absolute epoch (ExpiresAt) or relative (TTLSeconds from now).
 	// nil / 0 means "never expires". They are mutually exclusive.
@@ -231,6 +243,11 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 		SupersededAt: 0,
 		Polarity:     opts.Polarity,
 		ExpiresAt:    expiresAt,
+		Pinned:       opts.Pinned,
+		Trust:        trustOrDefault(opts.Trust),
+	}
+	if opts.Idempotent {
+		m.ContentHash = ContentHash(text)
 	}
 	if m.Tags == nil {
 		m.Tags = []string{}
@@ -238,7 +255,63 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 	return m, nil
 }
 
+// ContentHash is a stable hash of text for write-time dedup.
+//
+// Normalises case and collapses whitespace first, so "Use ruff for linting"
+// and "use  ruff for linting\n" are the same assertion — which is how the same
+// fact tends to arrive twice from an agent. Deliberately NOT semantic: this is
+// the cheap exact-repeat check that runs before (and independently of) the
+// vector conflict scan.
+func ContentHash(text string) string {
+	normalised := strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	// SHA-256 truncated to 16 bytes: stdlib in both ports, so a hash written
+	// by the Go store is recognised by the Python one and vice versa.
+	sum := sha256.Sum256([]byte(normalised))
+	return hex.EncodeToString(sum[:16])
+}
+
+// findByContentHash returns the live memory carrying digest, or false.
+//
+// Superseded and expired rows are skipped — re-asserting a fact that was
+// explicitly replaced should create a new memory, not resurrect the old.
+func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Memory, bool) {
+	if digest == "" {
+		return Memory{}, false
+	}
+	items, err := s.backend.All(ctx)
+	if err != nil {
+		return Memory{}, false
+	}
+	now := nowFloat()
+	for _, it := range items {
+		if it.Metadata["content_hash"] != digest {
+			continue
+		}
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.SupersededBy != "" {
+			continue
+		}
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		return m, true
+	}
+	return Memory{}, false
+}
+
 func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
+	if opts.Idempotent {
+		if existing, ok := s.findByContentHash(ctx, ContentHash(strings.TrimSpace(text))); ok {
+			if err := s.touchMany(ctx, []*Memory{&existing}); err != nil {
+				return existing, false, nil, err
+			}
+			refreshed, err := s.GetByID(ctx, existing.ID)
+			if err != nil {
+				return existing, false, nil, nil
+			}
+			return refreshed, false, nil, nil
+		}
+	}
 	if opts.OnConflict != "" {
 		if err := validateChoice(string(opts.OnConflict), ConflictPolicies, "on_conflict"); err != nil {
 			return Memory{}, false, nil, err
@@ -326,6 +399,17 @@ type RememberOpts struct {
 	// OnConflict overrides the store's configured conflict policy for this
 	// call only (empty = use the store default).
 	OnConflict ConflictPolicy
+	// Pinned marks a standing instruction: always offered to the packer,
+	// never pruned by decay.
+	Pinned bool
+	// Trust records how much the memory's ORIGIN is trusted (empty = trusted).
+	Trust TrustLevel
+	// Idempotent makes a repeated assertion a no-op: the normalised text is
+	// hashed, and if a live memory carries the same hash its access count is
+	// bumped and it is returned unchanged. Agents re-assert the same fact
+	// every session, and the alternative — a vector conflict scan per write —
+	// costs an embedding query and still creates a row.
+	Idempotent bool
 }
 
 // RememberItem is one entry for RememberMany: a text plus the same optional
@@ -460,6 +544,11 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if err := validateChoice(string(opts.Mode), RecallModes, "mode"); err != nil {
 		return nil, err
 	}
+	if opts.MinTrust != "" {
+		if err := validateChoice(string(opts.MinTrust), TrustLevels, "min_trust"); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Fusion == "" {
 		opts.Fusion = FusionWeighted
 	}
@@ -535,6 +624,15 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		return nil, err
 	}
 
+	// Full-corpus lexical recall. The vector over-fetch pool is chosen by
+	// embedding distance alone, so a memory matching the query's exact tokens
+	// but embedding weakly never enters it — and therefore can never be
+	// surfaced by the BM25 term, at any corpus size. Union the sidecar's top
+	// FTS hits into the pool so lexical evidence can actually win.
+	if opts.LexicalIndex == LexicalFTS && opts.Mode == ModeHybrid {
+		hits = s.unionLexical(ctx, hits, query, vecs[0], nFetch)
+	}
+
 	now := nowFloat()
 
 	// The "where-clause" filters (type/importance/source/since/until) form the
@@ -550,6 +648,9 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 			continue
 		}
 		if opts.Source != "" && m.Source != opts.Source {
+			continue
+		}
+		if opts.MinTrust != "" && TrustRank(m.Trust) > TrustRank(opts.MinTrust) {
 			continue
 		}
 		if opts.Since > 0 && m.CreatedAt < opts.Since {
@@ -762,7 +863,25 @@ type RecallOpts struct {
 	// Reranker overrides the store's default reranker for this call: it
 	// rescores the first-stage pool before the top-k cut. nil = store default.
 	Reranker Reranker
+	// MinTrust keeps only memories whose provenance is at least this trusted:
+	// "trusted" admits only trusted, "reported" also admits reported,
+	// "untrusted" admits everything. Empty = no filter. Old rows have no trust
+	// label and read as trusted, so they are never silently excluded.
+	MinTrust TrustLevel
+	// LexicalIndex selects where lexical candidates come from: "" / "pool"
+	// (default) scores BM25 only over the vector over-fetch pool, as before;
+	// "fts" unions the best full-corpus matches from the sidecar index into
+	// the pool first. Requires an enabled, healthy index with FTS5.
+	LexicalIndex LexicalIndexMode
 }
+
+// LexicalIndexMode selects the lexical candidate source for hybrid recall.
+type LexicalIndexMode string
+
+const (
+	LexicalPool LexicalIndexMode = "pool"
+	LexicalFTS  LexicalIndexMode = "fts"
+)
 
 // Forget deletes a memory by ID. Returns true if found and deleted.
 func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
@@ -792,6 +911,9 @@ type EditOpts struct {
 	// ExpiresAt: nil = unchanged; a pointer to 0 clears the TTL.
 	ExpiresAt *float64
 	Source    *string
+	// Pinned / Trust: nil = unchanged.
+	Pinned *bool
+	Trust  *TrustLevel
 }
 
 // Edit updates fields of an existing memory in place, keeping its id.
@@ -832,6 +954,15 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 		}
 		mem.ExpiresAt = *opts.ExpiresAt
 	}
+	if opts.Pinned != nil {
+		mem.Pinned = *opts.Pinned
+	}
+	if opts.Trust != nil {
+		if err := validateChoice(string(*opts.Trust), TrustLevels, "trust"); err != nil {
+			return Memory{}, err
+		}
+		mem.Trust = *opts.Trust
+	}
 	if opts.Tags != nil {
 		if err := validateTags(opts.Tags); err != nil {
 			return Memory{}, err
@@ -848,6 +979,11 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 			return Memory{}, validationErrorf("text must be non-empty")
 		}
 		textChanged = newText != mem.Text
+		// Keep the dedup hash in step, or an edited memory would still answer
+		// to its original text on the next idempotent write.
+		if textChanged && mem.ContentHash != "" {
+			mem.ContentHash = ContentHash(newText)
+		}
 		mem.Text = newText
 	}
 
@@ -863,8 +999,59 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 	return mem, nil
 }
 
+// ListRecentOpts bounds a ListRecentPage query.
+type ListRecentOpts struct {
+	Limit             int
+	IncludeSuperseded bool
+	IncludeExpired    bool
+	// Before is a keyset cursor on created_at: pass the created_at of the last
+	// item from the previous page to get the next one. Paging by offset would
+	// re-scan the prefix each time; a cursor does not, which is what makes
+	// walking a large store viable. 0 = start from the newest.
+	Before float64
+}
+
 // ListRecent returns up to limit memories sorted by created_at desc.
 func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]Memory, error) {
+	return s.ListRecentPage(ctx, ListRecentOpts{
+		Limit: limit, IncludeSuperseded: includeSuperseded,
+		IncludeExpired: includeExpired,
+	})
+}
+
+// ListRecentPage is ListRecent with a cursor. With the sidecar index this is an
+// indexed range scan; without it, the whole collection is loaded and sorted in
+// Go — the historical behaviour, kept as the fallback.
+func (s *MemoryStore) ListRecentPage(ctx context.Context, o ListRecentOpts) ([]Memory, error) {
+	limit, includeSuperseded, includeExpired := o.Limit, o.IncludeSuperseded, o.IncludeExpired
+
+	if s.index != nil && s.index.Healthy() {
+		ids := s.index.RecentIDs(sidecar.RecentOpts{
+			Limit: limit, Before: o.Before,
+			IncludeSuperseded: includeSuperseded, IncludeExpired: includeExpired,
+			Now: nowFloat(),
+		})
+		if len(ids) == 0 {
+			return nil, nil
+		}
+		items, err := s.backend.Get(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		byID := make(map[string]Memory, len(items))
+		for _, it := range items {
+			byID[it.ID] = MetadataToMemory(it.ID, it.Content, it.Metadata)
+		}
+		// Preserve the index's ordering; Get does not promise it.
+		out := make([]Memory, 0, len(ids))
+		for _, id := range ids {
+			if m, ok := byID[id]; ok {
+				out = append(out, m)
+			}
+		}
+		return out, nil
+	}
+
 	items, err := s.backend.All(ctx)
 	if err != nil {
 		return nil, err
@@ -877,6 +1064,9 @@ func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSupersed
 			continue
 		}
 		if !includeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		if o.Before > 0 && m.CreatedAt >= o.Before {
 			continue
 		}
 		mems = append(mems, m)
@@ -1048,15 +1238,30 @@ func (s *MemoryStore) PurgeExpired(ctx context.Context, now float64, dryRun bool
 	if now == 0 {
 		now = nowFloat()
 	}
-	items, err := s.backend.All(ctx)
-	if err != nil {
-		return nil, err
-	}
 	var expired []Memory
-	for _, it := range items {
-		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
-		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
-			expired = append(expired, m)
+	if s.index != nil && s.index.Healthy() {
+		// An index range scan over expires_at, instead of loading the whole
+		// collection to find the handful of rows that have lapsed.
+		ids := s.index.ExpiredIDs(now)
+		if len(ids) > 0 {
+			items, err := s.backend.Get(ctx, ids)
+			if err != nil {
+				return nil, err
+			}
+			for _, it := range items {
+				expired = append(expired, MetadataToMemory(it.ID, it.Content, it.Metadata))
+			}
+		}
+	} else {
+		items, err := s.backend.All(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range items {
+			m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+			if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+				expired = append(expired, m)
+			}
 		}
 	}
 	if !dryRun && len(expired) > 0 {
@@ -1086,15 +1291,22 @@ func entryTouches(e JournalEntry, memoryID string) bool {
 	return false
 }
 
+// EntryTouches reports whether a journal entry concerns memoryID, including as
+// a link target or supersede counterpart. Exported for the surfaces (MCP/HTTP
+// "undo the newest change to X") that need the same relation History uses.
+func EntryTouches(e JournalEntry, memoryID string) bool {
+	return entryTouches(e, memoryID)
+}
+
 // History returns every journaled event touching memoryID, oldest first.
 // Covers the memory as an op's subject and as a link/supersede counterpart.
 // Store-wide "nuke" events are omitted (use JournalTail for those). Bounded by
 // journal retention.
-func (s *MemoryStore) History(ctx context.Context, memoryID string) ([]JournalEntry, error) {
+func (s *MemoryStore) History(ctx context.Context, memoryID string, includeArchives bool) ([]JournalEntry, error) {
 	if s.journal == nil {
 		return nil, nil
 	}
-	all, err := s.journal.Read(ReadOpts{IncludeArchives: true})
+	all, err := s.journal.Read(ReadOpts{IncludeArchives: includeArchives})
 	if err != nil {
 		return nil, err
 	}
@@ -1423,11 +1635,10 @@ func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction strin
 					}
 				}
 			}
-			// Incoming links (reverse scan).
+			// Incoming links: an index lookup when available, a full scan
+			// per frontier node per hop when not.
 			if direction == "in" || direction == "both" {
-				all, _ := s.backend.All(ctx)
-				for _, it := range all {
-					other := MetadataToMemory(it.ID, it.Content, it.Metadata)
+				for _, other := range s.incomingCandidates(ctx, qid, rel) {
 					if visited[other.ID] {
 						continue
 					}

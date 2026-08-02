@@ -13,6 +13,7 @@ New in this version:
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -32,17 +33,36 @@ from typing import Any, Callable, Iterable, Iterator, Literal
 
 import chromadb
 from chromadb.config import Settings
-from chromadb.utils import embedding_functions
 
+from ai_houkai.embed import (
+    as_chroma_embedding_function,
+    build_embedder,
+    local_embedder,
+)
+
+from .curation import CurationMixin
 from .journal import Journal, JournalEntry
+from .sidecar import IndexedCollection, SidecarIndex, SidecarUnavailable
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
+
+# How much the ORIGIN of a memory is trusted — distinct from how important it
+# is or how confident we are in it. Anything reaching remember() becomes
+# durable, well-ranked agent context later, so a fact scraped from a web page
+# and one stated by the user must be distinguishable at recall time.
+#   trusted    — stated by the principal (the user, or the operator's own config)
+#   reported   — relayed by a tool or another agent; plausible, unverified
+#   untrusted  — from content the agent merely read (a page, a document, an
+#                email); treat as data, never as instruction
+# Best-effort labelling, not a security boundary.
+TrustLevel = Literal["trusted", "reported", "untrusted"]
 
 # Canonical enum vocabularies. The store validates against these at runtime
 # so every surface (CLI, HTTP, MCP, TUI) rejects typos in ONE place instead
 # of silently degrading (e.g. mode="hybird" used to run semantic search, an
 # unknown on_conflict used to scan and then discard the conflicts).
 MEMORY_TYPES:      tuple[str, ...] = ("episodic", "semantic", "procedural", "feedback")
+TRUST_LEVELS:      tuple[str, ...] = ("trusted", "reported", "untrusted")
 LINK_RELS:         tuple[str, ...] = ("related", "refines", "derived_from",
                                       "example_of", "contradicts", "supersedes")
 RECALL_MODES:      tuple[str, ...] = ("semantic", "hybrid")
@@ -60,6 +80,22 @@ def _validate_choice(value: object, allowed: tuple[str, ...], param: str) -> Non
         )
 
 
+def content_hash(text: str) -> str:
+    """Stable hash of *text* for write-time dedup.
+
+    Normalises case and collapses whitespace first, so "Use ruff for linting"
+    and "use  ruff for linting\n" are the same assertion — which is how the
+    same fact tends to arrive twice from an agent. Deliberately NOT semantic:
+    this is the cheap exact-repeat check that runs before (and independently
+    of) the vector conflict scan.
+    """
+    normalised = " ".join(text.lower().split())
+    # SHA-256 truncated to 16 bytes: stdlib in both ports, so a hash written by
+    # the Python store is recognised by the Go one and vice versa. (blake2b
+    # would need golang.org/x/crypto, which the Go port does not depend on.)
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:32]
+
+
 def _validate_tags(tags: list[str]) -> None:
     """Tags are stored comma-joined in Chroma metadata, so a comma inside a
     tag would silently split it into two on the next read."""
@@ -71,30 +107,28 @@ def _validate_tags(tags: list[str]) -> None:
             )
 
 
-@functools.lru_cache(maxsize=None)
-def _get_embed_fn(model_name: str):
-    """Return a cached embedding function for *model_name*.
+# Backwards-compatible alias: the local sentence-transformers loader moved to
+# ai_houkai.embed when the embedder became pluggable.
+_get_embed_fn = local_embedder
 
-    Loaded once per process per model name — subsequent calls return the
-    same instance, avoiding redundant disk reads and RAM allocation.
 
-    Side-effects applied before the first load:
-      • HF_HUB_DISABLE_PROGRESS_BARS=1  — suppress "Loading weights" bars
-      • huggingface_hub loggers → ERROR  — suppress unauthenticated-request
-        warnings (the model lives in the local cache; no auth is needed)
+def _index_row(mid: str, document: str, metadata: dict) -> dict[str, Any]:
+    """Flatten a Chroma record into the row shape the sidecar index stores.
+
+    Goes through Memory.from_record so the index inherits exactly the same
+    metadata decoding as every other read — an index that parsed tags or
+    timestamps its own way would drift from the store it mirrors.
     """
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    for _logger_name in (
-        "huggingface_hub",
-        "huggingface_hub.utils",
-        "huggingface_hub.utils._http",
-        "huggingface_hub.utils._headers",
-    ):
-        logging.getLogger(_logger_name).setLevel(logging.ERROR)
+    mem = Memory.from_record(mid, document, metadata)
+    return {
+        "id": mem.id, "text": mem.text, "type": mem.type, "tags": mem.tags,
+        "importance": mem.importance, "created_at": mem.created_at,
+        "last_accessed": mem.last_accessed, "access_count": mem.access_count,
+        "source": mem.source, "superseded_by": mem.superseded_by,
+        "expires_at": mem.expires_at,
+        "links": [{"to": lnk.to, "rel": lnk.rel} for lnk in mem.links],
+    }
 
-    return embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=model_name
-    )
 ConflictFn = Callable[["Memory", "Memory"], bool]
 
 # A reranker rescores a recall candidate pool with a stronger (usually
@@ -183,11 +217,13 @@ class RememberItem:
     polarity:    int = 0
     expires_at:  float | None = None
     ttl_seconds: float | None = None
+    pinned:      bool = False
+    trust:       TrustLevel = "trusted"
 
 
 _REMEMBER_ITEM_FIELDS = (
     "text", "type", "tags", "importance", "source",
-    "polarity", "expires_at", "ttl_seconds",
+    "polarity", "expires_at", "ttl_seconds", "pinned", "trust",
 )
 
 
@@ -313,6 +349,23 @@ class Memory:
     # Unix timestamp after which the memory is treated as expired: hidden from
     # recall/list and reclaimable by purge_expired(). 0.0 means "never expires".
     expires_at:    float = 0.0
+    # — working set —
+    # A pinned memory is always offered to the packer and is never pruned by
+    # decay or evicted. `importance` cannot express this: it simultaneously
+    # drives ranking, decay survival and the min_importance filter, so raising
+    # it to protect a standing instruction also distorts every search.
+    pinned:        bool = False
+    # — provenance trust —
+    # How much the *origin* of this memory is trusted, distinct from how
+    # important or how confident it is. Anything reaching remember() becomes
+    # durable, well-ranked agent context later, so a memory scraped from a web
+    # page and one stated by the user need to be distinguishable at recall
+    # time. "trusted" is the default so existing stores are unchanged.
+    trust:         TrustLevel = "trusted"
+    # — write-time dedup —
+    # Hash of the normalised text, set when remember(idempotent=True) is used.
+    # Lets a repeated assertion be recognised without a vector query.
+    content_hash:  str = ""
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -328,6 +381,9 @@ class Memory:
             "superseded_at": self.superseded_at,
             "polarity":      self.polarity,
             "expires_at":    self.expires_at,
+            "pinned":        self.pinned,
+            "trust":         self.trust,
+            "content_hash":  self.content_hash,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -347,6 +403,9 @@ class Memory:
             "superseded_at": self.superseded_at,
             "polarity":      self.polarity,
             "expires_at":    self.expires_at,
+            "pinned":        self.pinned,
+            "trust":         self.trust,
+            "content_hash":  self.content_hash,
         }
 
     @classmethod
@@ -366,6 +425,9 @@ class Memory:
             superseded_at=float(d.get("superseded_at") or 0.0),
             polarity=int(d.get("polarity") or 0),
             expires_at=float(d.get("expires_at") or 0.0),
+            pinned=bool(d.get("pinned") or False),
+            trust=d.get("trust") or "trusted",
+            content_hash=str(d.get("content_hash") or ""),
         )
 
     @classmethod
@@ -392,6 +454,12 @@ class Memory:
             # Old rows written before TTL landed have no "expires_at" key;
             # default 0.0 = never expires, so they keep showing up in recall.
             expires_at=float(meta.get("expires_at", 0.0)),
+            # Likewise for the fields added after them: an absent key must read
+            # as the neutral value, or an old store would change behaviour just
+            # by being opened with a newer library.
+            pinned=bool(meta.get("pinned", False)),
+            trust=meta.get("trust") or "trusted",
+            content_hash=str(meta.get("content_hash") or ""),
         )
 
 
@@ -611,9 +679,18 @@ def _build_where(
     return {"$and": conditions}
 
 
-class MemoryStore:
+class MemoryStore(CurationMixin):
     """Long-term memory backed by ChromaDB with linking, conflict detection,
-    and hybrid retrieval."""
+    and hybrid retrieval.
+
+    Curation operations (merge, versions, tag management, find_path, trash)
+    come from :class:`~ai_houkai.memory_system.curation.CurationMixin`.
+    """
+
+    @staticmethod
+    def _memory_from_dict(d: dict[str, Any]) -> "Memory":
+        """Rebuild a Memory from its to_dict() form (used by trash_restore)."""
+        return Memory.from_dict(d)
 
     def __init__(
         self,
@@ -621,6 +698,9 @@ class MemoryStore:
         collection: str = "ai_houkai",
         embedding_model: str = "all-MiniLM-L6-v2",
         *,
+        embedding_function: "Callable[[list[str]], list[list[float]]] | None" = None,
+        index: Literal["sqlite"] | None = None,
+        index_path: str | Path | None = None,
         conflict_policy: Literal["ignore", "warn", "supersede", "raise"] = "ignore",
         conflict_threshold: float = 0.80,
         contradiction_fn: ConflictFn | None = None,
@@ -640,15 +720,55 @@ class MemoryStore:
         self.client = chromadb.PersistentClient(
             path=path, settings=Settings(anonymized_telemetry=False)
         )
-        embed_fn = _get_embed_fn(embedding_model)
+        # Embedder resolution, most explicit first:
+        #   1. an injected callable  2. AI_HOUKAI_EMBEDDER=provider:model
+        #   3. the local sentence-transformers default
+        # The env var lets an operator move an existing deployment onto a
+        # hosted embedder without touching call sites; the injected callable
+        # is what tests and embedding services use.
+        if embedding_function is None:
+            embedding_function = build_embedder(
+                os.environ.get("AI_HOUKAI_EMBEDDER", ""))
+        embed_fn = embedding_function or local_embedder(embedding_model)
         # Kept so diagnostics (readiness / doctor) can actively probe the
-        # embedding backend rather than waiting for the first lazy embed.
+        # embedding backend rather than waiting for the first lazy embed —
+        # the *unwrapped* callable, so probes see plain lists.
         self._embed_fn = embed_fn
+        # Chroma's collection API needs more than a bare callable (embed_query
+        # on the query path, name()/is_legacy in the config), so adapt anything
+        # that does not already satisfy it.
         self.collection = self.client.get_or_create_collection(
             name=collection,
-            embedding_function=embed_fn,
+            embedding_function=as_chroma_embedding_function(embed_fn),
             metadata={"hnsw:space": "cosine"},
         )
+
+        # Optional derived SQLite index (see sidecar.py). Off by default: an
+        # existing store has no index, so enabling it silently would make
+        # list/neighbors read an empty table. `houkai reindex` builds it.
+        self.index: SidecarIndex | None = None
+        index_mode = index if index is not None else os.environ.get(
+            "AI_HOUKAI_INDEX", "")
+        if index_mode == "sqlite":
+            try:
+                self.index = SidecarIndex(
+                    index_path or Path(path).parent / f"{collection}.index.sqlite3",
+                    collection=collection,
+                )
+            except SidecarUnavailable as exc:
+                warnings.warn(f"sidecar index unavailable, falling back to "
+                              f"full scans: {exc}", RuntimeWarning, stacklevel=2)
+            else:
+                # A count mismatch means the index is stale or belongs to
+                # another collection; degrade to scanning rather than serve
+                # wrong results.
+                self.index.verify(self.collection.count())
+                self.collection = IndexedCollection(
+                    self.collection, self.index, _index_row)
+        elif index_mode not in ("", None):
+            raise ValueError(
+                f"index must be 'sqlite' or None — got {index_mode!r}")
+
         self._conflict_policy    = conflict_policy
         self._conflict_threshold = conflict_threshold
         self._contradiction_fn   = contradiction_fn
@@ -717,6 +837,9 @@ class MemoryStore:
         polarity: int = 0,
         expires_at: float | None = None,
         ttl_seconds: float | None = None,
+        pinned: bool = False,
+        trust: TrustLevel = "trusted",
+        idempotent: bool = False,
     ) -> Memory:
         """Validate inputs and construct a :class:`Memory` — no store write, no
         journal, no conflict scan.
@@ -725,6 +848,7 @@ class MemoryStore:
         validation, TTL resolution and importance auto-scoring.
         """
         _validate_choice(type, MEMORY_TYPES, "type")
+        _validate_choice(trust, TRUST_LEVELS, "trust")
         if polarity not in (-1, 0, 1):
             raise ValueError(f"polarity must be -1, 0, or +1 — got {polarity!r}")
         # Expiry: absolute epoch (expires_at) or relative (ttl_seconds from now).
@@ -746,15 +870,19 @@ class MemoryStore:
                 importance = self._importance_fn(text, type, list(tags))
             else:
                 importance = 0.5
+        clean = text.strip()
         return Memory(
             id=str(uuid.uuid4()),
-            text=text.strip(),
+            text=clean,
             type=type,
             tags=list(tags),
             importance=max(0.0, min(1.0, importance)),
             source=source,
             polarity=polarity,
             expires_at=expires_at or 0.0,
+            pinned=pinned,
+            trust=trust,
+            content_hash=content_hash(clean) if idempotent else "",
         )
 
     def remember(
@@ -770,12 +898,33 @@ class MemoryStore:
         ttl_seconds: float | None = None,
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
+        pinned: bool = False,
+        trust: TrustLevel = "trusted",
+        idempotent: bool = False,
     ) -> Memory:
+        """Store a new memory.
+
+        ``pinned`` marks a standing instruction: always offered to the packer,
+        never pruned by decay. ``trust`` records how much the memory's *origin*
+        is trusted (see :data:`TrustLevel`).
+
+        ``idempotent=True`` makes a repeated assertion a no-op: the normalised
+        text is hashed, and if an existing memory carries the same hash its
+        access count is bumped and it is returned unchanged. Agents re-assert
+        the same fact every session, and the alternative — a vector conflict
+        scan per write — costs an embedding query and still creates a row.
+        """
         if on_conflict is not None:
             _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
+        if idempotent:
+            existing = self._find_by_content_hash(content_hash(text.strip()))
+            if existing is not None:
+                self._touch(existing)
+                return existing
         mem = self._build_memory(
             text, type, tags, importance, source,
             polarity=polarity, expires_at=expires_at, ttl_seconds=ttl_seconds,
+            pinned=pinned, trust=trust, idempotent=idempotent,
         )
         self.collection.add(
             ids=[mem.id],
@@ -896,7 +1045,7 @@ class MemoryStore:
         return mems
 
     def forget(self, memory_id: str) -> bool:
-        before = self._get_by_id(memory_id)
+        before = self.get(memory_id)
         if before is None:
             return False
         self.collection.delete(ids=[memory_id])
@@ -917,6 +1066,8 @@ class MemoryStore:
         polarity: int | None = None,
         expires_at: float | None = None,
         source: str | None = _UNSET,
+        pinned: bool | None = None,
+        trust: TrustLevel | None = None,
     ) -> Memory:
         """Update fields of an existing memory in place, keeping its id.
 
@@ -932,7 +1083,7 @@ class MemoryStore:
         Raises KeyError if *memory_id* does not exist, ValueError on a bad
         type / polarity / importance.
         """
-        mem = self._get_by_id(memory_id)
+        mem = self.get(memory_id)
         if mem is None:
             raise KeyError(f"memory_id {memory_id!r} not found")
         before = mem.to_dict()
@@ -951,6 +1102,11 @@ class MemoryStore:
             if expires_at < 0:
                 raise ValueError("expires_at must be >= 0")
             mem.expires_at = float(expires_at)
+        if pinned is not None:
+            mem.pinned = bool(pinned)
+        if trust is not None:
+            _validate_choice(trust, TRUST_LEVELS, "trust")
+            mem.trust = trust
         if tags is not None:
             new_tags = list(tags)
             _validate_tags(new_tags)
@@ -964,6 +1120,10 @@ class MemoryStore:
                 raise ValueError("text must be non-empty")
             text_changed = new_text != mem.text
             mem.text = new_text
+            # Keep the dedup hash in step, or an edited memory would still
+            # answer to its original text on the next idempotent write.
+            if text_changed and mem.content_hash:
+                mem.content_hash = content_hash(new_text)
 
         after = mem.to_dict()
         if after == before:
@@ -1005,8 +1165,14 @@ class MemoryStore:
         """
         self._metric_calls["purge_expired"] += 1
         t = now if now is not None else time.time()
-        expired = [m for m in self._get_all_memories()
-                   if m.expires_at and m.expires_at <= t]
+        if self.index is not None and self.index.healthy:
+            # An index range scan over expires_at, instead of loading the whole
+            # collection to find the handful of rows that have lapsed.
+            ids = self.index.expired_ids(t)
+            expired = [m for m in (self.get(i) for i in ids) if m is not None]
+        else:
+            expired = [m for m in self._get_all_memories()
+                       if m.expires_at and m.expires_at <= t]
         if not dry_run and expired:
             with self.as_actor("purge"):
                 for m in expired:
@@ -1037,6 +1203,8 @@ class MemoryStore:
         reranker: "Reranker | None" = None,
         touch: bool = True,
         explain: bool = False,
+        lexical_index: Literal["pool", "fts"] = "pool",
+        min_trust: TrustLevel | None = None,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         """Semantic (or hybrid) search with optional metadata filters.
 
@@ -1064,9 +1232,21 @@ class MemoryStore:
         the store default) rescores the first-stage candidate pool with a
         stronger relevance model before the top-``k`` cut; its returned score
         replaces the blended score, and explain records the first-stage rank.
+
+        ``min_trust`` keeps only memories whose provenance is at least that
+        trusted (``"trusted"`` admits only trusted; ``"untrusted"`` admits
+        everything). Old rows have no trust label and read as ``"trusted"``.
+
+        ``lexical_index="fts"`` (hybrid mode, sidecar index required) unions the
+        best full-corpus BM25 matches into the candidate pool before scoring, so
+        an exact-token match with a weak embedding can be found at all;
+        ``"pool"`` (default) scores lexical relevance only over the vector
+        over-fetch pool, as before.
         """
         _validate_choice(mode, RECALL_MODES, "mode")
         _validate_choice(fusion, FUSIONS, "fusion")
+        if min_trust is not None:
+            _validate_choice(min_trust, TRUST_LEVELS, "min_trust")
         if type is not None:
             _validate_choice(type, MEMORY_TYPES, "type")
         if diversity is not None and not (0.0 <= diversity <= 1.0):
@@ -1110,6 +1290,14 @@ class MemoryStore:
             include=include,
         )
 
+        # Full-corpus lexical recall. The vector over-fetch pool is chosen by
+        # embedding distance alone, so a memory that matches the query's exact
+        # tokens but embeds weakly never enters it — and therefore can never be
+        # surfaced by the BM25 term, at any corpus size. Union the sidecar's
+        # top FTS hits into the pool so lexical evidence can actually win.
+        if lexical_index == "fts" and mode == "hybrid":
+            res = self._union_lexical(res, query, n_fetch, where, include)
+
         w = weights or self._hybrid_weights or HybridWeights()
         expl: dict[str, dict] | None = {} if explain else None
         if mode == "hybrid":
@@ -1122,6 +1310,15 @@ class MemoryStore:
         else:
             scored = self._semantic_filter(
                 res, tag, include_superseded, w.polarity_weight, min_cosine, expl)
+
+        # Drop memories whose origin is trusted less than the caller demands.
+        # A post-filter for the same reason as expiry: old rows have no "trust"
+        # key, and a Chroma equality clause would silently exclude every one
+        # of them.
+        if min_trust is not None:
+            floor = TRUST_LEVELS.index(min_trust)
+            scored = [(mem, s_) for mem, s_ in scored
+                      if TRUST_LEVELS.index(mem.trust) <= floor]
 
         # Drop expired memories (post-filter, not a Chroma where-clause, so old
         # rows without the expires_at key are unaffected). Done before rerank /
@@ -1188,6 +1385,79 @@ class MemoryStore:
                     for mem, score in out]
         return out
 
+    def _union_lexical(
+        self,
+        res: dict,
+        query: str,
+        n_fetch: int,
+        where: dict | None,
+        include: list[str],
+    ) -> dict:
+        """Merge full-corpus BM25 hits into a Chroma query result.
+
+        Fetches the sidecar's top lexical ids that the vector query missed and
+        appends them to the pool with their *real* cosine distance, computed
+        here against the query vector.
+
+        Fabricating a distance was tempting and wrong: a neutral value invents
+        vector evidence a candidate has not earned, and a worst-case value
+        (-1 similarity × the 0.55 cosine weight) buries it far below anything
+        the 0.20 lexical weight could recover — which would make the whole
+        channel decorative.
+
+        Returns *res* unchanged when the index is off, unhealthy, FTS-less, or
+        has nothing to add, so enabling the flag on a store without an index is
+        a no-op rather than an error.
+        """
+        if self.index is None or not (self.index.healthy and self.index.fts):
+            return res
+        existing = set(res["ids"][0])
+        extra = [i for i in self.index.search_lexical(query, limit=n_fetch)
+                 if i not in existing]
+        if not extra:
+            return res
+
+        # Re-apply the caller's metadata filter through Chroma itself rather
+        # than re-implementing its `where` semantics here: a lexical hit must
+        # obey type/source/importance/date filters exactly as a vector hit does.
+        get_include = [c for c in include if c != "distances"]
+        if "embeddings" not in get_include:
+            get_include = get_include + ["embeddings"]
+        fetched = self.collection.get(
+            ids=extra, where=where, include=get_include)
+        if not fetched["ids"]:
+            return res
+
+        # Chroma does not hand back the vector it embedded the query into, so
+        # embed once here to score the newcomers on the same scale.
+        try:
+            query_vec = list(self._embed_fn([query])[0])
+        except Exception:  # noqa: BLE001 — a lexical bonus is never worth a 500
+            return res
+        fetched_embs = fetched.get("embeddings")
+
+        merged = {key: [list(value[0])] for key, value in res.items()
+                  if isinstance(value, list) and value
+                  and isinstance(value[0], list)}
+        for pos, mid in enumerate(fetched["ids"]):
+            merged["ids"][0].append(mid)
+            if "documents" in merged:
+                merged["documents"][0].append(fetched["documents"][pos])
+            if "metadatas" in merged:
+                merged["metadatas"][0].append(fetched["metadatas"][pos])
+            emb = None
+            if fetched_embs is not None and len(fetched_embs) > pos:
+                emb = list(fetched_embs[pos])
+            if "distances" in merged:
+                # Chroma's cosine distance is 1 - similarity. A row with no
+                # stored vector gets the neutral 1.0 rather than a fabricated
+                # extreme.
+                sim = _cosine_sim(query_vec, emb) if emb else 0.0
+                merged["distances"][0].append(1.0 - sim)
+            if "embeddings" in merged:
+                merged["embeddings"][0].append(emb)
+        return merged
+
     def recall_pack(
         self,
         query: str,
@@ -1214,6 +1484,9 @@ class MemoryStore:
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
+        lexical_index: Literal["pool", "fts"] = "pool",
+        min_trust: TrustLevel | None = None,
+        include_pinned: bool = False,
     ) -> PackResult:
         """Assemble the highest-ranked memories that fit a token budget into a
         ready-to-inject context block.
@@ -1234,6 +1507,13 @@ class MemoryStore:
         ``fusion``/``diversity``/``dedup_threshold``/``min_cosine`` are passed
         through to :meth:`recall` — e.g. ``diversity`` stops the budget being
         spent on near-duplicate memories; ``min_cosine`` keeps weak hits out.
+
+        ``include_pinned=True`` prepends every pinned memory ahead of the
+        ranked hits, so a standing instruction is present whether or not it
+        happens to match the query. They still compete for the same budget:
+        a pinned memory that does not fit is dropped like any other.
+
+        ``min_trust`` filters by provenance (see :meth:`recall`).
         """
         count_fn = token_counter or _estimate_tokens
 
@@ -1255,12 +1535,39 @@ class MemoryStore:
             expand=expand,
             include_superseded=include_superseded,
             touch=touch,
+            lexical_index=lexical_index,
+            min_trust=min_trust,
         )
+        if include_pinned:
+            ranked = self._prepend_pinned(ranked, min_trust=min_trust)
         return self._pack_ranked(
             ranked, token_budget=token_budget, count_fn=count_fn, header=header,
             compress=compress, compress_threshold=compress_threshold,
             compress_min_group=compress_min_group,
         )
+
+    def _prepend_pinned(
+        self,
+        ranked: list[tuple[Memory, float]],
+        *,
+        min_trust: TrustLevel | None = None,
+    ) -> list[tuple[Memory, float]]:
+        """Put pinned memories at the front of a ranked list.
+
+        Scored above every hit rather than merged by relevance: a standing
+        instruction is included *because* it is pinned, not because it matched.
+        Already-ranked pinned memories are moved rather than duplicated.
+        """
+        pinned = [m for m in self.list_recent(limit=10**9) if m.pinned]
+        if min_trust is not None:
+            floor = TRUST_LEVELS.index(min_trust)
+            pinned = [m for m in pinned if TRUST_LEVELS.index(m.trust) <= floor]
+        if not pinned:
+            return ranked
+        pinned_ids = {m.id for m in pinned}
+        rest = [(m, sc) for m, sc in ranked if m.id not in pinned_ids]
+        top = max((sc for _, sc in ranked), default=1.0)
+        return [(m, top) for m in pinned] + rest
 
     def _pack_ranked(
         self,
@@ -1370,7 +1677,19 @@ class MemoryStore:
 
     @staticmethod
     def _pack_line(mem: Memory) -> str:
-        return f"- ({mem.type}) {mem.text}"
+        """Render one packed memory.
+
+        An untrusted origin is marked inline: the packed block goes straight
+        into a model's context, and a fact scraped from a page should not be
+        indistinguishable there from one the user stated.
+        """
+        marks = []
+        if mem.pinned:
+            marks.append("pinned")
+        if mem.trust != "trusted":
+            marks.append(mem.trust)
+        suffix = f" [{', '.join(marks)}]" if marks else ""
+        return f"- ({mem.type}){suffix} {mem.text}"
 
     def list_recent(
         self,
@@ -1378,13 +1697,38 @@ class MemoryStore:
         *,
         include_superseded: bool = False,
         include_expired: bool = False,
+        before: float | None = None,
     ) -> list[Memory]:
+        """Newest-first memories, most recent ``created_at`` first.
+
+        ``before`` is a keyset cursor: pass the ``created_at`` of the last item
+        from the previous page to get the next one. Paging by offset would
+        re-scan the prefix each time; a cursor does not, which is what makes
+        walking a large store viable.
+
+        Without the sidecar index this loads the whole collection and sorts in
+        Python — the historical behaviour, kept as the fallback.
+        """
         if limit < 0:
             # memories[:-1] would return everything *except* the oldest —
             # nearly the whole store for a caller that asked for less than 0.
             raise ValueError("limit must be >= 0")
         if self.collection.count() == 0:
             return []
+
+        if self.index is not None and self.index.healthy:
+            ids = self.index.recent_ids(
+                limit, before=before,
+                include_superseded=include_superseded,
+                include_expired=include_expired, now=time.time())
+            if not ids:
+                return []
+            res = self.collection.get(ids=ids, include=["documents", "metadatas"])
+            by_id = {i: Memory.from_record(i, d, m) for i, d, m
+                     in zip(res["ids"], res["documents"], res["metadatas"])}
+            # Preserve the index's ordering; Chroma's get() does not promise it.
+            return [by_id[i] for i in ids if i in by_id]
+
         res = self.collection.get(include=["documents", "metadatas"])
         memories = [
             Memory.from_record(i, d, m)
@@ -1396,11 +1740,61 @@ class MemoryStore:
             now_ts = time.time()
             memories = [m for m in memories
                         if not (m.expires_at and m.expires_at <= now_ts)]
+        if before is not None:
+            memories = [m for m in memories if m.created_at < before]
         memories.sort(key=lambda m: m.created_at, reverse=True)
         return memories[:limit]
 
+    def reindex(self) -> dict[str, Any]:
+        """Rebuild the sidecar index from Chroma and re-enable it.
+
+        The only way back from a disabled index. Returns a summary so the CLI
+        can report what happened.
+        """
+        if self.index is None:
+            return {"enabled": False, "indexed": 0,
+                    "error": "no sidecar index configured (index='sqlite')"}
+        rows = [_index_row(i, d, m) for i, d, m in self._iter_records()]
+        indexed = self.index.rebuild(rows)
+        return {
+            "enabled": True,
+            "indexed": indexed,
+            "healthy": self.index.healthy,
+            "fts": self.index.fts,
+            "path": str(self.index.path),
+            "error": self.index.disabled_reason,
+        }
+
+    def _iter_records(self) -> list[tuple[str, str, dict]]:
+        """Every (id, document, metadata) triple in the collection."""
+        if self.collection.count() == 0:
+            return []
+        res = self.collection.get(include=["documents", "metadatas"])
+        return list(zip(res["ids"], res["documents"], res["metadatas"]))
+
     def count(self) -> int:
         return self.collection.count()
+
+    @property
+    def embedder_name(self) -> str:
+        """Human-readable label for the embedding backend actually in use.
+
+        ``embedding_model`` only describes the *default local* model; once an
+        embedding_function is injected (or AI_HOUKAI_EMBEDDER is set) that name
+        is misleading, and diagnostics must report the real backend — reading
+        the wrong model name off a healthy-looking `doctor` is exactly how an
+        embedder swap goes unnoticed until rankings degrade.
+        """
+        fn = self._embed_fn
+        namer = getattr(fn, "name", None)
+        if callable(namer):
+            try:
+                label = namer()
+                if isinstance(label, str) and label:
+                    return label
+            except Exception:  # noqa: BLE001 — a label must never break a probe
+                pass
+        return getattr(fn, "__name__", None) or type(fn).__name__
 
     def probe_embedding(
         self, text: str = "ai-houkai health probe"
@@ -1599,7 +1993,7 @@ class MemoryStore:
             return []
 
         if memory_id is not None:
-            mem = self._get_by_id(memory_id)
+            mem = self.get(memory_id)
             if mem is None:
                 return []
             return self._check_conflicts(mem, thr)
@@ -1657,10 +2051,10 @@ class MemoryStore:
         """Mark *old_id* as superseded by *new_id* and add a 'supersedes' link."""
         if old_id == new_id:
             raise ValueError("Cannot supersede a memory with itself")
-        old = self._get_by_id(old_id)
+        old = self.get(old_id)
         if old is None:
             raise KeyError(f"old_id {old_id!r} not found")
-        new = self._get_by_id(new_id)
+        new = self.get(new_id)
         if new is None:
             raise KeyError(f"new_id {new_id!r} not found")
         if new.superseded_by == old_id:
@@ -1682,7 +2076,7 @@ class MemoryStore:
 
     def restore(self, memory_id: str) -> bool:
         """Clear the superseded_by marker on a memory (undo a supersede)."""
-        mem = self._get_by_id(memory_id)
+        mem = self.get(memory_id)
         if mem is None or not mem.superseded_by:
             return False
         before = mem.to_dict()
@@ -1714,10 +2108,10 @@ class MemoryStore:
         _validate_choice(rel, LINK_RELS, "rel")
         if src_id == dst_id:
             raise ValueError("Cannot link a memory to itself")
-        src = self._get_by_id(src_id)
+        src = self.get(src_id)
         if src is None:
             raise KeyError(f"src_id {src_id!r} not found")
-        if self._get_by_id(dst_id) is None:
+        if self.get(dst_id) is None:
             # Refuse dangling edges — graph walkers skip targets that don't
             # resolve, so the link would be stored but unreachable.
             raise KeyError(f"dst_id {dst_id!r} not found")
@@ -1748,7 +2142,7 @@ class MemoryStore:
         """Remove matching links without journaling. Returns the removed rels."""
         if rel is not None:
             _validate_choice(rel, LINK_RELS, "rel")
-        src = self._get_by_id(src_id)
+        src = self.get(src_id)
         if src is None:
             return []
         removed = [l.rel for l in src.links
@@ -1758,6 +2152,26 @@ class MemoryStore:
                          if not (l.to == dst_id and (rel is None or l.rel == rel))]
             self.collection.update(ids=[src_id], metadatas=[src.to_metadata()])
         return removed
+
+    def _incoming_candidates(
+        self, mid: str, rel: str | None
+    ) -> list[Memory]:
+        """Memories with a link pointing at *mid*.
+
+        With the sidecar index this is a lookup on ``links(dst)``. Without it,
+        the only way to answer "who points at me?" is to read every memory —
+        and ``neighbors`` asks once per frontier node per hop, so a depth-2
+        walk over ten neighbours used to mean eleven full-collection loads.
+        """
+        if self.index is not None and self.index.healthy:
+            src_ids = {src for src, _ in self.index.incoming(mid, rel)}
+            if not src_ids:
+                return []
+            res = self.collection.get(
+                ids=sorted(src_ids), include=["documents", "metadatas"])
+            return [Memory.from_record(i, d, m) for i, d, m
+                    in zip(res["ids"], res["documents"], res["metadatas"])]
+        return self._get_all_memories()
 
     def neighbors(
         self,
@@ -1769,8 +2183,9 @@ class MemoryStore:
     ) -> list[tuple[Memory, str]]:
         """Return (memory, rel) pairs reachable from *memory_id* via links.
 
-        Outgoing traversal is O(links per node); incoming requires a full
-        store scan per hop — fine at agent scale.
+        Outgoing traversal is O(links per node). Incoming traversal is a
+        reverse-link lookup when the sidecar index is enabled, and a full store
+        scan per frontier node per hop when it is not.
         """
         _validate_choice(direction, DIRECTIONS, "direction")
         if rel is not None:
@@ -1784,14 +2199,14 @@ class MemoryStore:
             for mid in frontier:
                 # outgoing
                 if direction in ("out", "both"):
-                    mem = self._get_by_id(mid)
+                    mem = self.get(mid)
                     if mem is not None:
                         for lnk in mem.links:
                             if rel is not None and lnk.rel != rel:
                                 continue
                             if lnk.to in visited:
                                 continue
-                            target = self._get_by_id(lnk.to)
+                            target = self.get(lnk.to)
                             if target is None:
                                 continue
                             # Two memories may be joined by several
@@ -1804,7 +2219,7 @@ class MemoryStore:
                             visited.add(lnk.to)
                             next_frontier.append(lnk.to)
                 if direction in ("in", "both"):
-                    for candidate in self._get_all_memories():
+                    for candidate in self._incoming_candidates(mid, rel):
                         if candidate.id in visited:
                             continue
                         matched_rels = [
@@ -1844,7 +2259,7 @@ class MemoryStore:
             best_remaining[mid] = remaining
             mem = nodes.get(mid)
             if mem is None:
-                fetched = self._get_by_id(mid)
+                fetched = self.get(mid)
                 if fetched is None:
                     return
                 nodes[mid] = mem = fetched
@@ -2029,7 +2444,7 @@ class MemoryStore:
             for row in rows:
                 meta = row.get("meta") or {}
                 rid = str(row.get("id") or meta.get("id") or "")
-                existing = self._get_by_id(rid) if rid else None
+                existing = self.get(rid) if rid else None
                 if existing is not None:
                     collisions.append((rid, existing.text[:80]))
                 elif rid in seen_ids:
@@ -2087,7 +2502,7 @@ class MemoryStore:
             "text": row.get("text") or meta.get("text", ""),
         })
         vector = row.get("vector") if use_vectors else None
-        existing = self._get_by_id(mem.id)
+        existing = self.get(mem.id)
 
         if existing is not None:
             if on_conflict == "skip":
@@ -2142,7 +2557,7 @@ class MemoryStore:
         if entry.op == "forget":
             if entry.before is None:
                 return False
-            if self._get_by_id(entry.id) is not None:
+            if self.get(entry.id) is not None:
                 return False  # id already exists, refuse to clobber
             mem = Memory.from_dict(entry.before)
             self.collection.add(
@@ -2157,7 +2572,7 @@ class MemoryStore:
         if entry.op == "edit":
             if entry.before is None or entry.after is None:
                 return False
-            current = self._get_by_id(entry.id)
+            current = self.get(entry.id)
             if current is None:
                 return False  # memory has since been forgotten
             # Refuse when the memory changed after this edit (a later edit,
@@ -2193,9 +2608,9 @@ class MemoryStore:
 
         if entry.op == "restore":
             superseder = entry.meta.get("superseder_id")
-            if not superseder or self._get_by_id(superseder) is None:
+            if not superseder or self.get(superseder) is None:
                 return False
-            if self._get_by_id(entry.id) is None:
+            if self.get(entry.id) is None:
                 return False  # restored memory has since been forgotten
             self.supersede(old_id=entry.id, new_id=superseder)
             self._journal("undo", entry.id,
@@ -2236,7 +2651,36 @@ class MemoryStore:
         # reflect / decay / import / export / undo themselves: not undoable
         return False
 
-    def _get_by_id(self, memory_id: str) -> Memory | None:
+    def _find_by_content_hash(self, digest: str) -> Memory | None:
+        """The live memory carrying *digest*, or None.
+
+        A Chroma metadata equality lookup, not a vector query: exact repeats
+        are the common case and must not cost an embedding round-trip.
+        Superseded and expired rows are skipped — re-asserting a fact that was
+        explicitly replaced should create a new memory, not resurrect the old.
+        """
+        if not digest:
+            return None
+        res = self.collection.get(where={"content_hash": digest},
+                                  include=["documents", "metadatas"])
+        now_ts = time.time()
+        for mid, doc, meta in zip(res["ids"], res["documents"], res["metadatas"]):
+            mem = Memory.from_record(mid, doc, meta)
+            if mem.superseded_by:
+                continue
+            if mem.expires_at and mem.expires_at <= now_ts:
+                continue
+            return mem
+        return None
+
+    def get(self, memory_id: str) -> Memory | None:
+        """Fetch one memory by exact id, or None if it does not exist.
+
+        A plain read: no access-count bump, no journal entry, and no filtering
+        — a superseded or expired memory is still returned. Use
+        :meth:`recall` for ranked search and :meth:`get_at` for the state as of
+        a past timestamp.
+        """
         res = self.collection.get(
             ids=[memory_id],
             include=["documents", "metadatas"],
@@ -2244,6 +2688,11 @@ class MemoryStore:
         if not res["ids"]:
             return None
         return Memory.from_record(res["ids"][0], res["documents"][0], res["metadatas"][0])
+
+    # Deprecated private alias for get(), kept one release for out-of-tree
+    # callers (the CLI, the HTTP server and ai-houkai-service all used it
+    # before it was promoted).
+    _get_by_id = get
 
     def _get_all_memories(self) -> list[Memory]:
         if self.collection.count() == 0:
@@ -2697,7 +3146,7 @@ class MemoryStore:
             for mid in frontier:
                 if added >= spec.cap:
                     break
-                src = self._get_by_id(mid)
+                src = self.get(mid)
                 if src is None:
                     continue
                 for lnk in src.links:
@@ -2705,7 +3154,7 @@ class MemoryStore:
                         continue
                     if lnk.to in seen:
                         continue
-                    nb = self._get_by_id(lnk.to)
+                    nb = self.get(lnk.to)
                     if nb is None:
                         continue
                     if not include_superseded and nb.superseded_by:

@@ -1,0 +1,442 @@
+"""Curation operations: merge, versions, tag management, path-finding, trash.
+
+
+These grew up in ai-houkai-service, which implemented them by reaching through
+the library's private API — ``store._get_by_id``, ``store._get_all_memories``,
+``store.collection.update``, ``store._journal``. Every one is a store-level
+primitive: re-pointing an incoming link, rewriting a tag across the collection
+and walking the link graph all need the store's own write path and journal, and
+a downstream consumer cannot do them correctly from outside.
+
+
+They live in a separate module rather than growing ``store.py`` further, and
+attach to :class:`MemoryStore` as mixin methods, so ``store.merge(...)`` works
+without a second object to thread around.
+
+
+**Trash** fills the gap between ``supersede`` (soft, but semantically "replaced
+by X") and ``forget`` (irreversible): a recoverable delete. Decay pruning
+hard-deletes today, so a mis-tuned ``min_score`` is unrecoverable.
+"""
+
+
+from __future__ import annotations
+
+
+import gzip
+import json
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+
+from .journal import JournalEntry
+
+
+__all__ = [
+    "CurationMixin",
+    "MergeError",
+    "TagRename",
+    "TrashEntry",
+    "Version",
+]
+
+
+# Where trashed memories are parked, relative to the store's parent directory.
+TRASH_FILENAME = "trash.jsonl.gz"
+
+
+class MergeError(ValueError):
+    """merge() could not proceed (missing memory, or a self-merge)."""
+
+    def __init__(self, message: str, *, not_found: bool = False) -> None:
+        super().__init__(message)
+        self.not_found = not_found
+
+
+@dataclass(frozen=True)
+class Version:
+    """One past text state of a memory, recovered from the journal."""
+    ts: float
+    text: str
+    tags: list[str]
+    importance: float
+    source: str | None
+    type: str
+
+
+@dataclass(frozen=True)
+class TagRename:
+    """Result of a tag-curation operation."""
+    changed: int
+    tag: str
+
+
+@dataclass(frozen=True)
+class TrashEntry:
+    """A soft-deleted memory parked in the trash file."""
+    memory_id: str
+    deleted_at: float
+    actor: str
+    memory: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "memory_id": self.memory_id, "deleted_at": self.deleted_at,
+            "actor": self.actor, "memory": self.memory,
+        }
+
+
+class CurationMixin:
+    """Curation methods mixed into :class:`MemoryStore`."""
+
+    def merge(self, target_id: str, other_id: str, *,
+              separator: str = "\n\n") -> "Any":
+        """Fold ``other`` into ``target`` and return the updated target.
+
+        Combines the text, transfers ``other``'s outgoing links, and — the part
+        no caller can do from outside — **re-points every incoming link**
+        ``x -> other`` at ``x -> target``. ``forget`` does not clean up incoming
+        edges, so without this step merging would silently strand every
+        relationship that pointed at the absorbed memory.
+
+        Both sides' changes are journaled as ``edit`` entries, so a merge is
+        auditable and each rewritten source is individually undoable.
+
+        Raises :class:`MergeError` on a missing memory or a self-merge.
+        """
+        target = self.get(target_id)
+        if target is None:
+            raise MergeError(f"memory not found: {target_id}", not_found=True)
+        other = self.get(other_id)
+        if other is None:
+            raise MergeError(f"memory not found: {other_id}", not_found=True)
+        if target.id == other.id:
+            raise MergeError("cannot merge a memory with itself")
+
+        before = target.to_dict()
+        target.text = target.text + separator + other.text
+
+        existing = {(lnk.to, lnk.rel) for lnk in target.links}
+        for lnk in other.links:
+            # Skip self-loops and edges whose destination is already gone.
+            if lnk.to == target.id or self.get(lnk.to) is None:
+                continue
+            if (lnk.to, lnk.rel) in existing:
+                continue
+            existing.add((lnk.to, lnk.rel))
+            target.links.append(type(lnk)(to=lnk.to, rel=lnk.rel))
+
+        # Text changed, so the vector must be recomputed — a merged memory that
+        # kept the pre-merge embedding would not be findable by its new half.
+        self.collection.update(
+            ids=[target.id], documents=[target.text],
+            metadatas=[target.to_metadata()])
+        after = self.get(target.id)
+        self._journal("edit", target.id, before=before,
+                      after=(after or target).to_dict(),
+                      meta={"merged_from": other.id})
+
+        self._repoint_incoming(other.id, target.id)
+        self.forget(other.id)
+        return self.get(target.id)
+
+    def _repoint_incoming(self, old_dst: str, new_dst: str) -> int:
+        """Rewrite every ``x -> old_dst`` edge to ``x -> new_dst``.
+
+        Writes each source's link list directly rather than going through
+        unlink+link: that path re-validates the rel vocabulary (rejecting a
+        legacy custom rel outright) and costs two journal entries per edge.
+        A pre-existing ``new_dst -> old_dst`` edge is dropped rather than
+        turned into a self-loop.
+        """
+        rewritten = 0
+        for src in self._link_sources(old_dst):
+            if src.id == old_dst or not any(l.to == old_dst for l in src.links):
+                continue
+            src_before = src.to_dict()
+            seen = {(l.to, l.rel) for l in src.links if l.to != old_dst}
+            new_links = [l for l in src.links if l.to != old_dst]
+            if src.id != new_dst:
+                for l in src.links:
+                    if l.to != old_dst:
+                        continue
+                    if (new_dst, l.rel) not in seen:
+                        seen.add((new_dst, l.rel))
+                        new_links.append(type(l)(to=new_dst, rel=l.rel))
+            src.links = new_links
+            self.collection.update(ids=[src.id], metadatas=[src.to_metadata()])
+            self._journal("edit", src.id, before=src_before, after=src.to_dict())
+            rewritten += 1
+        return rewritten
+
+    def _link_sources(self, dst: str) -> list[Any]:
+        """Memories with an edge pointing at *dst* (index-backed when enabled)."""
+        return self._incoming_candidates(dst, None)
+
+    def versions(self, memory_id: str, *,
+                 include_archives: bool = True) -> list[Version]:
+        """Past text states of a memory, oldest first.
+
+        Each entry is the state *before* an edit; the current live state is
+        excluded (fetch it with :meth:`get`). Reads rotated journal segments
+        too, so version history survives a rollover.
+        """
+        out: list[Version] = []
+        for e in self.journal.read(include_archives=include_archives):
+            if e.op != "edit" or e.id != memory_id or not e.before:
+                continue
+            out.append(Version(
+                ts=e.ts,
+                text=e.before.get("text", ""),
+                tags=list(e.before.get("tags") or []),
+                importance=float(e.before.get("importance", 0.5)),
+                source=e.before.get("source"),
+                type=e.before.get("type", "semantic"),
+            ))
+        return out
+
+    def list_tags(self, *, include_superseded: bool = False
+                  ) -> list[tuple[str, int]]:
+        """Every tag with its usage count, most-used first then alphabetical."""
+        if self.index is not None and self.index.healthy:
+            counts = self.index.tag_counts(
+                include_superseded=include_superseded)
+        else:
+            counts = {}
+            for m in self.list_recent(limit=0 or 10**9,
+                                      include_superseded=include_superseded,
+                                      include_expired=True):
+                for t in m.tags:
+                    counts[t] = counts.get(t, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def _rewrite_tags(self, fn: Callable[[list[str]], list[str] | None]) -> int:
+        """Apply *fn* to every memory's tag list, persisting + journaling changes.
+
+        Includes superseded and expired memories: tag curation that skipped them
+        would leave the old spelling alive in rows a later `restore` brings back.
+        Returns the number of memories changed.
+        """
+        changed = 0
+        for m in self.list_recent(limit=10**9, include_superseded=True,
+                                  include_expired=True):
+            new_tags = fn(list(m.tags))
+            if new_tags is None or new_tags == m.tags:
+                continue
+            before = m.to_dict()
+            m.tags = new_tags
+            self.collection.update(ids=[m.id], metadatas=[m.to_metadata()])
+            self._journal("edit", m.id, before=before, after=m.to_dict())
+            changed += 1
+        return changed
+
+    def rename_tag(self, old: str, new: str) -> TagRename:
+        """Rename a tag across the collection, de-duplicating on collision."""
+        _validate_tag(new)
+
+        def fn(tags: list[str]) -> list[str] | None:
+            if old not in tags:
+                return None
+            out: list[str] = []
+            for t in tags:
+                t2 = new if t == old else t
+                if t2 not in out:
+                    out.append(t2)
+            return out
+
+        with self.as_actor("curation"):
+            return TagRename(changed=self._rewrite_tags(fn), tag=new)
+
+    def merge_tags(self, sources: Iterable[str], into: str) -> TagRename:
+        """Fold several tags into one across the collection."""
+        _validate_tag(into)
+        src = set(sources)
+
+        def fn(tags: list[str]) -> list[str] | None:
+            if not src.intersection(tags):
+                return None
+            out: list[str] = []
+            for t in tags:
+                t2 = into if t in src else t
+                if t2 not in out:
+                    out.append(t2)
+            return out
+
+        with self.as_actor("curation"):
+            return TagRename(changed=self._rewrite_tags(fn), tag=into)
+
+    def delete_tag(self, tag: str) -> TagRename:
+        """Strip a tag from every memory that carries it."""
+
+        def fn(tags: list[str]) -> list[str] | None:
+            if tag not in tags:
+                return None
+            return [t for t in tags if t != tag]
+
+        with self.as_actor("curation"):
+            return TagRename(changed=self._rewrite_tags(fn), tag=tag)
+
+    def find_path(self, from_id: str, to_id: str, *,
+                  max_depth: int = 6) -> list[tuple[str, str]]:
+        """Shortest *undirected* link path between two memories.
+
+        Returns ``[(memory_id, rel_used_to_reach_it), ...]`` starting at
+        ``from_id`` (whose rel is ``""``), or ``[]`` when no path exists within
+        ``max_depth``. Undirected because "how are these two related?" does not
+        care which way the author happened to draw the arrow.
+
+        Adjacency comes from the sidecar index when enabled; otherwise it is
+        built from a single full scan — one scan, not one per hop.
+        """
+        if self.get(from_id) is None or self.get(to_id) is None:
+            return []
+        if from_id == to_id:
+            return [(from_id, "")]
+
+        adjacency = self._undirected_adjacency()
+        queue: deque[list[tuple[str, str]]] = deque([[(from_id, "")]])
+        visited = {from_id}
+        while queue:
+            path = queue.popleft()
+            if len(path) > max_depth:
+                break
+            for nxt, rel in adjacency.get(path[-1][0], []):
+                if nxt in visited:
+                    continue
+                extended = path + [(nxt, rel)]
+                if nxt == to_id:
+                    return extended
+                visited.add(nxt)
+                queue.append(extended)
+        return []
+
+    def _undirected_adjacency(self) -> dict[str, list[tuple[str, str]]]:
+        """Both-directions adjacency built from one pass over the link graph."""
+        adjacency: dict[str, list[tuple[str, str]]] = {}
+        for m in self.list_recent(limit=10**9, include_superseded=True,
+                                  include_expired=True):
+            for lnk in m.links:
+                adjacency.setdefault(m.id, []).append((lnk.to, lnk.rel))
+                adjacency.setdefault(lnk.to, []).append((m.id, lnk.rel))
+        for edges in adjacency.values():
+            edges.sort()
+        return adjacency
+
+    @property
+    def trash_path(self) -> Path:
+        """Where soft-deleted memories are parked."""
+        return Path(self.path).parent / TRASH_FILENAME
+
+    def trash(self, memory_id: str) -> bool:
+        """Soft-delete: park the memory in the trash, then remove it.
+
+        The missing middle between ``supersede`` (which asserts "replaced by
+        X") and ``forget`` (irreversible). ``trash_restore`` brings it back with
+        its id, tags, links and timestamps intact — but not its vector, which is
+        recomputed from the text on restore.
+        """
+        mem = self.get(memory_id)
+        if mem is None:
+            return False
+        entry = TrashEntry(memory_id=mem.id, deleted_at=time.time(),
+                           actor=self._actor, memory=mem.to_dict())
+        self.trash_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(self.trash_path, "at", encoding="utf-8") as f:
+            f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
+        with self.as_actor("trash"):
+            self.forget(mem.id)
+        return True
+
+    def trash_list(self) -> list[TrashEntry]:
+        """Everything currently in the trash, oldest first."""
+        return [e for e in self._read_trash()]
+
+    def trash_restore(self, memory_id: str) -> "Any":
+        """Bring a trashed memory back, or None when it is not in the trash.
+
+        The row is re-added with its original id and metadata and re-embedded
+        from its text; the trash entry is then dropped.
+        """
+        entries = self._read_trash()
+        keep = [e for e in entries if e.memory_id != memory_id]
+        if len(keep) == len(entries):
+            return None
+        restored = next(e for e in entries if e.memory_id == memory_id)
+
+        # Rehydrated through the store rather than by importing Memory here:
+        # store.py imports this module for the mixin, so a module-level import
+        # back the other way would be a cycle.
+        mem = self._memory_from_dict(restored.memory)
+        self.collection.add(ids=[mem.id], documents=[mem.text],
+                            metadatas=[mem.to_metadata()])
+        with self.as_actor("trash"):
+            self._journal("restore", mem.id, after=mem.to_dict(),
+                          meta={"from": "trash"})
+        self._write_trash(keep)
+        return mem
+
+    def trash_purge(self, memory_id: str | None = None) -> int:
+        """Permanently drop one trashed memory, or empty the trash.
+
+        Irreversible — this is the only operation in the trash path that loses
+        data, which is why it is separate from ``trash``.
+        """
+        entries = self._read_trash()
+        if memory_id is None:
+            self._write_trash([])
+            return len(entries)
+        keep = [e for e in entries if e.memory_id != memory_id]
+        purged = len(entries) - len(keep)
+        if purged:
+            self._write_trash(keep)
+        return purged
+
+    def _read_trash(self) -> list[TrashEntry]:
+        if not self.trash_path.exists():
+            return []
+        out: list[TrashEntry] = []
+        with gzip.open(self.trash_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    # A truncated tail (crash mid-write) must not make the
+                    # whole trash unreadable.
+                    continue
+                out.append(TrashEntry(
+                    memory_id=d.get("memory_id", ""),
+                    deleted_at=float(d.get("deleted_at", 0.0)),
+                    actor=d.get("actor", ""),
+                    memory=d.get("memory") or {},
+                ))
+        return out
+
+    def _write_trash(self, entries: list[TrashEntry]) -> None:
+        tmp = self.trash_path.with_suffix(".tmp")
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e.to_dict(), ensure_ascii=False) + "\n")
+        tmp.replace(self.trash_path)
+
+
+def _validate_tag(tag: str) -> None:
+    """Tags are stored comma-joined, so a comma would split one tag into two."""
+    if not tag:
+        raise ValueError("tag must not be empty")
+    if "," in tag:
+        raise ValueError(f"tags must not contain commas — got {tag!r}")
+
+
+def timeline_entry_to_dict(e: JournalEntry) -> dict[str, Any]:
+    """Render a journal entry for the timeline surfaces."""
+    return {
+        "ts": e.ts, "op": e.op, "actor": e.actor, "id": e.id,
+        "before": e.before, "after": e.after, "meta": e.meta,
+        "summary": e.summary(),
+    }

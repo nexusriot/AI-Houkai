@@ -24,7 +24,7 @@ def edit(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
-    mem = store._get_by_id(full_id)
+    mem = store.get(full_id)
     if mem is None:
         typer.echo(f"Error: memory {id!r} not found", err=True)
         raise typer.Exit(1)
@@ -128,7 +128,7 @@ def tag(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
-    mem = store._get_by_id(full_id)
+    mem = store.get(full_id)
     if mem is None:
         typer.echo("Error: not found", err=True)
         raise typer.Exit(1)
@@ -158,7 +158,7 @@ def bump(
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
 
-    mem = store._get_by_id(full_id)
+    mem = store.get(full_id)
     if mem is None:
         typer.echo("Error: not found", err=True)
         raise typer.Exit(1)

@@ -20,6 +20,14 @@ def reflect(
              "default from [maintenance.reflect].summarizer in config.toml. "
              "LLM summarizers are also called for the dry-run preview.",
     ),
+    types: str = typer.Option(
+        "episodic", "--types",
+        help="Comma-separated memory types to cluster. Historically episodic "
+             "only, which meant summaries were never themselves consolidated."),
+    max_level: int = typer.Option(
+        1, "--max-level",
+        help="Tiers of reflection-of-reflections to allow. Each summary is "
+             "tagged level:N; 1 (default) never re-summarises."),
     apply: bool = typer.Option(False, "--apply", help="Actually write (default is dry-run)"),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
@@ -40,6 +48,8 @@ def reflect(
         similarity_threshold=threshold,
         min_cluster_size=min_cluster_size,
         summarizer=summarize,
+        types=tuple(t.strip() for t in types.split(",") if t.strip()),
+        max_level=max_level,
     )
 
     consolidate_arg: bool | str

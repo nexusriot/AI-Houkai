@@ -102,6 +102,12 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 }
 
 func (e *Engine) isProtected(m memory.Memory) bool {
+	// A pinned memory is a standing instruction: decay must not reach it
+	// however stale it looks. Without this the only way to protect one is to
+	// inflate its importance, which distorts every search it appears in.
+	if m.Pinned {
+		return true
+	}
 	for _, t := range e.ProtectTypes {
 		if m.Type == t {
 			return true

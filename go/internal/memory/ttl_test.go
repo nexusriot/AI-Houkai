@@ -191,8 +191,6 @@ func TestExpiresAtMigrationMissingKey(t *testing.T) {
 	}
 }
 
-// --- helpers ---
-
 func idSet(hits []MemoryWithScore) map[string]bool {
 	s := map[string]bool{}
 	for _, h := range hits {

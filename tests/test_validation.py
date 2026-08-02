@@ -285,6 +285,7 @@ class TestCliValidation:
         assert res.exit_code == 1
         assert "on_conflict must be one of" in res.output
 
+    @pytest.mark.needs_model
     def test_remember_conflict_raise_is_clean_outcome(self, cli_store):
         store, path = cli_store
         store.remember("the sky is blue today", tags=["sky"])

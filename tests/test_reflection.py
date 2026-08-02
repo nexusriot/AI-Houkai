@@ -15,6 +15,7 @@ def _ep(store: MemoryStore, text: str, tags: list[str] | None = None,
 
 
 class TestClusters:
+    @pytest.mark.needs_model
     def test_similar_memories_cluster_together(self, store: MemoryStore):
         # These three are semantically very close
         _ep(store, "Deployed API v2.1 to production on Monday.")
@@ -69,6 +70,7 @@ class TestReflect:
         _ep(store, "Released API v2.3 to production environment.",
             tags=["deploy", "api"], importance=0.75)
 
+    @pytest.mark.needs_model
     def test_creates_semantic_memory(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         engine = ReflectionEngine(store, similarity_threshold=0.70,
@@ -104,6 +106,7 @@ class TestReflect:
         if created:
             assert created[0].importance == pytest.approx(0.7, abs=0.05)
 
+    @pytest.mark.needs_model
     def test_dry_run_does_not_write(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         count_before = store.count()
@@ -121,6 +124,7 @@ class TestReflect:
         for m in candidates:
             assert "dry-run" in (m.source or "")
 
+    @pytest.mark.needs_model
     def test_consolidate_soft_deletes_sources(self, store: MemoryStore):
         """consolidate=True soft-deletes sources (supersedes them, keeps in DB)."""
         self._seed_deployment_cluster(store)
@@ -142,6 +146,7 @@ class TestReflect:
         assert len(episodic_all) >= 1
         assert all(m.superseded_by != "" for m in episodic_all)
 
+    @pytest.mark.needs_model
     def test_second_reflect_skips_superseded_sources(self, store: MemoryStore):
         """A second consolidating reflect must not re-cluster sources that an
         earlier reflection already superseded — doing so would emit a duplicate
@@ -166,6 +171,7 @@ class TestReflect:
                      if "reflection" in m.tags]
         assert len(summaries) == 1, "a second reflect must not duplicate the summary"
 
+    @pytest.mark.needs_model
     def test_consolidate_hard_removes_sources(self, store: MemoryStore):
         """consolidate='hard' hard-deletes sources (old behaviour)."""
         self._seed_deployment_cluster(store)
@@ -188,6 +194,7 @@ class TestReflect:
             assert "reflection" in tags
             assert "deploy" in tags
 
+    @pytest.mark.needs_model
     def test_custom_summarizer_called(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         called_with: list[list[Memory]] = []

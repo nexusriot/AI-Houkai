@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (no torch)
+        # The [test] extra deliberately omits sentence-transformers: the suite
+        # runs against ai_houkai.testing.FakeEmbedder, so CI needs neither a
+        # ~2 GB torch install nor a model download. Tests that genuinely need
+        # real semantics are marked and skipped here.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Verify the local model really is absent
+        # Guards the point of the [test] extra: if sentence-transformers leaks
+        # back into the core deps, this job would silently start downloading
+        # models and the fast-suite promise would rot.
+        run: |
+          if python -c "import sentence_transformers" 2>/dev/null; then
+            echo "::error::sentence-transformers is installed in the [test] extra —"
+            echo "::error::the fast suite must not depend on torch."
+            exit 1
+          fi
+
+      - name: Test
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: pytest -q -m "not needs_model"
+
+  python-model:
+    # The ~29 tests whose assertions depend on real semantic similarity
+    # (conflict thresholds, reflection clustering, ranking quality). Split out
+    # because it needs torch + a model download; the fast job above covers
+    # everything else on every push.
+    name: Python (real embedder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache the sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-all-MiniLM-L6-v2-v1
+
+      - name: Install (with torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Test
+        run: pytest -q -m needs_model
+
+  functional:
+    # Black-box tests against the installed console scripts and a real
+    # ai-houkai-serve process. Needs the model (they exercise real recall), so
+    # it is split out like python-model rather than gating every push.
+    name: Functional (e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache the sentence-transformers model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-all-MiniLM-L6-v2-v1
+
+      - name: Install the real console scripts
+        # Not editable: the suite drives `houkai` / `ai-houkai-serve` off PATH,
+        # so it has to test an actual install.
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[cli,dev]"
+
+      - name: Test
+        run: pytest -q functional_tests
+
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^vendor/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needs to run on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  parity:
+    name: Port parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Install Python deps
+        run: pip install -e ".[test]"
+
+      # Both ports assert their MCP tool list, HTTP routes and recall knobs
+      # against the shared parity.json. The per-port jobs above already run
+      # these; this job exists so a surface change shows up as a single
+      # unmistakable "Port parity" failure rather than two unrelated ones.
+      - name: Python surface vs parity.json
+        run: pytest -q tests/test_parity.py
+
+      - name: Go surface vs parity.json
+        working-directory: go
+        run: go test ./internal/parity/ -v

@@ -59,6 +59,7 @@ class TestReranker:
         assert "first_stage_score" in rr_info
         assert "score" in rr_info
 
+    @pytest.mark.needs_model
     def test_per_store_default_reranker_applies(self, tmp_path):
         wanted = {}
 

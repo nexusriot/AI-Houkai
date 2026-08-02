@@ -38,6 +38,7 @@ class TestFindConflicts:
         store.remember("Use pytest for testing", type="procedural")
         assert store.find_conflicts() == []
 
+    @pytest.mark.needs_model
     def test_near_duplicate_detected(self, store: MemoryStore):
         store.remember("Use ruff to lint Python code", type="procedural",
                        tags=["linting"])
@@ -47,6 +48,7 @@ class TestFindConflicts:
         assert len(conflicts) >= 1
         assert all(c.kind == "duplicate" for c in conflicts)
 
+    @pytest.mark.needs_model
     def test_contradiction_detected(self, store: MemoryStore):
         store.remember("Always use ruff for linting", type="procedural",
                        tags=["linting"])
@@ -88,6 +90,7 @@ class TestFindConflicts:
             assert c.kind in ("duplicate", "contradiction")
             assert c.reason in ("negation_diff", "custom_fn", "similarity")
 
+    @pytest.mark.needs_model
     def test_custom_contradiction_fn(self, store: MemoryStore):
         def always_contradicts(a, b):
             return True
@@ -116,12 +119,14 @@ class TestRememberConflict:
                              on_conflict="ignore")
         assert mem.id  # stored normally
 
+    @pytest.mark.needs_model
     def test_on_conflict_warn_emits_warning(self, store: MemoryStore):
         store.remember("Always use ruff", type="procedural", tags=["lint"])
         with pytest.warns(UserWarning, match="conflict"):
             store.remember("Never use ruff", type="procedural", tags=["lint"],
                            on_conflict="warn")
 
+    @pytest.mark.needs_model
     def test_on_conflict_raise_raises(self, store: MemoryStore):
         store.remember("Always use ruff", type="procedural", tags=["lint"])
         with pytest.raises(ConflictError) as exc_info:
@@ -239,6 +244,7 @@ class TestPolarityConflict:
         assert any(c.kind == "contradiction" and c.reason == "polarity_diff"
                    for c in conflicts)
 
+    @pytest.mark.needs_model
     def test_polarity_diff_takes_priority_over_negation(self, store: MemoryStore):
         # Even with negation words, polarity_diff should be the reason
         store.remember("Always use ruff", type="procedural",

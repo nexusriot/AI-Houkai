@@ -308,6 +308,7 @@ class TestRRFFusion:
         assert scores == sorted(scores, reverse=True)
         assert all(s > 0 for s in scores)
 
+    @pytest.mark.needs_model
     def test_rrf_ranks_exact_match_top(self, store: MemoryStore):
         self._seed(store)
         hits = store.recall("python gil parallelism", k=3, mode="hybrid", fusion="rrf")
@@ -333,6 +334,7 @@ class TestDiversityAndDedup:
         hits = store.recall("beta duplicate fact", k=5)
         assert len(hits) == 3
 
+    @pytest.mark.needs_model
     def test_diversity_first_pick_is_most_relevant(self, store: MemoryStore):
         # First MMR pick has no novelty penalty → always the most relevant.
         best = store.remember("python testing with pytest fixtures", type="semantic")
@@ -341,6 +343,7 @@ class TestDiversityAndDedup:
         hits = store.recall("python testing pytest fixtures", k=3, diversity=0.5)
         assert hits[0][0].id == best.id
 
+    @pytest.mark.needs_model
     def test_rrf_diversity_does_not_promote_irrelevant(self, store: MemoryStore):
         # Regression for the RRF/MMR scale mismatch: with diversity high
         # (relevance-dominant) an off-topic memory must not be promoted into the

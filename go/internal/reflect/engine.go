@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,53 @@ type Engine struct {
 	SimilarityThreshold float32
 	MinClusterSize      int
 	Summarizer          Summarizer
+	// Types selects which memory types to cluster. Historically hard-coded to
+	// episodic, which meant semantic memories — including reflections
+	// themselves — never consolidated, so a long-lived store accumulated
+	// summaries without bound, and feedback/procedural never benefited at all.
+	// Empty = {episodic}.
+	Types []memory.MemoryType
+	// MaxLevel caps how many tiers of reflection-of-reflections are allowed.
+	// Each summary is tagged level:N; a memory already at MaxLevel is not
+	// eligible for clustering. 1 (default) reproduces the old behaviour —
+	// summaries are produced but never re-summarised. The cap is what stops
+	// runaway re-summarisation from eating the store.
+	MaxLevel int
+}
+
+// LevelOf returns the reflection tier of a memory: 0 for a raw one, N for a
+// "level:N" tag. Encoded as a tag rather than a metadata field so it
+// round-trips through export/import and old archives read as level 0.
+func LevelOf(m memory.Memory) int {
+	for _, t := range m.Tags {
+		if !strings.HasPrefix(t, "level:") {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(t, "level:")); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// eligibleType reports whether the engine should cluster this type.
+func (e *Engine) eligibleType(t memory.MemoryType) bool {
+	if len(e.Types) == 0 {
+		return t == memory.Episodic
+	}
+	for _, want := range e.Types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) maxLevel() int {
+	if e.MaxLevel < 1 {
+		return 1
+	}
+	return e.MaxLevel
 }
 
 // Storable is the subset of MemoryStore the Engine needs.
@@ -97,9 +145,15 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 	var eps []episodicItem
 	for _, it := range items {
 		m := memory.MetadataToMemory(it.ID, it.Content, it.Metadata)
-		if m.Type == memory.Episodic && m.SupersededBy == "" {
-			eps = append(eps, episodicItem{Memory: m, embedding: it.Embedding})
+		if !e.eligibleType(m.Type) || m.SupersededBy != "" {
+			continue
 		}
+		// A memory already at the deepest allowed tier must not be folded into
+		// yet another summary — that is the runaway case MaxLevel prevents.
+		if LevelOf(m) >= e.maxLevel() {
+			continue
+		}
+		eps = append(eps, episodicItem{Memory: m, embedding: it.Embedding})
 	}
 
 	// Sort by importance descending so highest-importance seeds first.
@@ -174,15 +228,27 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 
 		// Aggregate tags (reflection first, then first-seen order) and mean
 		// importance rounded to 3 decimals, matching Python.
-		tags := []string{"reflection"}
-		seen := map[string]bool{"reflection": true}
+		// The new summary sits one tier above its deepest member, so a
+		// hierarchy can be walked (and re-reflected) by level.
+		level := 0
+		for _, m := range cluster {
+			if l := LevelOf(m); l > level {
+				level = l
+			}
+		}
+		levelTag := "level:" + strconv.Itoa(level+1)
+		tags := []string{"reflection", levelTag}
+		seen := map[string]bool{"reflection": true, levelTag: true}
 		var totalImp float64
 		for _, m := range cluster {
 			for _, t := range m.Tags {
-				if !seen[t] {
-					seen[t] = true
-					tags = append(tags, t)
+				// Do not inherit the members' level tags: the summary has its
+				// own tier.
+				if strings.HasPrefix(t, "level:") || seen[t] {
+					continue
 				}
+				seen[t] = true
+				tags = append(tags, t)
 			}
 			totalImp += float64(m.Importance)
 		}

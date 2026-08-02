@@ -20,9 +20,9 @@ import (
 // Config controls a maintenance tick (used by the CLI tick/run commands and
 // the MCP maintenance_tick tool).
 type Config struct {
-	Interval    time.Duration // cadence of the foreground `maintenance run` loop
-	DecayRate   float32
-	MinScore    float32
+	Interval  time.Duration // cadence of the foreground `maintenance run` loop
+	DecayRate float32
+	MinScore  float32
 	// ProtectTypes are never pruned by the decay job. Without this the tick
 	// defaulted to decay's built-in ["procedural"], silently ignoring the
 	// user's configured protect_types and deleting memories they meant to keep.

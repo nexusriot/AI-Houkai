@@ -98,6 +98,9 @@ type PackOpts struct {
 	DedupThreshold *float32
 	MinCosine      *float32
 	NoTouch        bool
+	// LexicalIndex forwards to Recall: "fts" unions full-corpus BM25 matches
+	// into the candidate pool (hybrid mode, sidecar index required).
+	LexicalIndex LexicalIndexMode
 
 	// Query-time compression: candidates that could not be packed individually
 	// are clustered by Jaccard similarity; clusters of ≥ CompressMinGroup
@@ -105,6 +108,14 @@ type PackOpts struct {
 	Compress          bool
 	CompressThreshold float32 // default 0.30 when Compress and zero
 	CompressMinGroup  int     // default 2 when Compress and zero
+
+	// MinTrust filters candidates by provenance (see RecallOpts.MinTrust).
+	MinTrust TrustLevel
+	// IncludePinned prepends every pinned memory ahead of the ranked hits, so
+	// a standing instruction is present whether or not it matches the query.
+	// They still compete for the same budget: a pinned memory that does not
+	// fit is dropped like any other.
+	IncludePinned bool
 }
 
 const defaultPackHeader = "## Relevant memory"
@@ -153,9 +164,17 @@ func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpt
 		DedupThreshold:    opts.DedupThreshold,
 		MinCosine:         opts.MinCosine,
 		NoTouch:           opts.NoTouch,
+		LexicalIndex:      opts.LexicalIndex,
+		MinTrust:          opts.MinTrust,
 	})
 	if err != nil {
 		return PackResult{}, err
+	}
+	if opts.IncludePinned {
+		ranked, err = s.prependPinned(ctx, ranked, opts.MinTrust)
+		if err != nil {
+			return PackResult{}, err
+		}
 	}
 
 	return packRanked(ranked, opts.TokenBudget, countFn, header,
@@ -232,8 +251,24 @@ func packRanked(ranked []MemoryWithScore, budget int, countFn func(string) int, 
 	}
 }
 
+// packLine renders one packed memory.
+//
+// An untrusted origin is marked inline: the packed block goes straight into a
+// model's context, and a fact scraped from a page should not be
+// indistinguishable there from one the user stated.
 func packLine(m Memory) string {
-	return fmt.Sprintf("- (%s) %s", m.Type, m.Text)
+	var marks []string
+	if m.Pinned {
+		marks = append(marks, "pinned")
+	}
+	if t := trustOrDefault(m.Trust); t != TrustTrusted {
+		marks = append(marks, string(t))
+	}
+	suffix := ""
+	if len(marks) > 0 {
+		suffix = " [" + strings.Join(marks, ", ") + "]"
+	}
+	return fmt.Sprintf("- (%s)%s %s", m.Type, suffix, m.Text)
 }
 
 // jaccardSim is the token-set Jaccard similarity of two texts.
@@ -308,4 +343,50 @@ func compressGroup(mems []Memory) string {
 		}
 	}
 	return fmt.Sprintf("[×%d similar] %s", len(mems), strings.Join(snippets, " | "))
+}
+
+// prependPinned puts pinned memories at the front of a ranked list.
+//
+// Scored above every hit rather than merged by relevance: a standing
+// instruction is included *because* it is pinned, not because it matched.
+// Already-ranked pinned memories are moved rather than duplicated.
+func (s *MemoryStore) prependPinned(ctx context.Context, ranked []MemoryWithScore,
+	minTrust TrustLevel) ([]MemoryWithScore, error) {
+	mems, err := s.ListRecent(ctx, 0, false, false)
+	if err != nil {
+		return ranked, err
+	}
+	var pinned []Memory
+	for _, m := range mems {
+		if !m.Pinned {
+			continue
+		}
+		if minTrust != "" && TrustRank(m.Trust) > TrustRank(minTrust) {
+			continue
+		}
+		pinned = append(pinned, m)
+	}
+	if len(pinned) == 0 {
+		return ranked, nil
+	}
+	pinnedIDs := map[string]bool{}
+	for _, m := range pinned {
+		pinnedIDs[m.ID] = true
+	}
+	var top float32 = 1.0
+	for _, r := range ranked {
+		if r.Score > top {
+			top = r.Score
+		}
+	}
+	out := make([]MemoryWithScore, 0, len(ranked)+len(pinned))
+	for _, m := range pinned {
+		out = append(out, MemoryWithScore{Memory: m, Score: top})
+	}
+	for _, r := range ranked {
+		if !pinnedIDs[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }

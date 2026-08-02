@@ -72,6 +72,7 @@ class TestAsyncRecall:
         texts = [m.text for m, _ in hits]
         assert any("sky" in t for t in texts)
 
+    @pytest.mark.needs_model
     def test_scores_in_range(self, astore):
         _run(astore.remember("memory alpha"))
         hits = _run(astore.recall("alpha", k=5))

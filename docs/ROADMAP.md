@@ -28,8 +28,23 @@ doubled by the two-port parity requirement).
 
 ## ✅ Shipped in this cycle
 
+Everything in [RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) — A1–A3, B, C,
+F2, E, D, F1, F3, F4 and G — landed together (2026-08-02), in both ports.
+
 | Feature | Notes |
 |---|---|
+| **A1 — retrieval knobs on MCP** | Python MCP `recall`/`recall_pack`/`auto_context` gained `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph`, `touch`, `header` and flat `expand_*`; Go gained `graph`/`expand_*`/`header` and `AutoContextOpts.NoTouch`. |
+| **A2 — public `get()`** | `_get_by_id` promoted (alias kept one release), `AsyncMemoryStore.get`, MCP `get` tool. |
+| **A3 — surface coverage** | MCP +`get`/`subgraph`/`restore`/`undo`/`nuke`/`ready`; HTTP +`/restore`, `/subgraph`, `/undo`, `/nuke`, `/journal`, `/export`, `/import`; CLI +`metrics`/`history`/`state-at`/`get-at`/`journal undo-last`. |
+| **B — pluggable embedder** | `ai_houkai/embed.py` (stdlib OpenAI-compatible + Ollama), `MemoryStore(embedding_function=)`, `AI_HOUKAI_EMBEDDER=provider:model`, `ai_houkai/testing.py` (`FakeEmbedder` + fixtures). sentence-transformers moved out of core into a `[local]` extra. |
+| **C — CI + parity guard** | `.github/workflows/{ci,release}.yml` and repo-root `parity.json`, asserted by **both** ports (`tests/test_parity.py`, `go/internal/parity/`). |
+| **F2 — eval wired up** | `houkai eval goldset.jsonl`, `eval_recall` MCP tool, and a full Go port of the harness (`go/internal/eval`). |
+| **E — SQLite sidecar index** | Opt-in `index="sqlite"`: full-corpus FTS5 BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag/type counts, indexed expiry sweep, `houkai reindex`. Derived cache with a scan fallback everywhere. |
+| **D — curation graduated** | `merge`, `versions`, `list_tags`/`rename_tag`/`merge_tags`/`delete_tag`, `find_path`, and the `trash`/`trash_list`/`trash_restore`/`trash_purge` trio — all previously implemented in ai-houkai-service against library privates. |
+| **F1 — tiered reflection** | `ReflectionEngine(types=…, max_level=…)`; summaries tagged `level:N` so reflections-of-reflections form a capped hierarchy. |
+| **F3 — pinned tier** | `Memory.pinned`: always offered to `recall_pack(include_pinned=True)`, never pruned by decay. |
+| **F4 — idempotent writes** | `remember(idempotent=True)` + `content_hash` (sha256, byte-identical across ports). |
+| **G — provenance trust** | `Memory.trust` (`trusted`/`reported`/`untrusted`), `recall(min_trust=…)`, untrusted lines marked in packed context. |
 | **Graph-proximity fusion** (`HybridWeights.graph`) | PPR-lite spread over intra-pool links, fused into both weighted and RRF scoring; `graph=0.0` default is a byte-for-byte no-op. |
 | **Gated graph expansion** (`ExpandSpec.rerank`) | Expanded neighbours can now be merged into the pool *before* `min_cosine`/dedup/MMR/top-k so they can't inject near-duplicates or overflow `k`. `rerank=False` keeps the legacy append-after behaviour. |
 | **`houkai doctor` + `GET /ready`** | Active embedder probe (latency + dim), embed-dim guardrail, store/journal checks; readiness endpoint returns 200/503 and is auth-exempt like `/health`. |
@@ -50,14 +65,11 @@ per-scope quotas, stats, GDPR erasure, and agent hand-off.
   backfill once or filter client-side (as the Go port already does); keep both
   ports' "missing key = unscoped" semantics identical.
 
-### 2. Persistent full-corpus BM25 (opt-in SQLite FTS5 sidecar) · value 5 · fit 4 · L
-`_bm25_score_pool` scores lexical relevance only over the vector over-fetch
-pool, so a strong exact-token match with a weak embedding is *never surfaced at
-any corpus size*. Add an optional FTS5 sidecar (`lexical_index="fts"`, default
-`"pool"` = today's behaviour) that indexes the same pre-tokenised text, UNIONs
-its top-N ids into the pool before scoring, plus a `houkai reindex` command.
-- **Watch-out:** the `β=0.20` lexical weight was tuned against pool-relative
-  normalisation; global IDF changes magnitude and may need re-tuning.
+### 2. Tune the lexical weight for full-corpus BM25 · value 4 · fit 5 · S
+The FTS5 sidecar shipped (see above), but `β=0.20` was tuned against
+*pool-relative* normalisation. Global IDF changes the term's magnitude, so
+re-tune it against a gold set with `houkai eval --lexical-index fts` now that
+there is a ruler.
 
 ---
 
@@ -76,7 +88,7 @@ its top-N ids into the pool before scoring, plus a `houkai reindex` command.
 
 | Feature | V/Fit/Eff | Sketch |
 |---|---|---|
-| **Metrics overhaul** | 4/5/M | `metrics()` docstring promises "recall-latency percentiles" it never computes — add real p50/p95/p99 (fixed-bucket histogram), per-stage latency, counters on the *uncounted* mutators (`link`/`unlink`/`import`/`export`/`restore`/`purge`), and an optional dependency-free `GET /metrics?format=prometheus`. |
+| **Prometheus metrics** | 3/5/S | p50/p95/p99 and the full mutator counters already ship; what remains is per-*stage* latency and a dependency-free `GET /metrics?format=prometheus`. |
 | **Quota + eviction** | 4/5/M | `max_memories` + policy (`decay`/`lru`/`reject`), batch-evict to a headroom watermark, never evict `procedural`, journal evictions under `as_actor("quota")`. |
 | **Quiesced backup + restore** | 4/4/M | Today's `houkai backup` is an unlocked `copytree` with no real restore. Add a manifest (embedding-model / collection / checksums), a real `houkai restore`, and integrity verification. |
 
@@ -97,8 +109,6 @@ its top-N ids into the pool before scoring, plus a `houkai reindex` command.
 
 | Feature | V/Fit/Eff | Sketch |
 |---|---|---|
-| **Wire the eval harness into CLI + MCP** | 4/5/M | `ai_houkai.eval` exists but is unreachable from any surface. Add `houkai eval <goldset.jsonl>` + a read-only `eval_recall` MCP tool + a Go port, so ranking changes are measurable in CI. Keep gold sets JSONL-only (preserve the stdlib-only ethos). |
-| **`ai_houkai.testing`** | 4/4/M | A hash-based `FakeEmbedder` + pytest fixtures. Requires first adding an `embedding_function=` injection seam to the Python constructor (Go already has the seam). |
 | **Typed remote SDK client** | 3/5/L | A thin stdlib `HoukaiClient` mirroring the REST surface. |
 | **LangChain / LlamaIndex adapters** | 4/4/M | Memory/retriever adapters — the primitives already match. |
 | **Contradiction-surfacing context packing** | 4/5/M | Opt-in `surface_conflicts` on `recall_pack` that *annotates* (does not resolve) conflicts among packed items — reuses two shipped-but-disconnected features. |
@@ -118,7 +128,9 @@ its top-N ids into the pool before scoring, plus a `houkai reindex` command.
 
 ## Latent issues worth a quick correctness pass
 
-- **`metrics()` doc/impl mismatch** — the docstring advertises percentiles that
-  are not computed (folded into the Metrics overhaul above).
-- **Incomplete op counters** — `link`/`unlink`/`import`/`export`/`restore`/
-  `purge_expired` are invisible to `metrics()`.
+Both previously listed here (the `metrics()` doc/impl mismatch and the
+incomplete op counters) were already fixed in the shipped code — see
+[RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) §1.
+
+- **`/ready` has no probe deadline** — the 5 s is a cache TTL, not a timeout,
+  and the route is auth-exempt and never caches a failure.
