@@ -2,7 +2,7 @@
 
 This document describes the Go port's internals. For the user-facing overview
 see [README.md](README.md); for the original Python design see
-[`../DESIGN.md`](../DESIGN.md); for the porting rationale see
+[`../docs/DESIGN.md`](../docs/DESIGN.md); for the porting rationale see
 [`../GO_PORT_DESIGN.md`](../GO_PORT_DESIGN.md).
 
 ## Goals
@@ -288,8 +288,10 @@ corresponding `MemoryStore` method, and returns a JSON text result via
 `jsonText`. `ConflictError` is unwrapped so callers see
 `{stored: false, conflicts: [...]}` rather than an opaque error.
 
-These 22 tools mirror the Python tool names so existing MCP clients keep
-working, and the surface is at full parity: the `auto_context` tool, the
+These 41 tools mirror the Python tool names so existing MCP clients keep
+working, and the surface is at full parity — now *asserted* against the
+repo-root `parity.json` by `internal/parity` rather than maintained by hand:
+the `auto_context` tool, the
 advanced `recall` / `recall_pack` parameters (`fusion=rrf`, diversity/MMR,
 `dedup_threshold`, `min_cosine`, `touch`, `explain`, `recall_pack`
 compression via `compress`/`compress_threshold`/`compress_min_group`), and the

@@ -26,29 +26,32 @@ doubled by the two-port parity requirement).
 
 ---
 
-## ✅ Shipped in this cycle
+## ✅ Shipped
 
-Everything in [RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) — A1–A3, B, C,
-F2, E, D, F1, F3, F4 and G — landed together (2026-08-02), in both ports.
+### This cycle (see [RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) for the analysis)
 
 | Feature | Notes |
 |---|---|
-| **A1 — retrieval knobs on MCP** | Python MCP `recall`/`recall_pack`/`auto_context` gained `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph`, `touch`, `header` and flat `expand_*`; Go gained `graph`/`expand_*`/`header` and `AutoContextOpts.NoTouch`. |
-| **A2 — public `get()`** | `_get_by_id` promoted (alias kept one release), `AsyncMemoryStore.get`, MCP `get` tool. |
-| **A3 — surface coverage** | MCP +`get`/`subgraph`/`restore`/`undo`/`nuke`/`ready`; HTTP +`/restore`, `/subgraph`, `/undo`, `/nuke`, `/journal`, `/export`, `/import`; CLI +`metrics`/`history`/`state-at`/`get-at`/`journal undo-last`. |
-| **B — pluggable embedder** | `ai_houkai/embed.py` (stdlib OpenAI-compatible + Ollama), `MemoryStore(embedding_function=)`, `AI_HOUKAI_EMBEDDER=provider:model`, `ai_houkai/testing.py` (`FakeEmbedder` + fixtures). sentence-transformers moved out of core into a `[local]` extra. |
-| **C — CI + parity guard** | `.github/workflows/{ci,release}.yml` and repo-root `parity.json`, asserted by **both** ports (`tests/test_parity.py`, `go/internal/parity/`). |
-| **F2 — eval wired up** | `houkai eval goldset.jsonl`, `eval_recall` MCP tool, and a full Go port of the harness (`go/internal/eval`). |
-| **E — SQLite sidecar index** | Opt-in `index="sqlite"`: full-corpus FTS5 BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag/type counts, indexed expiry sweep, `houkai reindex`. Derived cache with a scan fallback everywhere. |
-| **D — curation graduated** | `merge`, `versions`, `list_tags`/`rename_tag`/`merge_tags`/`delete_tag`, `find_path`, and the `trash`/`trash_list`/`trash_restore`/`trash_purge` trio — all previously implemented in ai-houkai-service against library privates. |
-| **F1 — tiered reflection** | `ReflectionEngine(types=…, max_level=…)`; summaries tagged `level:N` so reflections-of-reflections form a capped hierarchy. |
-| **F3 — pinned tier** | `Memory.pinned`: always offered to `recall_pack(include_pinned=True)`, never pruned by decay. |
-| **F4 — idempotent writes** | `remember(idempotent=True)` + `content_hash` (sha256, byte-identical across ports). |
-| **G — provenance trust** | `Memory.trust` (`trusted`/`reported`/`untrusted`), `recall(min_trust=…)`, untrusted lines marked in packed context. |
+| **Full MCP ranking surface** | `recall`/`recall_pack`/`auto_context` now expose `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph`, `lexical_index`, `min_trust`, `touch`, `header` and flat `expand_*` knobs in **both** ports. Three cycles of retrieval work had been invisible to MCP clients. |
+| **Public `get()`** | `_get_by_id` promoted (alias kept), plus `AsyncMemoryStore.get` and an MCP `get` tool. |
+| **Surface coverage** | MCP 23→41 tools, HTTP 24→41 routes, CLI 30→39 commands. `undo` was the sharpest gap: the append-only journal is the project's differentiator and undo was reachable only from a local shell. |
+| **Pluggable embedder** (§24) | `embedding_function=` seam + `AI_HOUKAI_EMBEDDER`, stdlib OpenAI-compatible/Ollama backends, `sentence-transformers` moved to a `[local]` extra, `ai_houkai.testing.FakeEmbedder`. |
+| **CI + enforced parity** (§23) | `.github/workflows/{ci,release}.yml`; `parity.json` asserted by both ports; a fast suite that needs no torch. |
+| **Eval harness wired** (§28) | `houkai eval`, the `eval_recall` MCP tool, and a Go port. Ranking constants are now measurable. |
+| **SQLite sidecar index** (§25) | Full-corpus BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag counts, indexed expiry sweep, `houkai reindex`. Opt-in; degrades to scanning rather than to wrong answers. |
+| **Curation + trash** (§26) | `merge`/`versions`/tag ops/`find_path` graduated out of ai-houkai-service; recoverable delete between `supersede` and `forget`, with decay pruning routed through it. |
+| **Tiered reflection** | `ReflectionEngine(types=…)` instead of episodic-only, with a `level` tag and `max_level` guard so reflections-of-reflections form a hierarchy. |
+| **Pinned / trust / idempotent** (§27) | A standing-instruction slot, a provenance tier, and content-hash dedupe on write. |
+
+### Earlier cycles
+
+| Feature | Notes |
+|---|---|
 | **Graph-proximity fusion** (`HybridWeights.graph`) | PPR-lite spread over intra-pool links, fused into both weighted and RRF scoring; `graph=0.0` default is a byte-for-byte no-op. |
-| **Gated graph expansion** (`ExpandSpec.rerank`) | Expanded neighbours can now be merged into the pool *before* `min_cosine`/dedup/MMR/top-k so they can't inject near-duplicates or overflow `k`. `rerank=False` keeps the legacy append-after behaviour. |
-| **`houkai doctor` + `GET /ready`** | Active embedder probe (latency + dim), embed-dim guardrail, store/journal checks; readiness endpoint returns 200/503 and is auth-exempt like `/health`. |
-| **Batch write & embed** (`remember_many`) | Bulk store with batched embedding — N docs cost `ceil(N/batch_size)` encode passes instead of N; one journal entry per id (undo stays per-id); wired into `houkai ingest`, `POST /memories/batch`, and the `remember_many` MCP tool. Intra-batch semantics are explicit (earlier items win under `supersede`); `on_conflict="raise"` is rejected in bulk. |
+| **Gated graph expansion** (`ExpandSpec.rerank`) | Expanded neighbours can be merged into the pool *before* `min_cosine`/dedup/MMR/top-k. |
+| **`houkai doctor` + `GET /ready`** | Active embedder probe (latency + dim), embed-dim guardrail, store/journal checks. |
+| **Batch write & embed** (`remember_many`) | `ceil(N/batch_size)` encode passes instead of N. |
+| **Metrics** | Real p50/p95/p99 percentiles over a bounded sample ring, plus counters on every mutator. Only the Prometheus exposition format and per-stage latency remain (below). |
 
 ---
 
@@ -64,12 +67,17 @@ per-scope quotas, stats, GDPR erasure, and agent hand-off.
 - **Watch-out:** Chroma equality won't match legacy rows lacking the key —
   backfill once or filter client-side (as the Go port already does); keep both
   ports' "missing key = unscoped" semantics identical.
+- **Sequencing:** the sidecar index (§25) landed first on purpose. Scoping
+  without an index just multiplies the full scans.
 
-### 2. Tune the lexical weight for full-corpus BM25 · value 4 · fit 5 · S
-The FTS5 sidecar shipped (see above), but `β=0.20` was tuned against
-*pool-relative* normalisation. Global IDF changes the term's magnitude, so
-re-tune it against a gold set with `houkai eval --lexical-index fts` now that
-there is a ruler.
+### 2. Port the sidecar index to Go · value 4 · fit 5 · M
+The metadata/FTS index (§25) is Python-only, so the Go port still pays the full
+scan for `list_recent`, reverse links and the expiry sweep, and has no
+full-corpus lexical channel. `modernc.org/sqlite` keeps it cgo-free; the
+alternative is folding the index into the existing `vector.Backend` abstraction.
+Until this lands, `lexical_index="fts"` is a documented Python-only knob — which
+`parity.json` deliberately does **not** assert, so the gap is explicit rather
+than a silent lie.
 
 ---
 
@@ -80,7 +88,7 @@ there is a ruler.
 | **Conversation fact-distillation ingest** | 4/4/M | `distill_turns()` extracts atomic facts from raw dialogue, then routes each via ADD/UPDATE/MERGE/NOOP with a dry-run plan. ~70% new extraction; MERGE reuses `remember(on_conflict="supersede")`. |
 | **Bi-temporal validity** (`valid_from`/`valid_until` + `recall(as_of=T)`) | 4/5/M | "What was true at T", distinct from the transaction-time journal. Critical subtlety: `as_of` on a past T must override superseded-hiding for in-interval memories. Contrast clearly with `state_at` ("as of when we *knew*"). |
 | **Entity extraction + entity-overlap channel** | 4/4/M | Store extracted entities like `tags`; add an entity-overlap term (`weight_entity=0.0` default → no-op) and a `recall(entity=…)` filter. |
-| **Full graph-proximity tuning** (follow-up to the shipped fusion) | 3/4/M | Empirically tune damping / iteration count / default `graph` weight via `eval_recall`; expose the knobs and document a recommended profile. |
+| **Full graph-proximity tuning** (follow-up to the shipped fusion) | 3/4/M | Empirically tune damping / iteration count / default `graph` weight — now actually possible, since `houkai eval` / `eval_recall` exist (§28). Document a recommended profile. |
 
 ---
 
@@ -90,7 +98,7 @@ there is a ruler.
 |---|---|---|
 | **Prometheus metrics** | 3/5/S | p50/p95/p99 and the full mutator counters already ship; what remains is per-*stage* latency and a dependency-free `GET /metrics?format=prometheus`. |
 | **Quota + eviction** | 4/5/M | `max_memories` + policy (`decay`/`lru`/`reject`), batch-evict to a headroom watermark, never evict `procedural`, journal evictions under `as_actor("quota")`. |
-| **Quiesced backup + restore** | 4/4/M | Today's `houkai backup` is an unlocked `copytree` with no real restore. Add a manifest (embedding-model / collection / checksums), a real `houkai restore`, and integrity verification. |
+| **Quiesced backup + restore** | 4/4/M | Today's `houkai backup` is an unlocked `copytree` with no real restore. Add a manifest (embedding-model / collection / checksums), a real `houkai restore`, and integrity verification. **ai-houkai-service's `backup.py` already has manifests and a working restore** — another graduation candidate, like the curation set (§26). |
 
 ---
 
@@ -112,6 +120,7 @@ there is a ruler.
 | **Typed remote SDK client** | 3/5/L | A thin stdlib `HoukaiClient` mirroring the REST surface. |
 | **LangChain / LlamaIndex adapters** | 4/4/M | Memory/retriever adapters — the primitives already match. |
 | **Contradiction-surfacing context packing** | 4/5/M | Opt-in `surface_conflicts` on `recall_pack` that *annotates* (does not resolve) conflicts among packed items — reuses two shipped-but-disconnected features. |
+| **Gold sets in CI** | 3/5/S | `houkai eval` exists now, but no gold set is checked in, so CI still cannot fail on a ranking regression. Commit a small fixture corpus + gold set and add a threshold job. |
 
 ---
 
@@ -134,3 +143,15 @@ incomplete op counters) were already fixed in the shipped code — see
 
 - **`/ready` has no probe deadline** — the 5 s is a cache TTL, not a timeout,
   and the route is auth-exempt and never caches a failure.
+- **`mcp` is capped at `<2`** — mcp 2.0.0 removed `mcp.server.fastmcp` (the
+  FastMCP server was renamed to `mcp.server.mcpserver`), so an unbounded
+  requirement made every fresh install resolve to a version the code cannot
+  import. The cap restores reproducible installs; porting
+  `mcp_server/server.py` to the 2.x API is real work across 41 tools and should
+  lift the cap in the same change.
+- **`houkai list --format json` on an empty store** prints a human message to
+  stderr and nothing to stdout, so the output is not parseable JSON. Any script
+  piping it has to tolerate the empty case (see `list_ids` in
+  `functional_tests/test_e2e.py`).
+- **The sidecar index is Python-only** — tracked as Tier 1 #2, and deliberately
+  absent from `parity.json` so the gap is explicit rather than an unstated lie.

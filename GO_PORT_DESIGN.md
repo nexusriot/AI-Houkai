@@ -1,12 +1,27 @@
 # AI-Houkai — Go Port Feasibility & Design
 
-Status: **implemented** — the port shipped in `go/` (merged 2026-06-10) and
-has since reached full feature parity with the Python version (22 MCP tools,
-pack/ingest/collections/TUI/installers/summarizers/HTTP-REST-API server, plus
-the later reranking / TTL-expiry / point-in-time-history / recall-explain /
-runtime-metrics additions). This file is the original 2026-05-20 feasibility
-study, kept as a historical record; the authoritative docs for the shipped
-port are [go/README.md](go/README.md) and [go/DESIGN.md](go/DESIGN.md).
+Status: **implemented** — the port shipped in `go/` (merged 2026-06-10) and has
+since reached parity with the Python version on the whole remote surface: **41
+MCP tools and 41 HTTP routes**, pack / ingest / collections / TUI / installers /
+summarizers, and every later addition (reranking, TTL expiry, point-in-time
+history, recall `explain`, runtime metrics, graph-proximity fusion, gated
+expansion, curation + trash, pinned/trust/idempotent writes, tiered reflection,
+and the retrieval-eval harness).
+
+Parity is no longer a claim maintained by hand: [`parity.json`](parity.json) is
+the single source of truth and each port asserts against it in its own suite, so
+drift fails a build. The one deliberate gap is the SQLite sidecar index, which is
+Python-only — tracked in [docs/ROADMAP.md](docs/ROADMAP.md) Tier 1 #2 and
+deliberately absent from the manifest so it is an explicit gap rather than a
+silent lie.
+
+> **This file is the original 2026-05-20 feasibility study, kept as a historical
+> record.** The counts and estimates below (22 MCP tools, 22 CLI commands, a
+> 168-test suite, the 0.3.4 baseline) describe the codebase *as it was when the
+> study was written* — they are deliberately not updated, or the record would
+> stop being a record. For the shipped port see
+> [go/README.md](go/README.md) and [go/DESIGN.md](go/DESIGN.md); for the current
+> Python design see [docs/DESIGN.md](docs/DESIGN.md).
 
 Source baseline at writing: ai-houkai 0.3.4 (Python, ~3.6 kLOC under `ai_houkai/`)
 

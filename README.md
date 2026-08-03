@@ -29,7 +29,16 @@ and periodic reflection that condenses experience into knowledge.
 | **TTL / expiry** | Per-memory `ttl_seconds`/`expires_at` — expired memories hidden from recall, reclaimed by `purge_expired` |
 | **History / point-in-time** | `history()` timeline per memory + `state_at()`/`get_at()` journal replay ("what did I know as of T?") |
 | **Runtime metrics** | `metrics()` — op counters (all mutators) + recall latency (avg/max + p50/p95/p99), via `GET /metrics` and the `metrics` MCP tool |
-| **Retrieval eval** | `ai_houkai.eval` — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set |
+| **Retrieval eval** | `houkai eval <goldset.jsonl>` + the `eval_recall` MCP tool — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set, in both ports |
+| **Pluggable embedder** | `MemoryStore(embedding_function=…)` or `AI_HOUKAI_EMBEDDER=provider:model` — stdlib OpenAI-compatible / Ollama backends in `ai_houkai.embed`; the local sentence-transformers model is now the `[local]` extra, so the core install needs no torch |
+| **Metadata + FTS index** | Opt-in SQLite sidecar (`index="sqlite"`) — full-corpus BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag counts, indexed expiry sweep; `houkai reindex` rebuilds it, and a stale index degrades to scanning rather than to wrong answers |
+| **Curation** | `merge` (re-points incoming links) · `versions` · tag rename/merge/delete · `find_path` — graduated out of ai-houkai-service, which had been reaching through the library's private API |
+| **Trash** | Recoverable delete between `supersede` and `forget` — `trash` / `trash_list` / `trash_restore` / `trash_purge`; decay pruning routes here instead of hard-deleting |
+| **Pinned working set** | `pinned` memories lead `recall_pack`/`auto_context` inside the budget and are exempt from decay and eviction — a standing-instruction slot, so `importance` stops doing three jobs |
+| **Idempotent writes** | `remember(idempotent=True)` dedupes by normalised-text content hash instead of writing a near-duplicate every session |
+| **Provenance trust** | `trust` = `trusted` / `reported` / `untrusted`, set at ingest boundaries; `recall(min_trust=…)` filters and the packer annotates untrusted lines |
+| **Tiered reflection** | `ReflectionEngine(types=…)` instead of episodic-only, with a `level` tag so reflections-of-reflections form a hierarchy under a `max_level` guard |
+| **Test helpers** | `ai_houkai.testing` — hash-based `FakeEmbedder` + `fake_store` fixtures, so a suite runs with no torch and no model download |
 | **Context packing** | `recall_pack` — assemble top-ranked memories into a token-budgeted, ready-to-inject block |
 | **Importance auto-assignment** | Heuristic 0–1 scoring from text (instructions > decisions > completions > observations) |
 | **Bulk ingest** | `houkai ingest` — chunk files/stdin into memories (markdown-aware) |
@@ -40,10 +49,11 @@ and periodic reflection that condenses experience into knowledge.
 | **Audit journal** | Append-only JSONL log of every mutation — `journal tail` / `journal show` / `journal undo` |
 | **Portable import/export** | Gzipped `.ahkai` archives with embedded vectors, conflict policies, dry-run |
 | **Recall filters** | Narrow search by `source` provenance and a `since`/`until` creation-time window |
-| **MCP server** | 23 tools for any MCP client (Claude Code, Claude Desktop) |
+| **MCP server** | 41 tools for any MCP client (Claude Code, Claude Desktop) |
 | **HTTP/REST API** | `houkai serve` — stdlib JSON server (remember/recall/pack/links/history/metrics), `/health` + `/ready` probes, optional bearer-token auth |
 | **Diagnostics** | `houkai doctor` — active embedder probe (latency + dim), embed-dim guardrail, store/journal checks; `GET /ready` readiness endpoint (200/503, auth-exempt, minimal body, ~5 s cached) |
-| **CLI (`houkai`)** | Full-featured terminal interface — CRUD, graph, maintenance, diagnostics, I/O |
+| **CLI (`houkai`)** | 39 commands + 5 sub-groups — CRUD, graph, curation, trash, tags, maintenance, diagnostics, eval, I/O |
+| **Port parity, enforced** | `parity.json` is the single source of truth for the MCP tool list, HTTP routes and recall knobs; both ports assert against it in their own suites, so drift fails a build instead of going unnoticed |
 | **Multi-provider** | Claude · OpenAI · Ollama (local) agent examples |
 
 ## Layout
@@ -70,7 +80,7 @@ AI-Houkai/
 │   │   └── daemon.py             # PID file helpers + spawn_detached
 │   ├── mcp_server/
 │   │   ├── __init__.py
-│   │   └── server.py             # FastMCP server (23 tools)
+│   │   └── server.py             # FastMCP server (41 tools)
 │   ├── http_server/
 │   │   ├── __init__.py
 │   │   └── server.py             # stdlib JSON HTTP/REST server (houkai serve)
@@ -125,7 +135,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 803 tests across 33 files
+├── tests/                        # 1094 tests across 44 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -159,12 +169,23 @@ AI-Houkai/
 Modern Linux distros protect the system Python (PEP 668).  Pick whichever
 approach fits your workflow — none requires `--break-system-packages`.
 
+> **Pick an embedder.** The core install is deliberately light: it carries
+> ChromaDB and the MCP SDK, but **not** the local sentence-transformers model,
+> because that pulls torch (~2 GB installed). Add `[local]` for the batteries-
+> included local model, or point the store at a hosted embedder — see
+> [Embedding backends](#embedding-backends).
+>
+> ```bash
+> pip install "ai-houkai[local]"    # local model, no API key, fully offline
+> pip install ai-houkai             # bring your own embedder (see below)
+> ```
+
 ### Virtual environment (recommended for development)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install ai-houkai
+pip install "ai-houkai[local]"
 ```
 
 ### pipx (recommended for the MCP server / CLI tool)
@@ -176,7 +197,7 @@ PATH automatically — no activation step needed.
 sudo apt install pipx            # or: pip install --user pipx
 pipx ensurepath                  # adds ~/.local/bin to PATH (one-time)
 
-pipx install ai-houkai
+pipx install "ai-houkai[local]"
 ai-houkai-mcp                    # available everywhere
 ```
 
@@ -185,7 +206,7 @@ ai-houkai-mcp                    # available everywhere
 ```bash
 curl -Lsf https://astral.sh/uv/install.sh | sh   # one-time install
 
-uv venv && uv pip install ai-houkai               # project venv
+uv venv && uv pip install "ai-houkai[local]"      # project venv
 # or run a script without a persistent install:
 uv run --with ai-houkai python examples/pip_package_example.py
 ```
@@ -193,17 +214,57 @@ uv run --with ai-houkai python examples/pip_package_example.py
 ### Extras
 
 ```bash
-pip install "ai-houkai[claude]"   # + Anthropic SDK
-pip install "ai-houkai[openai]"   # + OpenAI SDK (also covers Ollama)
+pip install "ai-houkai[local]"    # + local sentence-transformers embeddings
+pip install "ai-houkai[claude]"   # + Anthropic SDK (reflection summarizer)
+pip install "ai-houkai[openai]"   # + OpenAI SDK (reflection summarizer)
 pip install "ai-houkai[cli]"      # + houkai terminal CLI (typer + rich)
 pip install "ai-houkai[tui]"      # + houkai tui memory browser (textual)
-pip install "ai-houkai[all]"      # all providers + CLI + TUI
-pip install "ai-houkai[dev]"      # + pytest + CLI
+pip install "ai-houkai[all]"      # local model + all providers + CLI + TUI
+pip install "ai-houkai[dev]"      # everything above + pytest
+pip install "ai-houkai[test]"     # pytest + CLI, no torch — the fast suite
 ```
 
-> The embedding model (`all-MiniLM-L6-v2`) downloads automatically on
-> first use (~90 MB).  Everything runs fully local — no API key required
-> for the memory layer itself.
+> With `[local]`, the embedding model (`all-MiniLM-L6-v2`) downloads
+> automatically on first use (~90 MB) and everything runs offline — no API key
+> required for the memory layer itself. Note that `[openai]` is only needed for
+> the OpenAI *summarizer*; the OpenAI-compatible **embedder** in
+> `ai_houkai.embed` is stdlib-only and needs no SDK.
+
+### Embedding backends
+
+The store resolves its embedder in this order — most explicit first:
+
+```python
+from ai_houkai.embed import OpenAICompatibleEmbedder
+from ai_houkai.memory_system import MemoryStore
+
+# 1. an injected callable — anything fn(list[str]) -> list[list[float]]
+store = MemoryStore(embedding_function=OpenAICompatibleEmbedder(
+    api_key=os.environ["OPENAI_API_KEY"], model="text-embedding-3-small"))
+```
+
+```bash
+# 2. AI_HOUKAI_EMBEDDER=provider:model — moves an existing deployment onto a
+#    hosted embedder without touching any call site.
+export AI_HOUKAI_EMBEDDER=ollama:nomic-embed-text
+export AI_HOUKAI_EMBEDDER=openai:text-embedding-3-small
+export AI_HOUKAI_EMBEDDER=digitalocean:gte-large-en-v1.5
+export AI_HOUKAI_EMBEDDER=local:all-MiniLM-L6-v2     # 3. the default
+```
+
+Credentials come from the environment (`AI_HOUKAI_EMBED_API_KEY`, falling back
+to `OPENAI_API_KEY` / `DIGITALOCEAN_API_KEY`), never from the spec string, so a
+spec is safe to put in a config file or a process listing.
+`AI_HOUKAI_EMBED_BASE_URL` overrides the endpoint — that is how you point at
+vLLM, llama.cpp's OpenAI-compat server, or any other compatible service.
+
+> **Changing the embedding model changes the vector space.** Vectors written by
+> one model are meaningless to another. `houkai doctor` catches the obvious
+> case (a different dimension) via its embed-dim guardrail, but two models of
+> the same width will silently produce nonsense rankings. Re-embed with
+> `houkai export` followed by `houkai import --regenerate-vectors` when
+> switching. `houkai doctor` reports the backend actually in use, not just the
+> configured local model name.
 
 ## Quick-start
 
@@ -406,6 +467,55 @@ All three go through the store's `edit()` API: the change keeps the memory's
 id, links, and access history, lands in the audit journal (`houkai journal
 tail --op edit`), and can be reversed with `houkai journal undo <ts>`.
 
+```bash
+# Fold one memory into another. Incoming links are re-pointed at the target,
+# not dropped — `forget` does not clean those up, so a naive merge would
+# silently strand every relationship pointing at the absorbed memory.
+houkai merge 72be7903 a1b2c3d4
+
+# Past text states, recovered from the journal (oldest first)
+houkai versions 72be7903
+
+# Tag curation across the whole collection
+houkai tags list
+houkai tags rename ops operations
+houkai tags merge infra platform --into infrastructure
+houkai tags delete stale
+
+# Shortest undirected link path between two memories
+houkai path 72be7903 a1b2c3d4
+```
+
+#### Trash — the recoverable delete
+
+`supersede` is soft but means "replaced by X"; `forget` is irreversible. Trash
+is the missing middle, and decay pruning routes here instead of hard-deleting,
+so a mis-tuned `min_score` is no longer unrecoverable.
+
+```bash
+houkai trash put 72be7903      # soft-delete, recoverable
+houkai trash list
+houkai trash restore 72be7903
+houkai trash purge --yes       # irreversible, empties the trash
+```
+
+#### Write-time flags
+
+```bash
+# Pinned: leads recall_pack/auto_context inside the budget, and is exempt
+# from decay pruning and quota eviction. A standing-instruction slot, so
+# `importance` stops doing triple duty (ranking + decay + filtering).
+houkai remember "ALWAYS run make lint before pushing" --pin --type procedural
+
+# Trust: provenance tier for anything that did not come from the user.
+houkai ingest notes.md --trust reported
+houkai recall "deploy" --min-trust trusted
+
+# Idempotent: dedupe by normalised-text content hash instead of writing a
+# near-duplicate every session.
+houkai remember "Use ruff for linting" --idempotent
+```
+
 ### Memory graph
 
 ```bash
@@ -527,6 +637,19 @@ houkai journal show 1748284800.123
 
 # Reverse a single operation (remember/forget/edit/supersede/restore/link/unlink)
 houkai journal undo 1748284800.123 --yes
+
+# Reverse the most recent mutation — the "undo my last change" shortcut
+houkai journal undo-last --yes
+houkai journal undo-last --id 72be7903 --yes    # newest entry touching one memory
+```
+
+Point-in-time queries have CLI commands too:
+
+```bash
+houkai history 72be7903            # full journaled timeline of one memory
+houkai state-at 7d                 # every live memory as it stood a week ago
+houkai get-at 72be7903 2026-07-01  # one memory, as of a date
+houkai metrics                     # op counters + recall-latency percentiles
 ```
 
 ### Collections
@@ -633,11 +756,21 @@ Endpoints (all JSON in / JSON out):
 | `GET /memories/{id}/at?ts=` | reconstruct one memory as of a past time |
 | `GET /state_at?ts=` | reconstruct all live memories as of a past time |
 | `POST /purge_expired` | hard-delete TTL-expired memories (`{dry_run?}`) |
-| `GET\|POST /recall` | search — supports `source`, `since`, `until`, `include_expired`, `explain` |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until`, `include_expired`, `explain`; the POST body additionally takes `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph`, `lexical_index`, `min_trust` and a nested `expand` object |
 | `POST /recall_pack` | token-budgeted context block |
 | `POST /auto_context` | multi-angle context block (`auto_context_pack`) |
 | `POST /links` · `POST /unlink` | manage the link graph |
-| `POST /supersede` · `POST /conflicts` | curation |
+| `POST /subgraph` | link graph reachable from seed ids (`{memory_ids, depth?}`) |
+| `POST /find_path` | shortest undirected link path between two memories |
+| `POST /supersede` · `POST /restore` · `POST /conflicts` | curation |
+| `POST /merge` | fold one memory into another, re-pointing incoming links |
+| `GET /memories/{id}/versions` | past text states, recovered from the journal |
+| `GET /tags` · `POST /tags/rename` · `POST /tags/merge` · `DELETE /tags/{tag}` | tag curation |
+| `GET /trash` · `POST /trash` · `POST /trash/restore` · `POST /trash/purge` | recoverable delete |
+| `GET /journal?n=&op=&since=` | audit-journal tail |
+| `POST /undo` | reverse a journaled mutation (`{ts?, memory_id?}`) |
+| `POST /nuke` | delete every memory — guarded by `{"confirm": "DELETE ALL"}` |
+| `POST /export` · `POST /import` | `.ahkai` archives (server-side paths) |
 
 ```bash
 curl -s localhost:8077/health
@@ -648,6 +781,9 @@ curl -s localhost:8077/recall_pack -d '{"query":"deploy","token_budget":500}'
 curl -s "localhost:8077/state_at?ts=7d"          # store as it was a week ago
 curl -s -X POST localhost:8077/purge_expired -d '{"dry_run":true}'
 curl -s -X PATCH localhost:8077/memories/<id> -d '{"importance":0.9}'
+curl -s localhost:8077/tags                       # tag usage counts
+curl -s localhost:8077/trash                      # recoverable deletes
+curl -s -X POST localhost:8077/undo -d '{}'       # reverse the last mutation
 ```
 
 **Auth:** pass `--token <secret>` (or set `AI_HOUKAI_HTTP_TOKEN`) and every
@@ -694,24 +830,40 @@ compression trio; its response adds the fan-out `queries`. String `tags` in
 
 A full Go port lives in [`go/`](go/) — two static binaries (`houkai` CLI +
 `ai-houkai-mcp` MCP server), no Python runtime, packaged as a Debian `.deb`
-and macOS tarballs. It is at parity on the core surface: the same 22 MCP
-tools, hybrid retrieval with the full ranking suite (RRF fusion, MMR
+and macOS tarballs.
+
+**The two ports are at parity on the remote surface, and it is enforced.**
+[`parity.json`](parity.json) is the single source of truth for the MCP tool list
+(41 tools), the HTTP routes (41) and the recall knobs; each port asserts against
+it in its own test suite (`tests/test_parity.py`,
+`go/internal/parity/`), so a tool added to only one side fails that side's
+build rather than going unnoticed. That guard exists because this drift really
+happened: the Python MCP `recall` had silently fallen five ranking knobs behind
+the Go one.
+
+Also ported: hybrid retrieval with the full ranking suite (RRF fusion, MMR
 diversity/dedup, `min_cosine`, read-only/`explain` recall, created-based
-recency, multi-hop link decay, CJK tokenization), context packing with
-compression, decay/reflection with LLM summarizers, bulk ingest, collections,
-importance auto-assignment, installers for Claude Code / Cursor / OpenCode, and
-a Bubble Tea TUI, and diagnostics (`houkai doctor` + `GET /ready`). The recent
-additions — pluggable **reranking**, **TTL/expiry** (+ maintenance purge),
-**point-in-time history**, recall **explain**, runtime **metrics**,
-**graph-proximity fusion** (`HybridWeights.Graph`) and **gated graph expansion**
-(`ExpandSpec.Rerank`) — are ported too; the graph/rerank knobs are library-level
-in both ports, not yet on the CLI/HTTP/MCP surface. The only Python-only piece
-is the retrieval-eval harness (`ai_houkai.eval`).
-Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean
-instead of bundled sentence-transformers, and the store is
-[chromem-go](https://github.com/philippgille/chromem-go) — not
-binary-compatible with ChromaDB, but the portable `.ahkai` export/import
-format bridges the two. See [go/README.md](go/README.md).
+recency, multi-hop link decay, CJK tokenization), graph-proximity fusion and
+gated expansion, context packing with compression, reranking, TTL/expiry,
+point-in-time history, runtime metrics, the curation set (merge/versions/tags/
+find_path), trash, pinned/trust/idempotent writes, tiered reflection, the
+retrieval-eval harness (`go/internal/eval`, metric-for-metric with the Python
+one and reading the same gold-set format), decay/reflection with LLM
+summarizers, bulk ingest, collections, importance auto-assignment, installers
+for Claude Code / Cursor / OpenCode, a Bubble Tea TUI, and diagnostics
+(`houkai doctor` + `GET /ready`).
+
+Deliberately **not** at parity: the CLIs differ (Python ships installers as
+console scripts, Go has `houkai install` and `houkai config`), so `parity.json`
+does not assert command equality — that would be a lie. The SQLite sidecar index
+is Python-only for now.
+
+Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean instead of
+bundled sentence-transformers — the same pluggable model Python now has via
+`ai_houkai.embed`. The store is
+[chromem-go](https://github.com/philippgille/chromem-go) — not binary-compatible
+with ChromaDB, but the portable `.ahkai` export/import format bridges the two.
+See [go/README.md](go/README.md).
 
 ## Design docs
 
@@ -728,8 +880,32 @@ Forward-looking feature recommendations live in
 ## Run the tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -q                       # 1094 tests across 44 files
+pytest tests/ -q -m "not needs_model"  # the fast subset — no torch, no download
+pytest functional_tests -v             # 16 black-box e2e tests (needs an install)
 ```
+
+Most of the suite runs against `ai_houkai.testing.FakeEmbedder`, a hash-based
+embedder that needs no model. Only the ~29 tests marked `needs_model` load real
+sentence-transformers — their assertions depend on genuine semantic similarity
+(conflict thresholds, reflection clustering, ranking quality). To re-derive that
+marker set after a change, force the real model everywhere:
+
+```bash
+AI_HOUKAI_TEST_REAL_EMBEDDER=1 pytest tests/ -q
+```
+
+The functional suite drives the installed `houkai` / `ai-houkai-serve` console
+scripts as subprocesses. Run it hermetically in a container — which is also the
+only thing that exercises a genuinely clean install:
+
+```bash
+./functional_tests/run.sh              # build the image, run unit + functional
+```
+
+Go: `cd go && go test ./...` (add `-race` for the concurrent packages).
+CI runs both ports plus a port-parity job — see
+[.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ---
 
@@ -889,8 +1065,28 @@ REPL commands: `memories` to list recent memories · `quit` to exit.
 ## Retrieval evaluation
 
 `ai_houkai.eval` is a dependency-free (stdlib-only) harness for scoring
-retrieval quality against a gold set — library-only, not wired to the CLI or
-MCP.
+retrieval quality against a gold set. It is reachable from the library, the
+CLI, MCP **and the Go port** — which matters because every ranking constant in
+the project (the graph damping and iteration count, the β=0.20 lexical weight,
+the MMR defaults) was otherwise set by intuition with no way to measure a
+change.
+
+```bash
+# Gold sets are JSONL — one case per line. `relevant_ids` accepts 8-char
+# prefixes as well as full UUIDs, so you can write one by eye from `houkai list`.
+cat > gold.jsonl <<'EOF'
+{"query": "how do we deploy", "relevant_ids": ["72be7903"]}
+{"query": "test isolation",   "relevant_ids": ["a1b2c3d4", "e5f6a7b8"], "k": 3}
+EOF
+
+houkai eval gold.jsonl
+houkai eval gold.jsonl --mode hybrid --fusion rrf --graph 0.15 --per-case
+houkai eval gold.jsonl --json          # for CI / A/B scripting
+```
+
+The `--json` output records the config under test alongside the scores, so
+numbers from two runs are attributable. The same gold-set format works with the
+Go port's `houkai eval` and with the read-only `eval_recall` MCP tool.
 
 ```python
 from ai_houkai.eval import EvalCase, evaluate
@@ -913,6 +1109,50 @@ never perturbs access tracking. Extra keyword args (e.g. `weights=`, `fusion=`,
 
 ---
 
+## Metadata + full-text index
+
+Chroma is authoritative for text, metadata and vectors — but it is not a
+metadata query engine. It has no reverse-link lookup, no cursor pagination and
+no tag aggregation, so the store historically scanned the whole collection for
+work that is one line of SQL. `neighbors(depth=2, direction="both")` on a node
+with ten neighbours performed **eleven** full-collection loads.
+
+An **opt-in** SQLite sidecar next to `.chroma` fixes that, and unlocks
+full-corpus lexical recall at the same time:
+
+```bash
+export AI_HOUKAI_INDEX=sqlite     # or index = "sqlite" in config.toml
+houkai reindex                    # build it for an existing store
+```
+
+```python
+store = MemoryStore(path="./.chroma", index="sqlite")
+
+# Full-corpus BM25. `_bm25_score_pool` only ever scored the vector over-fetch
+# pool, so a strong exact-token match with a weak embedding was unreachable at
+# *any* corpus size — it never entered the pool to be scored.
+store.recall("quetzalcoatlus", mode="hybrid", lexical_index="fts")
+
+# Keyset pagination: pass the previous page's last created_at.
+page1 = store.list_recent(limit=50)
+page2 = store.list_recent(limit=50, before=page1[-1].created_at)
+```
+
+What it delivers: full-corpus BM25 · cursor pagination · O(1) reverse links ·
+tag and type counts · an indexed expiry sweep.
+
+**It is a cache, never a source of truth.** Every read has a scan fallback, and
+an index whose row count disagrees with Chroma is disabled on open rather than
+trusted — a stale index must degrade to *slower*, never to *wrong*.
+`houkai reindex` is the way back. It is off by default because an existing
+store has no index, and enabling it silently would make `list`/`neighbors` read
+an empty table.
+
+> Requires SQLite built with FTS5 for the lexical channel (the standard CPython
+> build has it). Without FTS5 every other benefit still applies.
+
+---
+
 ## MCP server
 
 Exposes the memory store to any MCP client.
@@ -922,18 +1162,30 @@ ai-houkai-mcp
 # or: python -m ai_houkai.mcp_server.server
 ```
 
-Exposed tools (22):
+Exposed tools (41):
 
-- **Core** — `remember` · `edit` · `recall` · `recall_pack` · `auto_context` · `forget` · `purge_expired` · `list_recent` · `stats` · `metrics`
-- **Linking** — `link` · `unlink` · `neighbors`
-- **Conflicts** — `find_conflicts` · `supersede`
+- **Core** — `remember` · `remember_many` · `get` · `edit` · `recall` · `recall_pack` · `auto_context` · `forget` · `purge_expired` · `list_recent` · `stats` · `metrics`
+- **Linking & graph** — `link` · `unlink` · `neighbors` · `subgraph` · `find_path`
+- **Conflicts & lifecycle** — `find_conflicts` · `supersede` · `restore` · `merge` · `versions`
+- **Tags** — `list_tags` · `rename_tag` · `merge_tags` · `delete_tag`
+- **Trash** — `trash` · `trash_list` · `trash_restore` · `trash_purge`
 - **History** — `history` · `state_at` · `get_at`
-- **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `export` · `import`
+- **Maintenance & audit** — `maintenance_tick` · `journal_tail` · `undo` · `nuke` · `export` · `import`
+- **Diagnostics** — `ready` · `eval_recall`
 
-`recall` accepts `include_expired` and `explain`; `remember`/`edit` accept a TTL
-(`ttl_seconds`/`expires_at`). `history`/`state_at`/`get_at` replay the audit
-journal for point-in-time queries; `metrics` reports op counters + recall
-latency.
+`recall` and `recall_pack` expose the full ranking surface — `fusion`,
+`diversity`, `dedup_threshold`, `min_cosine`, `graph`, `lexical_index`,
+`min_trust`, `touch` and the flat `expand_*` graph-walk knobs. (These were
+library- and HTTP-only until recently: an MCP client could not reach RRF, MMR,
+dedup, the relevance gate or graph fusion at all, which is the drift
+`parity.json` now guards against.)
+
+`remember`/`edit` accept a TTL (`ttl_seconds`/`expires_at`), and `remember`
+also takes `pinned`, `trust` and `idempotent`.
+`history`/`state_at`/`get_at` replay the audit journal for point-in-time
+queries; `metrics` reports op counters + recall latency percentiles;
+`eval_recall` scores a gold set read-only; `nuke` is guarded behind
+`confirm="DELETE ALL"`.
 
 `auto_context` fans out recall over several angles extracted from a task
 description, dedupes by id, and packs the result within a token budget.
