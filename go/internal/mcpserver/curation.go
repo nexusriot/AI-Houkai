@@ -281,11 +281,28 @@ func addTrashRestore(s *server.MCPServer, store *memory.MemoryStore) {
 
 func addTrashPurge(s *server.MCPServer, store *memory.MemoryStore) {
 	tool := mcp.NewTool("trash_purge",
-		mcp.WithDescription("Permanently drop one trashed memory, or empty the trash. Irreversible."),
+		mcp.WithDescription("Permanently drop trashed memories. Irreversible. Pass memory_id for one "+
+			"entry, older_than_days to apply a retention cutoff, or neither to empty the whole trash. "+
+			"The two are mutually exclusive."),
 		mcp.WithString("memory_id", mcp.Description("Memory id; omit to empty the whole trash")),
+		mcp.WithNumber("older_than_days", mcp.Description("Purge only entries trashed more than this many days ago")),
 	)
 	s.AddTool(tool, func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		n, err := store.TrashPurge(req.GetString("memory_id", ""))
+		id := req.GetString("memory_id", "")
+		ttl := optFloat32(req, "older_than_days")
+		if id != "" && ttl != nil {
+			return jsonText(map[string]any{
+				"purged": 0,
+				"error":  "pass either memory_id or older_than_days, not both",
+			}), nil
+		}
+		var n int
+		var err error
+		if ttl != nil {
+			n, err = store.TrashPurgeExpired(float64(*ttl), 0)
+		} else {
+			n, err = store.TrashPurge(id)
+		}
 		if err != nil {
 			return errResult(err), nil
 		}

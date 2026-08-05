@@ -35,6 +35,24 @@ def _is_tty() -> bool:
     return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
+def resolve_format(fmt: str) -> str:
+    """Resolve "auto" against the terminal, so callers can branch on the real
+    format. Empty results still have to print something machine-readable, and
+    only the caller knows whether it has rows."""
+    if fmt != "auto":
+        return fmt
+    return "rich" if _is_tty() else "tsv"
+
+
+def is_machine_format(fmt: str) -> bool:
+    """True when the resolved format is meant to be parsed, not read.
+
+    An empty result must still emit a valid document in those formats — `[]` or
+    a bare header — or `houkai list -f json | jq .` fails on a fresh store.
+    """
+    return resolve_format(fmt) in ("json", "tsv")
+
+
 def short_id(mid: str) -> str:
     return mid[:8]
 

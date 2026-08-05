@@ -160,3 +160,77 @@ func TestPruneProtectsType(t *testing.T) {
 		t.Errorf("procedural should be protected, got pruned=%v", pruned)
 	}
 }
+
+// trashingStore is a Storable that records trash calls, so we can prove the
+// engine routes prunes through the recoverable path rather than Forget.
+type trashingStore struct {
+	fakeStore
+	trashed []string
+}
+
+func (f *trashingStore) Trash(_ context.Context, id string) (bool, error) {
+	f.trashed = append(f.trashed, id)
+	for i, m := range f.mems {
+		if m.ID == id {
+			f.mems = append(f.mems[:i], f.mems[i+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Decay is driven by tunable constants, so a mis-set MinScore used to destroy
+// data outright. README and docs/DESIGN.md §26 both promise pruning routes to
+// the trash; Prune called Forget, so that safety property was absent.
+func TestPruneRoutesToTrashNotForget(t *testing.T) {
+	fs := &trashingStore{fakeStore: fakeStore{mems: []memory.Memory{
+		{ID: "old", Importance: 0.5, LastAccessed: ts(400)},
+		{ID: "new", Importance: 0.9, LastAccessed: ts(0)},
+	}}}
+	e := New(fs, 0.1, 0.05, nil, 0)
+
+	pruned, err := e.Prune(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(pruned) != 1 || pruned[0].ID != "old" {
+		t.Fatalf("pruned = %+v, want just [old]", pruned)
+	}
+	if len(fs.trashed) != 1 || fs.trashed[0] != "old" {
+		t.Fatalf("trashed = %v, want [old]", fs.trashed)
+	}
+	if len(fs.forgot) != 0 {
+		t.Fatalf("forgot = %v, want none — prune must be recoverable", fs.forgot)
+	}
+}
+
+func TestPruneDryRunTrashesNothing(t *testing.T) {
+	fs := &trashingStore{fakeStore: fakeStore{mems: []memory.Memory{
+		{ID: "old", Importance: 0.5, LastAccessed: ts(400)},
+	}}}
+	pruned, err := New(fs, 0.1, 0.05, nil, 0).Prune(context.Background(), true)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(pruned) != 1 {
+		t.Fatalf("pruned = %+v, want 1 candidate", pruned)
+	}
+	if len(fs.trashed) != 0 || len(fs.forgot) != 0 {
+		t.Fatalf("dry run mutated the store: trashed=%v forgot=%v",
+			fs.trashed, fs.forgot)
+	}
+}
+
+// A store that predates the trash capability must still prune rather than
+// silently keeping everything forever.
+func TestPruneFallsBackToForgetWithoutTrash(t *testing.T) {
+	fs := &fakeStore{mems: []memory.Memory{
+		{ID: "old", Importance: 0.5, LastAccessed: ts(400)},
+	}}
+	if _, err := New(fs, 0.1, 0.05, nil, 0).Prune(context.Background(), false); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(fs.forgot) != 1 || fs.forgot[0] != "old" {
+		t.Fatalf("forgot = %v, want [old]", fs.forgot)
+	}
+}

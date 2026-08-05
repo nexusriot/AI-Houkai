@@ -326,6 +326,7 @@ func newTrashRestoreCmd() *cobra.Command {
 
 func newTrashPurgeCmd() *cobra.Command {
 	var yes bool
+	var olderThan float64
 	cmd := &cobra.Command{
 		Use:   "purge [id]",
 		Short: "Permanently drop trashed memories. Irreversible",
@@ -337,12 +338,26 @@ func newTrashPurgeCmd() *cobra.Command {
 				id = args[0]
 				what = "memory " + id
 			}
+			retention := cmd.Flags().Changed("older-than")
+			if retention {
+				if id != "" {
+					return fmt.Errorf("pass either an id or --older-than, not both")
+				}
+				what = fmt.Sprintf("everything trashed over %g day(s) ago", olderThan)
+			}
 			if !yes && !Confirm(fmt.Sprintf(
 				"Permanently delete %s? This cannot be undone.", what)) {
 				fmt.Println("Aborted.")
 				return nil
 			}
-			n, err := storeFromCtx(cmd.Context()).TrashPurge(id)
+			store := storeFromCtx(cmd.Context())
+			var n int
+			var err error
+			if retention {
+				n, err = store.TrashPurgeExpired(olderThan, 0)
+			} else {
+				n, err = store.TrashPurge(id)
+			}
 			if err != nil {
 				return err
 			}
@@ -351,5 +366,7 @@ func newTrashPurgeCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation")
+	cmd.Flags().Float64Var(&olderThan, "older-than", 0,
+		"Purge only entries trashed more than this many days ago")
 	return cmd
 }

@@ -1,8 +1,13 @@
 package memory
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -404,4 +409,399 @@ func newJournaledMemStore(t *testing.T) *MemoryStore {
 	cfg.JournalEnabled = true
 	cfg.JournalPath = filepath.Join(dir, "journal.log")
 	return NewMemoryStore(backend, &stubEmbedder{dim: 16}, cfg)
+}
+
+// TrashPurgeExpired — retention, so a recoverable delete does not become a
+// permanent archive. Mirrors Python's trash_purge_expired.
+
+func agedTrash(t *testing.T, store *MemoryStore, text string, daysAgo float64) Memory {
+	t.Helper()
+	ctx := context.Background()
+	m, _, _, err := store.Remember(ctx, text, RememberOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Trash(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range entries {
+		if entries[i].MemoryID == m.ID {
+			entries[i].DeletedAt = nowFloat() - daysAgo*86400
+		}
+	}
+	if err := store.writeTrash(entries); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestTrashPurgeExpiredDropsOnlyPastCutoff(t *testing.T) {
+	store := newTestStore(t)
+	old := agedTrash(t, store, "trashed long ago", 40)
+	recent := agedTrash(t, store, "trashed yesterday", 1)
+
+	n, err := store.TrashPurgeExpired(30, 0)
+	if err != nil || n != 1 {
+		t.Fatalf("purged %d (%v), want 1", n, err)
+	}
+	entries, _ := store.TrashList()
+	if len(entries) != 1 || entries[0].MemoryID != recent.ID {
+		t.Errorf("remaining = %+v, want only %s", entries, recent.ID)
+	}
+	_ = old
+}
+
+func TestTrashPurgeExpiredZeroTTLIsNoop(t *testing.T) {
+	store := newTestStore(t)
+	agedTrash(t, store, "should survive", 999)
+	for _, ttl := range []float64{0, -5} {
+		if n, err := store.TrashPurgeExpired(ttl, 0); err != nil || n != 0 {
+			t.Errorf("ttl=%v purged %d (%v), want 0 — a misconfigured retention "+
+				"must not mean delete everything", ttl, n, err)
+		}
+	}
+	if entries, _ := store.TrashList(); len(entries) != 1 {
+		t.Errorf("entries = %d, want 1", len(entries))
+	}
+}
+
+func TestTrashPurgeExpiredEmptyTrash(t *testing.T) {
+	store := newTestStore(t)
+	if n, err := store.TrashPurgeExpired(30, 0); err != nil || n != 0 {
+		t.Errorf("purged %d (%v), want 0", n, err)
+	}
+}
+
+func TestTrashPurgeExpiredHonoursExplicitNow(t *testing.T) {
+	store := newTestStore(t)
+	agedTrash(t, store, "aged five days", 5)
+	// Ten days later the same 7-day retention should sweep it.
+	n, err := store.TrashPurgeExpired(7, nowFloat()+10*86400)
+	if err != nil || n != 1 {
+		t.Errorf("purged %d (%v), want 1", n, err)
+	}
+}
+
+func TestTrashRestorableRightUpToCutoff(t *testing.T) {
+	store := newTestStore(t)
+	kept := agedTrash(t, store, "just inside retention", 29)
+	if _, err := store.TrashPurgeExpired(30, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.TrashRestore(context.Background(), kept.ID)
+	if err != nil || !ok {
+		t.Errorf("restore after retention sweep = ok=%v (%v), want true", ok, err)
+	}
+	if ok && got.ID != kept.ID {
+		t.Errorf("restored %s, want %s", got.ID, kept.ID)
+	}
+}
+
+// A derived memory must inherit the least-trusted of its sources, or the trust
+// tier has a laundering path: absorb untrusted content and the provenance label
+// silently survives.
+
+func TestWorstTrust(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []TrustLevel
+		want TrustLevel
+	}{
+		{"all trusted", []TrustLevel{"trusted", "trusted"}, "trusted"},
+		{"one reported", []TrustLevel{"trusted", "reported"}, "reported"},
+		{"one untrusted", []TrustLevel{"trusted", "untrusted"}, "untrusted"},
+		{"worst wins", []TrustLevel{"untrusted", "reported"}, "untrusted"},
+		{"empty reads as trusted", []TrustLevel{"", "trusted"}, "trusted"},
+		{"no levels", nil, "trusted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := WorstTrust(tc.in...); got != tc.want {
+				t.Errorf("WorstTrust(%v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMergeInheritsLeastTrustedSide(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	target, _, _, err := store.Remember(ctx, "trusted target fact",
+		RememberOpts{Trust: "trusted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, _, err := store.Remember(ctx, "untrusted absorbed fact",
+		RememberOpts{Trust: "untrusted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := store.Merge(ctx, target.ID, other.ID, "\n\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Trust != "untrusted" {
+		t.Errorf("merged trust = %q, want untrusted — absorbing untrusted text "+
+			"must downgrade the target's provenance", merged.Trust)
+	}
+}
+
+func TestMergeDoesNotUpgradeTrust(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	target, _, _, _ := store.Remember(ctx, "reported target",
+		RememberOpts{Trust: "reported"})
+	other, _, _, _ := store.Remember(ctx, "trusted addition",
+		RememberOpts{Trust: "trusted"})
+	merged, err := store.Merge(ctx, target.ID, other.ID, "\n\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Trust != "reported" {
+		t.Errorf("merged trust = %q, want reported (merge must not upgrade)",
+			merged.Trust)
+	}
+}
+
+// countTrashMembers reports how many gzip members the trash file holds.
+// An append-based writer adds one per call; a rewrite-everything writer always
+// leaves exactly one.
+func countTrashMembers(t *testing.T, path string) int {
+	t.Helper()
+	// Read into a bytes.Reader: gzip.Reader wraps a plain *os.File in a
+	// bufio.Reader and reads ahead past the member boundary, so Reset would
+	// resume at the wrong offset. A bytes.Reader is an io.ByteReader, which
+	// gzip consumes exactly.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	src := bytes.NewReader(raw)
+	gz, err := gzip.NewReader(src)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer gz.Close()
+	n := 0
+	for {
+		// Reset re-enables multistream, so this has to be inside the loop.
+		gz.Multistream(false)
+		if _, err := io.Copy(io.Discard, gz); err != nil {
+			t.Fatalf("read member %d: %v", n, err)
+		}
+		n++
+		if err := gz.Reset(src); err == io.EOF {
+			return n
+		} else if err != nil {
+			t.Fatalf("reset after member %d: %v", n, err)
+		}
+	}
+}
+
+// Trash read the whole file and rewrote it on every call, so N deletes cost
+// O(N²) — 100 calls took 137ms and 400 took 2.16s. Decay pruning now routes
+// through here in a loop, so a large prune could stall a maintenance tick.
+// Python appends a line; this port must too.
+func TestTrashAppendsRatherThanRewriting(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	var ids []string
+	for i := 0; i < 5; i++ {
+		m, _, _, err := store.Remember(ctx, fmt.Sprintf("row %d to bin", i), RememberOpts{})
+		if err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+		ids = append(ids, m.ID)
+	}
+	for _, id := range ids {
+		if ok, err := store.Trash(ctx, id); err != nil || !ok {
+			t.Fatalf("Trash(%s) = %v, %v", id, ok, err)
+		}
+	}
+
+	if got := countTrashMembers(t, store.TrashPath()); got != len(ids) {
+		t.Errorf("gzip members = %d, want %d (one appended per Trash call)",
+			got, len(ids))
+	}
+
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != len(ids) {
+		t.Fatalf("TrashList = %d entries, want %d — a multi-member file must "+
+			"read back whole", len(entries), len(ids))
+	}
+	for i, e := range entries {
+		if e.MemoryID != ids[i] {
+			t.Errorf("entry %d = %s, want %s (oldest first)", i, e.MemoryID, ids[i])
+		}
+	}
+}
+
+// Restore and purge rewrite the file wholesale; they must handle a file that
+// Trash appended to, and leave a readable one behind.
+func TestTrashRestoreAndPurgeSurviveAppendedFiles(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	var ids []string
+	for i := 0; i < 3; i++ {
+		m, _, _, err := store.Remember(ctx, fmt.Sprintf("appended row %d", i), RememberOpts{})
+		if err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+		ids = append(ids, m.ID)
+		if _, err := store.Trash(ctx, m.ID); err != nil {
+			t.Fatalf("Trash: %v", err)
+		}
+	}
+
+	if _, ok, err := store.TrashRestore(ctx, ids[1]); err != nil || !ok {
+		t.Fatalf("TrashRestore(%s) = %v, %v", ids[1], ok, err)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("TrashList = %d, want 2 after one restore", len(entries))
+	}
+	if n, err := store.TrashPurge(ids[0]); err != nil || n != 1 {
+		t.Fatalf("TrashPurge = %d, %v; want 1", n, err)
+	}
+	entries, err = store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MemoryID != ids[2] {
+		t.Fatalf("TrashList = %+v, want just %s", entries, ids[2])
+	}
+}
+
+// Trash deletes through Forget, so undoing that journal entry resurrects the
+// row — but the trash entry stayed behind, listing a memory that is live again.
+// The stale entry then makes TrashRestore a no-op on the newer row, and
+// TrashList advertises a recovery point that recovers nothing.
+func TestUndoOfATrashClearsTheTrashEntry(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	m, _, _, err := store.Remember(ctx, "binned then reinstated", RememberOpts{})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := store.Trash(ctx, m.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	entry := lastJournalEntry(t, store, "forget", m.ID)
+
+	ok, err := store.Undo(ctx, entry)
+	if err != nil || !ok {
+		t.Fatalf("Undo = %v, %v", ok, err)
+	}
+	if _, err := store.GetByID(ctx, m.ID); err != nil {
+		t.Fatalf("memory not restored: %v", err)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("trash still holds %+v for a live memory", entries)
+	}
+}
+
+// Only the undone memory's entry goes; anything else in the bin stays.
+func TestUndoOfAPlainForgetLeavesTheTrashAlone(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	kept, _, _, _ := store.Remember(ctx, "still in the bin", RememberOpts{})
+	if _, err := store.Trash(ctx, kept.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+	gone, _, _, _ := store.Remember(ctx, "plainly forgotten", RememberOpts{})
+	if _, err := store.Forget(ctx, gone.ID); err != nil {
+		t.Fatalf("Forget: %v", err)
+	}
+	entry := lastJournalEntry(t, store, "forget", gone.ID)
+
+	if ok, err := store.Undo(ctx, entry); err != nil || !ok {
+		t.Fatalf("Undo = %v, %v", ok, err)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MemoryID != kept.ID {
+		t.Fatalf("trash = %+v, want only %s", entries, kept.ID)
+	}
+}
+
+func lastJournalEntry(t *testing.T, store *MemoryStore, op, id string) JournalEntry {
+	t.Helper()
+	j := store.Journal()
+	if j == nil {
+		t.Fatal("journal disabled")
+	}
+	entries, err := j.Read(ReadOpts{Op: op})
+	if err != nil {
+		t.Fatalf("journal read: %v", err)
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].ID == id {
+			return entries[i]
+		}
+	}
+	t.Fatalf("no %q entry for %s", op, id)
+	return JournalEntry{}
+}
+
+// Merge folds other into target and deletes other. Trust already takes the
+// worse of the two sides; the pin did not travel at all, so absorbing a
+// standing instruction into an unpinned row emptied the working set and deleted
+// the only copy of the flag.
+func TestMergeKeepsThePin(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	target, _, _, _ := store.Remember(ctx, "plain target", RememberOpts{})
+	other, _, _, _ := store.Remember(ctx, "ALWAYS run make lint",
+		RememberOpts{Pinned: true})
+
+	merged, err := store.Merge(ctx, target.ID, other.ID, "\n\n")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if !merged.Pinned {
+		t.Error("merged row lost the pin it absorbed")
+	}
+	pinned, err := store.PinnedMemories(ctx)
+	if err != nil {
+		t.Fatalf("PinnedMemories: %v", err)
+	}
+	if len(pinned) != 1 || pinned[0].ID != target.ID {
+		t.Fatalf("working set = %+v, want just the merged row", pinned)
+	}
+}
+
+func TestMergeOfTwoUnpinnedRowsPinsNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+
+	target, _, _, _ := store.Remember(ctx, "first half", RememberOpts{})
+	other, _, _, _ := store.Remember(ctx, "second half", RememberOpts{})
+
+	merged, err := store.Merge(ctx, target.ID, other.ID, "\n\n")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if merged.Pinned {
+		t.Error("merged row was pinned out of nowhere")
+	}
 }

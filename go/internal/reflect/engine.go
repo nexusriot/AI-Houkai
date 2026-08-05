@@ -256,6 +256,31 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 		// Python's round(sum/len, 3).
 		avgImp := float32(math.RoundToEven(totalImp/float64(len(cluster))*1000) / 1000)
 
+		// A summary is only as trustworthy as its least trustworthy source.
+		// Without this, reflecting over content the agent did not author
+		// launders it into a "trusted" memory. Mirrors the polarity rule in
+		// clustering, which refuses to blend contradictory members.
+		trust := memory.TrustLevel(memory.TrustLevels[0])
+		for _, m := range cluster {
+			trust = memory.WorstTrust(trust, m.Trust)
+		}
+
+		// A consolidated summary takes over its sources' standing-instruction
+		// slot: soft consolidate supersedes them (and a superseded row leaves
+		// the working set), hard consolidate deletes them outright — either way
+		// the pin would be lost. Without consolidation the sources stay live
+		// and pinned, so pinning the summary too would put two rows in the
+		// working set for one instruction.
+		pinned := false
+		if consolidate == ConsolidateSoft || consolidate == ConsolidateHard {
+			for _, m := range cluster {
+				if m.Pinned {
+					pinned = true
+					break
+				}
+			}
+		}
+
 		if dryRun {
 			created = append(created, memory.Memory{
 				Text:       text,
@@ -263,6 +288,8 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 				Tags:       tags,
 				Importance: avgImp,
 				Source:     "reflection/dry-run",
+				Trust:      trust,
+				Pinned:     pinned,
 				CreatedAt:  float64(time.Now().Unix()),
 			})
 			continue
@@ -273,6 +300,8 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 			Tags:       tags,
 			Importance: memory.Float32Ptr(avgImp),
 			Source:     "reflection",
+			Trust:      trust,
+			Pinned:     pinned,
 		})
 		if err != nil {
 			return created, err

@@ -10,12 +10,14 @@ silently strands every relationship that pointed at the absorbed memory.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 from typer.testing import CliRunner
 
 import ai_houkai.mcp_server.server as srv
 from ai_houkai.cli.main import app
+from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.memory_system.curation import MergeError
 
 
@@ -425,3 +427,113 @@ class TestCli:
         res = self._run(tmp_path, "trash", "purge", "-y")
         assert res.exit_code == 0 and "Purged 1" in res.stdout
         assert json.loads(self._run(tmp_path, "trash", "list", "--json").stdout) == []
+
+
+class TestTrashRetention:
+    """`trash_purge_expired` — the piece that makes trash a recoverable delete
+    rather than a permanent archive.
+
+    Without it the trash file grows without bound, which is why the maintenance
+    scheduler drives it on the same tick as the TTL purge.
+    """
+
+    def _aged(self, store, text, days_ago):
+        """Trash a memory and backdate its deleted_at."""
+        mem = store.remember(text)
+        store.trash(mem.id)
+        entries = store._read_trash()
+        for e in entries:
+            if e.memory_id == mem.id:
+                object.__setattr__(e, "deleted_at", time.time() - days_ago * 86_400)
+        store._write_trash(entries)
+        return mem
+
+    def test_drops_only_entries_past_the_cutoff(self, store):
+        old = self._aged(store, "trashed long ago", days_ago=40)
+        recent = self._aged(store, "trashed yesterday", days_ago=1)
+
+        assert store.trash_purge_expired(30) == 1
+        remaining = {e.memory_id for e in store.trash_list()}
+        assert remaining == {recent.id}
+        assert old.id not in remaining
+
+    def test_zero_ttl_is_a_noop_not_purge_everything(self, store):
+        """A misconfigured or unset retention must never mean 'delete it all'."""
+        self._aged(store, "should survive", days_ago=999)
+        assert store.trash_purge_expired(0) == 0
+        assert store.trash_purge_expired(-5) == 0
+        assert len(store.trash_list()) == 1
+
+    def test_empty_trash_is_a_noop(self, store):
+        assert store.trash_purge_expired(30) == 0
+
+    def test_restorable_right_up_to_the_cutoff(self, store):
+        kept = self._aged(store, "just inside retention", days_ago=29)
+        store.trash_purge_expired(30)
+        assert store.trash_restore(kept.id) is not None
+
+    def test_explicit_now_is_honoured(self, store):
+        self._aged(store, "aged five days", days_ago=5)
+        # Ten days later the same 7-day retention should sweep it.
+        assert store.trash_purge_expired(7, now=time.time() + 10 * 86_400) == 1
+
+    def test_scheduler_drives_retention(self, store, tmp_path):
+        """Retention has to hold without anyone running a purge by hand."""
+        self._aged(store, "swept by the scheduler", days_ago=99)
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None,
+            purge_every=1, trash_ttl_days=30,
+            state_path=str(tmp_path / "state.json"),
+        )
+        result = sched.tick()
+        assert result.ran_purge is True
+        assert result.trash_purged == 1
+        assert store.trash_list() == []
+        assert "trash retention" in result.summary()
+
+    def test_scheduler_respects_a_disabled_retention(self, store, tmp_path):
+        self._aged(store, "kept forever", days_ago=999)
+        sched = MaintenanceScheduler(
+            store=store, decay_every=None, reflect_every=None,
+            purge_every=1, trash_ttl_days=0,
+            state_path=str(tmp_path / "state.json"),
+        )
+        assert sched.tick().trash_purged == 0
+        assert len(store.trash_list()) == 1
+
+
+class TestTrashRetentionSurfaces:
+    def test_mcp_older_than_days(self, mcp_store):
+        created = srv.remember(text="mcp retention subject")
+        srv.trash(memory_id=created["id"])
+        entries = srv.get_store()._read_trash()
+        object.__setattr__(entries[0], "deleted_at", time.time() - 90 * 86_400)
+        srv.get_store()._write_trash(entries)
+
+        assert srv.trash_purge(older_than_days=30) == {"purged": 1}
+        assert srv.trash_list() == []
+
+    def test_mcp_rejects_both_arguments(self, mcp_store):
+        out = srv.trash_purge(memory_id="x", older_than_days=1)
+        assert out["purged"] == 0 and "not both" in out["error"]
+
+    def test_cli_older_than(self, tmp_path):
+        runner = CliRunner()
+        base = ["--store", str(tmp_path / "chroma")]
+        runner.invoke(app, base + ["remember", "cli retention subject"])
+        listing = runner.invoke(app, base + ["list", "--format", "json"])
+        mid = json.loads(listing.stdout)[0]["id"]
+        runner.invoke(app, base + ["trash", "put", mid])
+
+        res = runner.invoke(app, base + ["trash", "purge", "--older-than", "30", "-y"])
+        assert res.exit_code == 0
+        # Trashed just now, so a 30-day cutoff must not touch it.
+        assert "Purged 0 entries" in res.stdout
+
+    def test_cli_rejects_id_with_older_than(self, tmp_path):
+        runner = CliRunner()
+        base = ["--store", str(tmp_path / "chroma")]
+        runner.invoke(app, base + ["remember", "cli conflict subject"])
+        res = runner.invoke(app, base + ["trash", "purge", "abc123",
+                                        "--older-than", "5", "-y"])
+        assert res.exit_code == 1

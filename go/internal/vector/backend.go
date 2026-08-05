@@ -26,6 +26,18 @@ type Backend interface {
 	Get(ctx context.Context, ids []string) ([]Item, error)
 	// All returns every item (used by ReflectionEngine for clustering).
 	All(ctx context.Context) ([]Item, error)
+	// SearchDocuments returns up to limit items whose document text contains
+	// substr. Backed by the store's own content predicate (chromem-go's
+	// $contains / Chroma's where_document), so the scan happens inside the
+	// store rather than by loading every row into Go.
+	SearchDocuments(ctx context.Context, substr string, limit int) ([]Item, error)
+	// SearchMetadata returns up to limit items whose metadata matches every
+	// key/value in where (exact match — chromem-go's Where has no range
+	// operators). Lets a hot-path lookup like the pinned working set filter
+	// inside the store instead of loading every row into Go. An empty where
+	// matches nothing rather than everything, so a caller cannot accidentally
+	// scan the collection through this door.
+	SearchMetadata(ctx context.Context, where map[string]string, limit int) ([]Item, error)
 	// UpdateMetadata patches the metadata of an existing item.
 	UpdateMetadata(ctx context.Context, id string, meta map[string]string) error
 	// Delete removes items by ID.

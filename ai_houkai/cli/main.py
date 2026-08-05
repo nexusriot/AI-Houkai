@@ -34,7 +34,6 @@ from ai_houkai.cli.commands.stats import stats
 from ai_houkai.cli.commands.doctor import doctor
 from ai_houkai.cli.commands.eval_cmd import eval_cmd
 from ai_houkai.cli.commands.ingest import ingest
-from ai_houkai.cli.commands.reindex import reindex
 from ai_houkai.cli.commands.serve import serve
 from ai_houkai.cli.commands.collections import collections_app
 from ai_houkai.cli.commands.tui_cmd import tui
@@ -97,7 +96,6 @@ def _callback(
     ctx.obj["config"] = cfg
     ctx.obj["store"] = MemoryStore(
         path=cfg.store_path, collection=cfg.collection, actor="cli",
-        index=cfg.index,
     )
 
 
@@ -140,7 +138,6 @@ def _register() -> None:
     app.command("doctor")(doctor)
     app.command("eval")(eval_cmd)
     app.command("ingest")(ingest)
-    app.command("reindex")(reindex)
     app.command("serve")(serve)
     app.command("tui")(tui)
     app.add_typer(maintenance_app, name="maintenance")

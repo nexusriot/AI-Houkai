@@ -28,11 +28,17 @@ func (f *fakeReflectStore) AllRaw(_ context.Context) ([]vector.Item, error) {
 	return f.items, nil
 }
 func (f *fakeReflectStore) Remember(_ context.Context, text string, opts memory.RememberOpts) (memory.Memory, bool, []memory.Conflict, error) {
+	// Carry every field the real store applies. A double that silently drops
+	// one hides exactly the bugs these tests exist to catch — Trust was dropped
+	// here, so trust laundering through reflection was invisible.
 	m := memory.Memory{
-		ID:   "new-" + text[:min(8, len(text))],
-		Text: text,
-		Type: opts.Type,
-		Tags: opts.Tags,
+		ID:     "new-" + text[:min(8, len(text))],
+		Text:   text,
+		Type:   opts.Type,
+		Tags:   opts.Tags,
+		Source: opts.Source,
+		Pinned: opts.Pinned,
+		Trust:  opts.Trust,
 	}
 	if opts.Importance != nil {
 		m.Importance = *opts.Importance
@@ -312,5 +318,191 @@ func TestReflectMaxLevelCapsTheHierarchy(t *testing.T) {
 	}
 	if levels != 1 {
 		t.Errorf("tags = %v, want exactly one level tag", made[0].Tags)
+	}
+}
+
+// episodeTrust is `episode` with an explicit provenance level.
+func episodeTrust(id string, vec []float32, imp float32,
+	trust memory.TrustLevel) vector.Item {
+	m := memory.Memory{
+		ID:         id,
+		Type:       memory.Episodic,
+		Importance: imp,
+		Tags:       []string{"t-" + id},
+		Trust:      trust,
+	}
+	return vector.Item{
+		ID:        id,
+		Content:   "text-" + id,
+		Embedding: vec,
+		Metadata:  memory.MemoryToMetadata(m),
+	}
+}
+
+// A summary inherits the least-trusted source. Otherwise reflecting over
+// content the agent did not author launders it into a "trusted" memory that
+// MinTrust="trusted" will happily return — the hole the trust tier closes.
+
+func TestReflectSummaryInheritsWorstSourceTrust(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodeTrust("a", []float32{1, 0, 0}, 0.9, "untrusted"),
+		episodeTrust("b", []float32{0.99, 0.01, 0}, 0.5, "untrusted"),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 {
+		t.Fatalf("want 1 summary, got %d", len(created))
+	}
+	if created[0].Trust != "untrusted" {
+		t.Errorf("summary trust = %q, want untrusted — a summary of untrusted "+
+			"sources must not be born trusted", created[0].Trust)
+	}
+}
+
+func TestReflectSummaryTakesTheWorstOfMixedSources(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodeTrust("a", []float32{1, 0, 0}, 0.9, "trusted"),
+		episodeTrust("b", []float32{0.99, 0.01, 0}, 0.5, "reported"),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0].Trust != "reported" {
+		t.Errorf("summary trust = %q, want reported", created[0].Trust)
+	}
+}
+
+func TestReflectTrustedSourcesStayTrusted(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodeTrust("a", []float32{1, 0, 0}, 0.9, "trusted"),
+		episodeTrust("b", []float32{0.99, 0.01, 0}, 0.5, "trusted"),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0].Trust != "trusted" {
+		t.Errorf("summary trust = %q, want trusted", created[0].Trust)
+	}
+}
+
+func TestReflectDryRunAlsoCarriesTrust(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodeTrust("a", []float32{1, 0, 0}, 0.9, "untrusted"),
+		episodeTrust("b", []float32{0.99, 0.01, 0}, 0.5, "trusted"),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), true, ConsolidateNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0].Trust != "untrusted" {
+		t.Errorf("dry-run summary trust = %q, want untrusted — a preview must "+
+			"show what would actually be written", created[0].Trust)
+	}
+}
+
+// episodePinned is `episode` with the standing-instruction flag set.
+func episodePinned(id string, vec []float32, imp float32, pinned bool) vector.Item {
+	m := memory.Memory{
+		ID:         id,
+		Type:       memory.Episodic,
+		Importance: imp,
+		Tags:       []string{"t-" + id},
+		Pinned:     pinned,
+	}
+	return vector.Item{
+		ID:        id,
+		Content:   "text-" + id,
+		Embedding: vec,
+		Metadata:  memory.MemoryToMetadata(m),
+	}
+}
+
+// A consolidated summary takes over its sources' standing-instruction slot:
+// soft consolidate supersedes them (and a superseded row leaves the working
+// set), hard consolidate deletes them outright — either way the pin was lost.
+
+func TestReflectSoftConsolidateCarriesThePin(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodePinned("a", []float32{1, 0, 0}, 0.9, true),
+		episodePinned("b", []float32{0.99, 0.01, 0}, 0.5, false),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateSoft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || !created[0].Pinned {
+		t.Fatalf("summary = %+v, want it pinned", created)
+	}
+}
+
+func TestReflectHardConsolidateCarriesThePin(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodePinned("a", []float32{1, 0, 0}, 0.9, true),
+		episodePinned("b", []float32{0.99, 0.01, 0}, 0.5, false),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateHard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || !created[0].Pinned {
+		t.Fatalf("summary = %+v, want it pinned — the sources are gone", created)
+	}
+}
+
+// Without consolidation the sources stay live and pinned, so pinning the
+// summary too would put two rows in the working set for one instruction.
+func TestReflectWithoutConsolidationDoesNotPin(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodePinned("a", []float32{1, 0, 0}, 0.9, true),
+		episodePinned("b", []float32{0.99, 0.01, 0}, 0.5, false),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0].Pinned {
+		t.Fatalf("summary = %+v, want it unpinned", created)
+	}
+}
+
+func TestReflectUnpinnedSourcesStayUnpinned(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodePinned("a", []float32{1, 0, 0}, 0.9, false),
+		episodePinned("b", []float32{0.99, 0.01, 0}, 0.5, false),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), false, ConsolidateSoft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || created[0].Pinned {
+		t.Fatalf("summary = %+v, want it unpinned", created)
+	}
+}
+
+func TestReflectDryRunShowsThePinItWouldSet(t *testing.T) {
+	store := &fakeReflectStore{items: []vector.Item{
+		episodePinned("a", []float32{1, 0, 0}, 0.9, true),
+		episodePinned("b", []float32{0.99, 0.01, 0}, 0.5, false),
+	}}
+	created, err := New(store, 0.9, 2, nil).Reflect(
+		context.Background(), true, ConsolidateSoft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created) != 1 || !created[0].Pinned {
+		t.Fatalf("dry-run summary = %+v, want it pinned — a preview must show "+
+			"what would actually be written", created)
 	}
 }

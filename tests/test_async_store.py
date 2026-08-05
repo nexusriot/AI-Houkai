@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 
 import pytest
 import pytest_asyncio
 
-from ai_houkai.memory_system import AsyncMemoryStore
+from ai_houkai.memory_system import AsyncMemoryStore, MemoryStore
 
 
 @pytest.fixture()
@@ -239,3 +240,118 @@ class TestAsyncDiagnostics:
         assert r["ready"] is True
         assert r["checks"]["store"]["ok"] is True
         assert r["checks"]["embedder"]["ok"] is True
+
+
+class TestAsyncSurfaceCompleteness:
+    """AsyncMemoryStore is documented public API, so a missing wrapper is a
+    functional gap, not an omission — an async caller simply cannot reach the
+    feature. This is the drift `parity.json` catches for MCP/HTTP; the async
+    wrapper had no equivalent guard.
+    """
+
+    CURATION = (
+        "merge", "versions", "list_tags", "rename_tag", "merge_tags",
+        "delete_tag", "find_path",
+    )
+    TRASH = (
+        "trash", "trash_list", "trash_restore", "trash_purge",
+        "trash_purge_expired",
+    )
+
+    @pytest.mark.parametrize("name", CURATION + TRASH)
+    def test_method_is_wrapped(self, name):
+        assert hasattr(AsyncMemoryStore, name), (
+            f"AsyncMemoryStore is missing {name}()")
+
+    @pytest.mark.parametrize("flag", ["pinned", "trust", "idempotent"])
+    def test_remember_exposes_write_flag(self, flag):
+        params = inspect.signature(AsyncMemoryStore.remember).parameters
+        assert flag in params, f"async remember() cannot set {flag}"
+
+    @pytest.mark.parametrize("flag", ["pinned", "trust"])
+    def test_edit_exposes_write_flag(self, flag):
+        params = inspect.signature(AsyncMemoryStore.edit).parameters
+        assert flag in params, f"async edit() cannot set {flag}"
+
+    def test_recall_exposes_min_trust_and_lexical_index(self):
+        params = inspect.signature(AsyncMemoryStore.recall).parameters
+        for knob in ("min_trust", "lexical_index"):
+            assert knob in params, f"async recall() is missing {knob}"
+
+    def test_every_public_store_method_has_a_wrapper(self):
+        """Catches the next omission automatically rather than by review."""
+        skip = {
+            # Sync-only plumbing, or deliberately not part of the async surface.
+            "as_actor", "journal", "collection", "client", "index",
+            "trash_path", "embedder_name",
+        }
+        missing = []
+        for name in dir(MemoryStore):
+            if name.startswith("_") or name in skip:
+                continue
+            if not callable(getattr(MemoryStore, name, None)):
+                continue
+            if not hasattr(AsyncMemoryStore, name):
+                missing.append(name)
+        assert not missing, f"AsyncMemoryStore is missing: {sorted(missing)}"
+
+
+class TestAsyncNewMethodsWork:
+    def test_trash_roundtrip(self, tmp_path):
+        async def go():
+            store = AsyncMemoryStore(path=str(tmp_path / "c"),
+                                     collection="async_trash")
+            try:
+                mem = await store.remember("async trash subject")
+                assert await store.trash(mem.id) is True
+                assert [e.memory_id for e in await store.trash_list()] == [mem.id]
+                assert (await store.trash_restore(mem.id)).id == mem.id
+                assert await store.trash_list() == []
+            finally:
+                await store.aclose()
+
+        _run(go())
+
+    def test_curation_roundtrip(self, tmp_path):
+        async def go():
+            store = AsyncMemoryStore(path=str(tmp_path / "c"),
+                                     collection="async_curation")
+            try:
+                a = await store.remember("async merge target", tags=["ops"])
+                b = await store.remember("async merge source", tags=["ops"])
+                merged = await store.merge(a.id, b.id)
+                assert "async merge source" in merged.text
+                assert await store.list_tags() == [("ops", 1)]
+                assert (await store.rename_tag("ops", "operations")).changed == 1
+            finally:
+                await store.aclose()
+
+        _run(go())
+
+    def test_write_flags_reach_the_store(self, tmp_path):
+        async def go():
+            store = AsyncMemoryStore(path=str(tmp_path / "c"),
+                                     collection="async_flags")
+            try:
+                mem = await store.remember("async standing instruction",
+                                           pinned=True, trust="reported")
+                assert mem.pinned is True and mem.trust == "reported"
+                again = await store.remember("async standing instruction",
+                                             idempotent=True)
+                assert again.id == mem.id
+            finally:
+                await store.aclose()
+
+        _run(go())
+
+
+class TestAsyncContentHashLookup:
+    def test_finds_a_live_row(self, astore):
+        mem = _run(astore.remember("an async fact worth repeating"))
+        found = _run(astore.find_by_content_hash(
+            "an async fact worth repeating"))
+        assert found is not None and found.id == mem.id
+
+    def test_misses_when_nothing_matches(self, astore):
+        _run(astore.remember("something else"))
+        assert _run(astore.find_by_content_hash("never written")) is None

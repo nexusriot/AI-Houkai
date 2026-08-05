@@ -240,10 +240,13 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 			}
 			return errResult(err), nil
 		}
-		if !stored {
+		if !stored && len(conflicts) > 0 {
 			return jsonText(map[string]any{"stored": false, "conflicts": conflicts}), nil
 		}
-		out := map[string]any{"id": m.ID, "stored": true, "importance": m.Importance}
+		// stored=false with no conflicts is an idempotent repeat: the store
+		// found the existing row and bumped it. Reporting a bare
+		// {stored:false, conflicts:[]} read as a rejected write with no reason.
+		out := map[string]any{"id": m.ID, "stored": stored, "importance": m.Importance}
 		if m.ExpiresAt != 0 {
 			out["expires_at"] = m.ExpiresAt
 		}
@@ -257,6 +260,7 @@ func addRememberMany(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithArray("items", mcp.Required(), mcp.Description("List of objects, each with a required \"text\" plus optional type/tags/importance/source/polarity/expires_at/ttl_seconds (same fields as remember)")),
 		mcp.WithNumber("batch_size", mcp.Description("Items per embed batch (default: 128)")),
 		mcp.WithString("on_conflict", mcp.Description("ignore|warn|supersede (default: store policy); raise is not supported in bulk")),
+		mcp.WithBoolean("idempotent", mcp.Description("Collapse re-assertions by normalised text, against stored rows and within this call, so a replayed batch does not accumulate near-duplicates")),
 	)
 	s.AddTool(tool, rememberManyHandler(store))
 }
@@ -319,15 +323,25 @@ func rememberManyHandler(store *memory.MemoryStore) func(context.Context, mcp.Ca
 			batchSize = int(v)
 		}
 		onConflict := memory.ConflictPolicy(req.GetString("on_conflict", ""))
-		mems, err := store.RememberMany(ctx, items, batchSize, onConflict)
+		idempotent := req.GetBool("idempotent", false)
+		started := float64(time.Now().UnixNano()) / 1e9
+		mems, err := store.RememberMany(ctx, items, batchSize, onConflict, idempotent)
 		if err != nil {
 			return jsonText(map[string]any{"stored": 0, "error": err.Error()}), nil
 		}
 		ids := make([]string, len(mems))
+		// Rows created, not items submitted: an idempotent replay returns the
+		// pre-existing rows, and reporting len(mems) told the agent it had
+		// written N facts when it had written none. Distinct ids also collapse
+		// intra-batch duplicates, which map to one row.
+		created := map[string]bool{}
 		for i, m := range mems {
 			ids[i] = m.ID
+			if m.CreatedAt >= started {
+				created[m.ID] = true
+			}
 		}
-		return jsonText(map[string]any{"stored": len(mems), "ids": ids}), nil
+		return jsonText(map[string]any{"stored": len(created), "ids": ids}), nil
 	}
 }
 
@@ -353,7 +367,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on the hits (default: true; false = read-only)")),
 		mcp.WithBoolean("explain", mcp.Description("Include a per-signal score breakdown on each result")),
 		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid mode only): lifts candidates linked to other strong hits. Omit/0 disables the channel")),
-		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; fts unions the best full-corpus matches from the sidecar index into the pool first (hybrid mode, index required)")),
+		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; corpus also pulls candidates whose text contains the query's tokens into the pool (hybrid mode)")),
 		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted (omit for no filter)")),
 	}
 	tool := mcp.NewTool("recall", withExpandArgs(recallOpts...)...)
@@ -452,7 +466,7 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid mode only): lifts candidates linked to other strong hits. Omit/0 disables the channel")),
 		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on the packed memories (default: true; false = read-only)")),
 		mcp.WithString("header", mcp.Description("Heading prepended to the block, not counted against token_budget (default: \"## Relevant memory\"; \"\" for none)")),
-		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; fts unions the best full-corpus matches from the sidecar index into the pool first (hybrid mode, index required)")),
+		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; corpus also pulls candidates whose text contains the query's tokens into the pool (hybrid mode)")),
 		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted")),
 		mcp.WithBoolean("include_pinned", mcp.Description("Prepend every pinned memory ahead of the ranked hits, so a standing instruction is present whether or not it matches the query. They compete for the same budget")),
 	}
@@ -1286,10 +1300,13 @@ func maintenanceTickHandler(store *memory.MemoryStore) func(context.Context, mcp
 			return errResult(res.Err), nil
 		}
 		return jsonText(map[string]any{
-			"ran_decay":   res.RanDecay,
-			"ran_reflect": res.RanReflect,
-			"pruned":      res.Pruned,
-			"reflected":   res.Reflected,
+			"ran_decay":    res.RanDecay,
+			"ran_reflect":  res.RanReflect,
+			"ran_purge":    res.RanPurge,
+			"pruned":       res.Pruned,
+			"reflected":    res.Reflected,
+			"purged":       res.Purged,
+			"trash_purged": res.TrashPurged,
 		}), nil
 	}
 }

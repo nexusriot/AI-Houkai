@@ -6,7 +6,7 @@ Run with:
 
 Tools exposed (41):
     remember(text, type?, tags?, importance?, source?, on_conflict?, polarity?, expires_at?, ttl_seconds?, pinned?, trust?, idempotent?)
-    remember_many(items, batch_size?, on_conflict?)
+    remember_many(items, batch_size?, on_conflict?, idempotent?)
     get(memory_id)
     edit(memory_id, text?, type?, tags?, importance?, polarity?, source?, clear_source?, expires_at?, pinned?, trust?)
     recall(query, k?, type?, tag?, min_importance?, source?, since?, until?, mode?, overfetch?, include_superseded?, include_expired?, explain?, fusion?, diversity?, dedup_threshold?, min_cosine?, graph?, touch?, expand_*?)
@@ -40,7 +40,7 @@ Tools exposed (41):
     trash(memory_id)
     trash_list()
     trash_restore(memory_id)
-    trash_purge(memory_id?)
+    trash_purge(memory_id?, older_than_days?)
     ready()
     maintenance_tick(reflect_apply?)
     journal_tail(n?, op?, since_seconds?)
@@ -135,6 +135,11 @@ def remember(
     """
 
     policy = on_conflict  # type: ignore[assignment]
+    # Asked before the write, because remember() returns the existing row on a
+    # dedupe hit and there is otherwise no way to tell it from a fresh one — an
+    # agent re-asserting known facts was told each one was newly stored.
+    deduped = (idempotent
+               and get_store().find_by_content_hash(text) is not None)
     try:
         mem = get_store().remember(
             text=text,
@@ -161,7 +166,7 @@ def remember(
                 for c in e.conflicts
             ],
         }
-    return {"id": mem.id, "stored": True, "importance": mem.importance,
+    return {"id": mem.id, "stored": not deduped, "importance": mem.importance,
             "expires_at": mem.expires_at or None, "pinned": mem.pinned,
             "trust": mem.trust}
 
@@ -171,6 +176,7 @@ def remember_many(
     items: list[dict[str, Any]],
     batch_size: int = 128,
     on_conflict: str | None = None,
+    idempotent: bool = False,
 ) -> dict[str, Any]:
     """Store many memories in one batched, embedding-efficient call.
     items: a list of objects, each with a required "text" plus optional "type",
@@ -179,17 +185,29 @@ def remember_many(
     ceil(N / batch_size) encode passes instead of N.
     on_conflict: ignore | warn | supersede (default: store policy). "raise" is
     not supported in bulk — use remember per item.
-    Returns {stored, ids}.
+    idempotent: true collapses re-assertions by normalised text, both against
+    rows already stored and within this call, so a batch replayed every session
+    does not accumulate near-duplicates. Every input still maps to an entry in
+    `ids`, with duplicates sharing one id.
+    Returns {stored, ids}, where `stored` counts the rows actually created — 0
+    for a fully replayed batch.
     """
+    started = time.time()
     try:
         mems = get_store().remember_many(
             items,
             batch_size=batch_size,
             on_conflict=on_conflict,  # type: ignore[arg-type]
+            idempotent=idempotent,
         )
     except (ValueError, TypeError) as e:
         return {"stored": 0, "error": str(e)}
-    return {"stored": len(mems), "ids": [m.id for m in mems]}
+    # Rows created, not items submitted: an idempotent replay returns the
+    # pre-existing rows, and reporting len(mems) told the agent it had written N
+    # facts when it had written none. Distinct ids also collapse intra-batch
+    # duplicates, which map to one row.
+    created = {m.id for m in mems if m.created_at >= started}
+    return {"stored": len(created), "ids": [m.id for m in mems]}
 
 
 def _weights(graph: float | None) -> "HybridWeights | None":
@@ -291,7 +309,7 @@ def recall(
     dedup/MMR/top-k instead of appending them after.
 
     lexical_index: "pool" (default) scores BM25 only over the vector over-fetch
-    pool; "fts" first unions the best full-corpus matches from the sidecar
+    pool; "corpus" also pulls in memories whose text contains the query's
     index into the pool, so an exact-token match with a weak embedding can be
     found at all (hybrid mode; requires an enabled index).
 
@@ -1088,8 +1106,18 @@ def trash_restore(memory_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def trash_purge(memory_id: str | None = None) -> dict[str, Any]:
-    """Permanently drop one trashed memory, or empty the trash. Irreversible."""
+def trash_purge(memory_id: str | None = None,
+                older_than_days: float | None = None) -> dict[str, Any]:
+    """Permanently drop trashed memories. Irreversible.
+
+    Pass memory_id for one entry, older_than_days to apply a retention cutoff,
+    or neither to empty the whole trash. The two are mutually exclusive.
+    """
+    if memory_id is not None and older_than_days is not None:
+        return {"purged": 0,
+                "error": "pass either memory_id or older_than_days, not both"}
+    if older_than_days is not None:
+        return {"purged": get_store().trash_purge_expired(older_than_days)}
     return {"purged": get_store().trash_purge(memory_id)}
 
 
@@ -1137,6 +1165,7 @@ def maintenance_tick(
             "decayed": 0,
             "reflected": 0,
             "purged": 0,
+            "trash_purged": 0,
             "reflect_applied": False,
             "decay_error": None,
             "reflect_error": None,
@@ -1149,6 +1178,7 @@ def maintenance_tick(
         decay_every=mcfg.decay_every,
         reflect_every=mcfg.reflect_every,
         purge_every=mcfg.purge_every,
+        trash_ttl_days=mcfg.trash_ttl_days,
         tick_interval=mcfg.tick_interval,
         state_path=mcfg.state_path,
         decay_rate=mcfg.decay_rate,
@@ -1170,6 +1200,7 @@ def maintenance_tick(
         "decayed": result.decayed,
         "reflected": result.reflected,
         "purged": result.purged,
+        "trash_purged": result.trash_purged,
         "reflect_applied": result.reflect_applied,
         "decay_error": result.decay_error,
         "reflect_error": result.reflect_error,

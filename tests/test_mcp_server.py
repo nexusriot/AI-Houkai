@@ -218,3 +218,55 @@ class TestMcpNewFeatures:
         created = srv.remember(text="mcp later")
         out = srv.get_at(memory_id=created["id"], ts=ts)
         assert out["ok"] is False
+
+
+class TestIdempotentRememberReportsNoNewRow:
+    """`stored: true` means "I created a row". An idempotent repeat creates
+    nothing — it finds the existing memory and bumps its access count — so an
+    agent re-asserting known facts every session was told each one was newly
+    stored. The Go port reported `{stored: false, conflicts: []}`, which reads
+    as a rejected write with no reason given; both now return the row with
+    `stored: false`."""
+
+    def test_first_write_is_stored(self, mcp_store):
+        out = srv.remember(text="repeat me", idempotent=True)
+        assert out["stored"] is True
+        assert out["id"]
+
+    def test_the_repeat_returns_the_existing_row(self, mcp_store):
+        first = srv.remember(text="repeat me", idempotent=True)
+        second = srv.remember(text="repeat me", idempotent=True)
+        assert second["stored"] is False
+        assert second["id"] == first["id"]
+        assert "conflicts" not in second
+
+    def test_without_the_flag_a_repeat_is_a_new_row(self, mcp_store):
+        first = srv.remember(text="no flag here")
+        second = srv.remember(text="no flag here")
+        assert second["stored"] is True
+        assert second["id"] != first["id"]
+
+
+class TestBatchStoredCountsOnlyNewRows:
+    """Same contract as the single write: `stored` is rows created, not items
+    submitted. A replayed idempotent batch creates nothing."""
+
+    def test_a_replayed_batch_reports_no_new_rows(self, mcp_store):
+        items = [{"text": "batch fact one"}, {"text": "batch fact two"}]
+        first = srv.remember_many(items=items, idempotent=True)
+        assert first["stored"] == 2
+
+        again = srv.remember_many(items=items, idempotent=True)
+        assert again["stored"] == 0
+        assert again["ids"] == first["ids"], "every input still maps to an id"
+
+    def test_intra_batch_duplicates_count_once(self, mcp_store):
+        out = srv.remember_many(
+            items=[{"text": "same text"}, {"text": "same text"}],
+            idempotent=True)
+        assert out["stored"] == 1
+        assert len(out["ids"]) == 2 and out["ids"][0] == out["ids"][1]
+
+    def test_without_the_flag_every_item_is_a_new_row(self, mcp_store):
+        out = srv.remember_many(items=[{"text": "dup"}, {"text": "dup"}])
+        assert out["stored"] == 2

@@ -119,3 +119,43 @@ class TestEvaluateHarness:
         assert {c["k"] for c in res.per_case} == {2, 5}
         assert res.k == -1                     # mixed
         assert "mixed" in res.summary()
+
+
+# Golden metric values, duplicated verbatim in go/internal/eval/eval_test.go
+# (TestPortParityGoldenValues). The eval harness's whole purpose is measuring
+# ranking changes, so the two ports disagreeing by even a rounding step would
+# make a cross-port comparison meaningless. Any change to these numbers must be
+# made in both files, deliberately.
+PORT_PARITY_GOLDEN = [
+    # (retrieved, relevant, k, recall, precision, rr, ap, ndcg)
+    (["a", "x", "b", "y"], ["a", "b"], 4,
+     1.000000, 0.500000, 1.000000, 0.833333, 0.919721),
+    (["x", "y", "z"], ["a"], 3,
+     0.000000, 0.000000, 0.000000, 0.000000, 0.000000),
+    # A duplicated retrieved id is credited once, so nothing exceeds 1.0.
+    (["a", "a", "b"], ["a", "b"], 3,
+     1.000000, 1.000000, 1.000000, 0.833333, 0.919721),
+    # k truncates recall but not RR/AP, which score the full ranking.
+    (["b", "a"], ["a", "b"], 1,
+     0.500000, 1.000000, 1.000000, 1.000000, 1.000000),
+    ([], ["a"], 5,
+     0.000000, 0.000000, 0.000000, 0.000000, 0.000000),
+]
+
+
+class TestPortParityGoldenValues:
+    @pytest.mark.parametrize(
+        "retrieved,relevant,k,want_recall,want_precision,want_rr,want_ap,want_ndcg",
+        PORT_PARITY_GOLDEN)
+    def test_matches_the_go_port(self, retrieved, relevant, k, want_recall,
+                                 want_precision, want_rr, want_ap, want_ndcg):
+        assert recall_at_k(retrieved, relevant, k) == pytest.approx(
+            want_recall, abs=1e-6)
+        assert precision_at_k(retrieved, relevant, k) == pytest.approx(
+            want_precision, abs=1e-6)
+        assert reciprocal_rank(retrieved, relevant) == pytest.approx(
+            want_rr, abs=1e-6)
+        assert average_precision(retrieved, relevant) == pytest.approx(
+            want_ap, abs=1e-6)
+        assert ndcg_at_k(retrieved, relevant, k) == pytest.approx(
+            want_ndcg, abs=1e-6)

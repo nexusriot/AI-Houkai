@@ -75,6 +75,12 @@ type MemRow struct {
 func PrintRows(w io.Writer, rows []MemRow, format OutputFormat) {
 	switch format {
 	case FormatJSON:
+		// A nil slice marshals to `null`, which is valid JSON but not iterable:
+		// `houkai list -f json | jq '.[]'` failed on a fresh store. An empty
+		// result is an empty list.
+		if rows == nil {
+			rows = []MemRow{}
+		}
 		b, _ := json.MarshalIndent(rows, "", "  ")
 		fmt.Fprintln(w, string(b))
 	case FormatTSV:

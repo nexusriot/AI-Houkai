@@ -299,3 +299,47 @@ def test_rotate_crash_mid_compress_loses_nothing(
     # And appends keep working on a fresh active file.
     j.append(_entry(9))
     assert [e.id for e in j.read(include_archives=True)][-1] == "id-9"
+
+
+def test_undo_of_a_trash_clears_the_trash_entry(store: MemoryStore) -> None:
+    """`trash` deletes through `forget`, so undoing it resurrects the row — but
+    the trash entry stayed behind, listing a memory that is live again. The
+    stale entry then makes `trash_restore` a silent no-op on the newer row, and
+    `trash_list` shows a recovery point that recovers nothing."""
+    mem = store.remember(text="binned then reinstated")
+    store.trash(mem.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == mem.id)
+
+    assert store.undo(entry) is True
+    assert store.get(mem.id) is not None
+    assert store.trash_list() == []
+
+
+def test_undo_of_a_plain_forget_leaves_the_trash_alone(store: MemoryStore) -> None:
+    """Only the entry for the undone memory goes — anything else in the bin
+    stays recoverable."""
+    kept = store.remember(text="still in the bin")
+    store.trash(kept.id)
+    gone = store.remember(text="plainly forgotten")
+    store.forget(gone.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == gone.id)
+
+    assert store.undo(entry) is True
+    assert [e.memory_id for e in store.trash_list()] == [kept.id]
+
+
+def test_trash_restore_does_not_clobber_a_live_memory(store: MemoryStore) -> None:
+    """Belt and braces: even if a stale entry appears some other way (an import
+    that recreates a trashed id, say), restoring it must not roll a live memory
+    back to an older snapshot."""
+    mem = store.remember(text="original text", tags=["before"])
+    store.trash(mem.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == mem.id)
+    store.undo(entry)
+    store.edit(mem.id, tags=["after"])
+
+    store.trash_restore(mem.id)
+    assert store.get(mem.id).tags == ["after"]

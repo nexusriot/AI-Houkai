@@ -88,6 +88,23 @@ func TrustRank(t TrustLevel) int {
 	return 0
 }
 
+// WorstTrust returns the least-trusted level among levels.
+//
+// Combining trust always takes the worst case, because a derived memory carries
+// the content of every source it came from. A summary of untrusted material is
+// untrusted; merging untrusted text into a trusted memory makes the result
+// untrusted. Anything else is a laundering path: content the agent did not
+// author ends up recallable under MinTrust="trusted".
+func WorstTrust(levels ...TrustLevel) TrustLevel {
+	worst := 0
+	for _, l := range levels {
+		if r := TrustRank(l); r > worst {
+			worst = r
+		}
+	}
+	return TrustLevel(TrustLevels[worst])
+}
+
 type MemoryWithScore struct {
 	Memory
 	Score float32 `json:"score"`
@@ -281,13 +298,14 @@ func MemoryToMetadata(m Memory) map[string]string {
 		"polarity":      strconv.Itoa(m.Polarity),
 		"expires_at":    fmt.Sprintf("%f", m.ExpiresAt),
 		"pinned":        strconv.FormatBool(m.Pinned),
-		"trust":         string(trustOrDefault(m.Trust)),
+		"trust":         string(TrustOrDefault(m.Trust)),
 		"content_hash":  m.ContentHash,
 	}
 }
 
-// trustOrDefault normalises the zero value to "trusted".
-func trustOrDefault(t TrustLevel) TrustLevel {
+// TrustOrDefault normalises the zero value to "trusted", so a caller
+// serialising a memory never has to special-case an unlabelled row.
+func TrustOrDefault(t TrustLevel) TrustLevel {
 	if t == "" {
 		return TrustTrusted
 	}
@@ -323,7 +341,7 @@ func (m Memory) ToDict() map[string]any {
 		"polarity":      m.Polarity,
 		"expires_at":    m.ExpiresAt,
 		"pinned":        m.Pinned,
-		"trust":         string(trustOrDefault(m.Trust)),
+		"trust":         string(TrustOrDefault(m.Trust)),
 		"content_hash":  m.ContentHash,
 	}
 }
@@ -393,7 +411,7 @@ func MemoryFromDict(d map[string]any) Memory {
 		Polarity:     asInt(d["polarity"]),
 		ExpiresAt:    asFloat(d["expires_at"]),
 		Pinned:       asBool(d["pinned"]),
-		Trust:        trustOrDefault(TrustLevel(asString(d["trust"]))),
+		Trust:        TrustOrDefault(TrustLevel(asString(d["trust"]))),
 		ContentHash:  asString(d["content_hash"]),
 	}
 }

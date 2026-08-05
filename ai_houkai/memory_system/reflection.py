@@ -44,6 +44,7 @@ from typing import Callable, Literal
 from contextlib import nullcontext
 
 from .store import Memory, MemoryStore
+from .trust import worst_trust
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -163,6 +164,23 @@ class ReflectionEngine:
                     sum(m.importance for m in group) / len(group), 3
                 )
 
+                # A summary is only as trustworthy as its least trustworthy
+                # source. Without this, reflecting over content the agent did
+                # not author launders it into a "trusted" memory that
+                # min_trust="trusted" will happily return — the exact hole the
+                # trust tier exists to close. Mirrors the polarity rule in
+                # _cluster, which refuses to blend contradictory members.
+                trust = worst_trust(m.trust for m in group)
+
+                # A consolidated summary takes over its sources' standing-
+                # instruction slot: soft consolidate supersedes them (and a
+                # superseded row leaves the working set), hard consolidate
+                # deletes them outright — either way the pin would be lost.
+                # Without consolidation the sources stay live and pinned, so
+                # pinning the summary too would put two rows in the working set
+                # for one instruction.
+                pinned = bool(consolidate) and any(m.pinned for m in group)
+
                 if dry_run:
                     candidate = Memory(
                         id=str(uuid.uuid4()),
@@ -171,6 +189,8 @@ class ReflectionEngine:
                         tags=all_tags,
                         importance=importance,
                         source="reflection/dry-run",
+                        trust=trust,
+                        pinned=pinned,
                     )
                     created.append(candidate)
                 else:
@@ -180,6 +200,8 @@ class ReflectionEngine:
                         tags=all_tags,
                         importance=importance,
                         source="reflection",
+                        trust=trust,
+                        pinned=pinned,
                     )
                     created.append(new_mem)
 

@@ -38,7 +38,7 @@ doubled by the two-port parity requirement).
 | **Pluggable embedder** (§24) | `embedding_function=` seam + `AI_HOUKAI_EMBEDDER`, stdlib OpenAI-compatible/Ollama backends, `sentence-transformers` moved to a `[local]` extra, `ai_houkai.testing.FakeEmbedder`. |
 | **CI + enforced parity** (§23) | `.github/workflows/{ci,release}.yml`; `parity.json` asserted by both ports; a fast suite that needs no torch. |
 | **Eval harness wired** (§28) | `houkai eval`, the `eval_recall` MCP tool, and a Go port. Ranking constants are now measurable. |
-| **SQLite sidecar index** (§25) | Full-corpus BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag counts, indexed expiry sweep, `houkai reindex`. Opt-in; degrades to scanning rather than to wrong answers. |
+| **Full-corpus lexical recall** (§25) | `lexical_index="corpus"` via Chroma's `where_document`, plus a Chroma-native range query for `purge_expired`. Started as a SQLite FTS sidecar; measurement retired it — see §25 for the numbers and the trade. |
 | **Curation + trash** (§26) | `merge`/`versions`/tag ops/`find_path` graduated out of ai-houkai-service; recoverable delete between `supersede` and `forget`, with decay pruning routed through it. |
 | **Tiered reflection** | `ReflectionEngine(types=…)` instead of episodic-only, with a `level` tag and `max_level` guard so reflections-of-reflections form a hierarchy. |
 | **Pinned / trust / idempotent** (§27) | A standing-instruction slot, a provenance tier, and content-hash dedupe on write. |
@@ -67,17 +67,22 @@ per-scope quotas, stats, GDPR erasure, and agent hand-off.
 - **Watch-out:** Chroma equality won't match legacy rows lacking the key —
   backfill once or filter client-side (as the Go port already does); keep both
   ports' "missing key = unscoped" semantics identical.
-- **Sequencing:** the sidecar index (§25) landed first on purpose. Scoping
-  without an index just multiplies the full scans.
+- **Sequencing:** worth pairing with Tier 1 #2 — scoping multiplies whatever
+  scans remain, so denormalising the link edges first keeps the cost bounded.
 
-### 2. Port the sidecar index to Go · value 4 · fit 5 · M
-The metadata/FTS index (§25) is Python-only, so the Go port still pays the full
-scan for `list_recent`, reverse links and the expiry sweep, and has no
-full-corpus lexical channel. `modernc.org/sqlite` keeps it cgo-free; the
-alternative is folding the index into the existing `vector.Backend` abstraction.
-Until this lands, `lexical_index="fts"` is a documented Python-only knob — which
-`parity.json` deliberately does **not** assert, so the gap is explicit rather
-than a silent lie.
+### 2. Denormalise link edges so reverse lookups stop scanning · value 4 · fit 5 · S
+Chroma stores `links` as an opaque metadata string, so "who points at me?" is
+not expressible as a `where` clause. `neighbors(direction="in"|"both")` therefore
+reads every memory — **once per frontier node per hop**, so a depth-2 walk over
+ten neighbours is eleven full loads. `merge`'s incoming-link re-pointing and
+`find_path` pay the same cost.
+
+Record the edge on both sides (`a → b` also stored as an inbound entry on `b`)
+and the reverse lookup becomes a plain `get`. No index, no second database, and
+both ports get it from the same data-model change.
+- **Watch-out:** the two halves must stay consistent under `unlink`, `forget`,
+  `merge` and `undo`; a migration pass has to backfill existing stores, and the
+  scan fallback should stay for a store whose inbound fields are absent.
 
 ---
 
@@ -153,5 +158,9 @@ incomplete op counters) were already fixed in the shipped code — see
   stderr and nothing to stdout, so the output is not parseable JSON. Any script
   piping it has to tolerate the empty case (see `list_ids` in
   `functional_tests/test_e2e.py`).
-- **The sidecar index is Python-only** — tracked as Tier 1 #2, and deliberately
-  absent from `parity.json` so the gap is explicit rather than an unstated lie.
+- **`neighbors(direction="in")` still scans** — see Tier 1 #2. Callers on large
+  stores should prefer `direction="out"` until the edges are denormalised.
+- **Corpus-lexical recall is a linear scan** — ~4.5 ms at 25k rows, growing with
+  the collection. Fine at agent scale, and off by default; if a deployment needs
+  a flat lookup curve, the index belongs in the consuming service's database
+  rather than back in the library (§25).

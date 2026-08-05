@@ -283,6 +283,13 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 		}}); err != nil {
 			return false, err
 		}
+		// Trash deletes through Forget, so undoing that entry brings the row
+		// back — and a trash entry for a live memory is a recovery point that
+		// recovers nothing, while making TrashRestore a no-op on the newer row.
+		// Drop it; a plain forget has nothing to drop.
+		if _, err := s.TrashPurge(mem.ID); err != nil {
+			return false, err
+		}
 		s.journalEntry("undo", mem.ID, nil, mem.ToDict(), map[string]any{"of": e.TS, "of_op": e.Op})
 		return true, nil
 

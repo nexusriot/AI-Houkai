@@ -99,7 +99,8 @@ type PackOpts struct {
 	MinCosine      *float32
 	NoTouch        bool
 	// LexicalIndex forwards to Recall: "fts" unions full-corpus BM25 matches
-	// into the candidate pool (hybrid mode, sidecar index required).
+	// "corpus" also pulls candidates whose text contains the query's tokens
+	// into the pool (hybrid mode only).
 	LexicalIndex LexicalIndexMode
 
 	// Query-time compression: candidates that could not be packed individually
@@ -261,7 +262,7 @@ func packLine(m Memory) string {
 	if m.Pinned {
 		marks = append(marks, "pinned")
 	}
-	if t := trustOrDefault(m.Trust); t != TrustTrusted {
+	if t := TrustOrDefault(m.Trust); t != TrustTrusted {
 		marks = append(marks, string(t))
 	}
 	suffix := ""
@@ -345,6 +346,35 @@ func compressGroup(mems []Memory) string {
 	return fmt.Sprintf("[×%d similar] %s", len(mems), strings.Join(snippets, " | "))
 }
 
+// PinnedMemories returns every live pinned memory, newest first.
+//
+// Pushed into the backend as a metadata filter rather than read-and-filter:
+// this sits on the RecallPack / AutoContext hot path, and loading the whole
+// collection to find the handful of pinned rows made the cheapest part of the
+// packer the most expensive. Rows written before `pinned` existed have no such
+// metadata key and do not match — which is correct, since an absent key means
+// not pinned.
+func (s *MemoryStore) PinnedMemories(ctx context.Context) ([]Memory, error) {
+	items, err := s.backend.SearchMetadata(ctx, map[string]string{"pinned": "true"}, 0)
+	if err != nil {
+		return nil, err
+	}
+	now := nowFloat()
+	out := make([]Memory, 0, len(items))
+	for _, it := range items {
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.SupersededBy != "" {
+			continue
+		}
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out, nil
+}
+
 // prependPinned puts pinned memories at the front of a ranked list.
 //
 // Scored above every hit rather than merged by relevance: a standing
@@ -352,15 +382,12 @@ func compressGroup(mems []Memory) string {
 // Already-ranked pinned memories are moved rather than duplicated.
 func (s *MemoryStore) prependPinned(ctx context.Context, ranked []MemoryWithScore,
 	minTrust TrustLevel) ([]MemoryWithScore, error) {
-	mems, err := s.ListRecent(ctx, 0, false, false)
+	mems, err := s.PinnedMemories(ctx)
 	if err != nil {
 		return ranked, err
 	}
 	var pinned []Memory
 	for _, m := range mems {
-		if !m.Pinned {
-			continue
-		}
 		if minTrust != "" && TrustRank(m.Trust) > TrustRank(minTrust) {
 			continue
 		}

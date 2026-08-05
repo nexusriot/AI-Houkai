@@ -250,16 +250,30 @@ def trash_purge_cmd(
     ctx: typer.Context,
     id: Optional[str] = typer.Argument(
         None, help="Memory id; omit to empty the whole trash"),
+    older_than: Optional[float] = typer.Option(
+        None, "--older-than",
+        help="Purge only entries trashed more than this many days ago"),
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Permanently drop trashed memories. Irreversible."""
     store = ctx.obj["store"]
-    what = f"memory {id}" if id else "the ENTIRE trash"
+    if older_than is not None:
+        if id is not None:
+            typer.echo("Error: pass either an id or --older-than, not both",
+                       err=True)
+            raise typer.Exit(1)
+        what = f"everything trashed over {older_than} day(s) ago"
+    else:
+        what = f"memory {id}" if id else "the ENTIRE trash"
     if not out.confirm(f"Permanently delete {what}? This cannot be undone.",
                        yes=yes):
         typer.echo("Aborted.")
         return
-    typer.echo(f"Purged {store.trash_purge(id)} entries.")
+    if older_than is not None:
+        purged = store.trash_purge_expired(older_than)
+    else:
+        purged = store.trash_purge(id)
+    typer.echo(f"Purged {purged} entries.")
 
 
 tags_app.command("list")(tags_list)

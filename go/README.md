@@ -723,11 +723,10 @@ rename/merge/delete, `find_path`), `trash`/`trash_list`/`trash_restore`/
 `eval_recall` harness (`internal/eval`, metric-for-metric with Python and
 reading the same JSONL gold-set format).
 
-The one deliberate gap is the SQLite sidecar metadata/FTS index, which is
-Python-only for now — so `lexical_index="fts"` has no Go equivalent. It is
-tracked in [docs/ROADMAP.md](../docs/ROADMAP.md) Tier 1 #2 and deliberately
-excluded from `parity.json`, so the gap is explicit rather than an unstated
-lie.
+`lexical_index` is the one recall knob not yet ported: Python backs
+`"corpus"` with Chroma's `where_document` filter, and chromem-go has no
+equivalent document-content predicate. Everything else in the manifest is
+matched on both sides.
 
 Two ranking features from the latest cycle live at the **library level** in both
 ports — not (yet) on the MCP/CLI/HTTP surface: **graph-proximity fusion**

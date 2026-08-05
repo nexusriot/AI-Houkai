@@ -52,11 +52,7 @@ type Config struct {
 	DOKey             string            `toml:"do_api_key"`
 	DOModel           string            `toml:"do_model"`
 	EmbedDim          int               `toml:"embed_dim"`
-	// Index enables the derived SQLite sidecar ("sqlite"); empty keeps the
-	// historical full-scan reads. An existing store needs `houkai reindex`
-	// after switching this on.
-	Index       string            `toml:"index"`
-	Maintenance MaintenanceConfig `toml:"maintenance"`
+	Maintenance       MaintenanceConfig `toml:"maintenance"`
 }
 
 // MaintenanceConfig holds the [maintenance] config block.
@@ -76,6 +72,11 @@ type MaintenanceConfig struct {
 	DecayEverySecs   int `toml:"decay_every_secs"`
 	ReflectEverySecs int `toml:"reflect_every_secs"`
 	PurgeEverySecs   int `toml:"purge_every_secs"`
+
+	// TrashTTLDays drops trashed memories deleted more than this many days ago,
+	// on the same tick as the TTL purge (mirrors Python's trash_ttl_days).
+	// 0 disables retention — the trash then keeps everything forever.
+	TrashTTLDays float64 `toml:"trash_ttl_days"`
 }
 
 // MaintPaths returns the resolved state/pid/log paths, defaulting to files
@@ -132,6 +133,7 @@ func defaultConfig() Config {
 			DecayEverySecs:   86_400,  // 24h, matching Python's decay_every
 			ReflectEverySecs: 604_800, // 7d, matching Python's reflect_every
 			PurgeEverySecs:   86_400,  // 24h, matching Python's purge_every
+			TrashTTLDays:     30,      // matching Python's trash_ttl_days
 		},
 	}
 }

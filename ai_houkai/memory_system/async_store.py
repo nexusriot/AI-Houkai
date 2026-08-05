@@ -46,7 +46,9 @@ from .store import (
     PackResult,
     RememberItem,
     Reranker,
+    TrustLevel,
 )
+from .curation import TagRename, TrashEntry, Version
 from .journal import JournalEntry
 
 _T = TypeVar("_T")
@@ -145,6 +147,9 @@ class AsyncMemoryStore:
         ttl_seconds: float | None = None,
         on_conflict: Literal["ignore", "warn", "supersede", "raise"] | None = None,
         contradiction_fn: ConflictFn | None = None,
+        pinned: bool = False,
+        trust: TrustLevel = "trusted",
+        idempotent: bool = False,
     ) -> Memory:
         return await self.run(
             self.sync.remember,
@@ -156,6 +161,9 @@ class AsyncMemoryStore:
             polarity=polarity,
             expires_at=expires_at,
             ttl_seconds=ttl_seconds,
+            pinned=pinned,
+            trust=trust,
+            idempotent=idempotent,
             on_conflict=on_conflict,
             contradiction_fn=contradiction_fn,
         )
@@ -167,6 +175,7 @@ class AsyncMemoryStore:
         batch_size: int = 128,
         on_conflict: Literal["ignore", "warn", "supersede"] | None = None,
         contradiction_fn: ConflictFn | None = None,
+        idempotent: bool = False,
     ) -> list[Memory]:
         return await self.run(
             self.sync.remember_many,
@@ -174,6 +183,7 @@ class AsyncMemoryStore:
             batch_size=batch_size,
             on_conflict=on_conflict,
             contradiction_fn=contradiction_fn,
+            idempotent=idempotent,
         )
 
     async def forget(self, memory_id: str) -> bool:
@@ -190,12 +200,15 @@ class AsyncMemoryStore:
         polarity: int | None = None,
         expires_at: float | None = None,
         source: str | None = MemoryStore._UNSET,
+        pinned: bool | None = None,
+        trust: TrustLevel | None = None,
     ) -> Memory:
         """Update fields of an existing memory in place — see MemoryStore.edit."""
         return await self.run(
             self.sync.edit, memory_id,
             text=text, type=type, tags=tags, importance=importance,
             polarity=polarity, expires_at=expires_at, source=source,
+            pinned=pinned, trust=trust,
         )
 
     async def nuke(self) -> int:
@@ -226,6 +239,8 @@ class AsyncMemoryStore:
         reranker: Reranker | None = None,
         touch: bool = True,
         explain: bool = False,
+        min_trust: TrustLevel | None = None,
+        lexical_index: Literal["pool", "corpus"] = "pool",
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         return await self.run(
             self.sync.recall,
@@ -249,6 +264,8 @@ class AsyncMemoryStore:
             include_expired=include_expired,
             reranker=reranker,
             touch=touch,
+            min_trust=min_trust,
+            lexical_index=lexical_index,
             explain=explain,
         )
 
@@ -338,6 +355,9 @@ class AsyncMemoryStore:
 
     async def get(self, memory_id: str) -> Memory | None:
         return await self.run(self.sync.get, memory_id)
+
+    async def find_by_content_hash(self, text: str) -> Memory | None:
+        return await self.run(self.sync.find_by_content_hash, text)
 
     async def list_recent(
         self,
@@ -481,3 +501,50 @@ class AsyncMemoryStore:
 
     async def undo(self, entry: JournalEntry) -> bool:
         return await self.run(self.sync.undo, entry)
+
+    async def merge(self, target_id: str, other_id: str, *,
+                    separator: str = "\n\n") -> Memory:
+        """Fold one memory into another — see MemoryStore.merge."""
+        return await self.run(self.sync.merge, target_id, other_id,
+                              separator=separator)
+
+    async def versions(self, memory_id: str, *,
+                       include_archives: bool = True) -> list[Version]:
+        return await self.run(self.sync.versions, memory_id,
+                              include_archives=include_archives)
+
+    async def list_tags(self, *, include_superseded: bool = False
+                        ) -> list[tuple[str, int]]:
+        return await self.run(self.sync.list_tags,
+                              include_superseded=include_superseded)
+
+    async def rename_tag(self, old: str, new: str) -> TagRename:
+        return await self.run(self.sync.rename_tag, old, new)
+
+    async def merge_tags(self, sources: Iterable[str], into: str) -> TagRename:
+        return await self.run(self.sync.merge_tags, sources, into)
+
+    async def delete_tag(self, tag: str) -> TagRename:
+        return await self.run(self.sync.delete_tag, tag)
+
+    async def find_path(self, from_id: str, to_id: str, *,
+                        max_depth: int = 6) -> list[Memory]:
+        return await self.run(self.sync.find_path, from_id, to_id,
+                              max_depth=max_depth)
+
+    async def trash(self, memory_id: str) -> bool:
+        """Soft-delete into the trash — see MemoryStore.trash."""
+        return await self.run(self.sync.trash, memory_id)
+
+    async def trash_list(self) -> list[TrashEntry]:
+        return await self.run(self.sync.trash_list)
+
+    async def trash_restore(self, memory_id: str) -> Memory | None:
+        return await self.run(self.sync.trash_restore, memory_id)
+
+    async def trash_purge(self, memory_id: str | None = None) -> int:
+        return await self.run(self.sync.trash_purge, memory_id)
+
+    async def trash_purge_expired(self, ttl_days: float, *,
+                                  now: float | None = None) -> int:
+        return await self.run(self.sync.trash_purge_expired, ttl_days, now=now)

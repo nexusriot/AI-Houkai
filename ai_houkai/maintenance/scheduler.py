@@ -68,6 +68,7 @@ class TickResult:
     decayed: int = 0
     reflected: int = 0
     purged: int = 0
+    trash_purged: int = 0
     decay_error: str | None = None
     reflect_error: str | None = None
     purge_error: str | None = None
@@ -95,7 +96,10 @@ class TickResult:
             if self.purge_error:
                 parts.append(f"purge FAILED: {self.purge_error}")
             else:
-                parts.append(f"purge removed {self.purged}")
+                summary = f"purge removed {self.purged}"
+                if self.trash_purged:
+                    summary += f" (+{self.trash_purged} past trash retention)"
+                parts.append(summary)
         return " | ".join(parts) if parts else "nothing to do"
 
 
@@ -140,6 +144,7 @@ class MaintenanceScheduler:
         decay_every: int | None = 86_400,
         reflect_every: int | None = 604_800,
         purge_every: int | None = 86_400,
+        trash_ttl_days: float = 30.0,
         tick_interval: int = 300,
         state_path: str = "~/.ai_houkai/maintenance.state.json",
         decay_rate: float = 0.1,
@@ -155,6 +160,7 @@ class MaintenanceScheduler:
         self.decay_every = decay_every
         self.reflect_every = reflect_every
         self.purge_every = purge_every
+        self.trash_ttl_days = trash_ttl_days
         self.tick_interval = tick_interval
         self.state_path = state_path
         self.decay_rate = decay_rate
@@ -248,6 +254,19 @@ class MaintenanceScheduler:
                     state.last_purge_at = t
                     state.total_purged += result.purged
                     logger.info("Purge: removed %d expired memories", result.purged)
+                    # Trash retention rides the same tick. Without it a
+                    # "recoverable delete" is really a permanent archive and the
+                    # trash file grows forever. 0 days disables it, and is not
+                    # read as "purge everything".
+                    if self.trash_ttl_days > 0:
+                        dropped = self.store.trash_purge_expired(
+                            self.trash_ttl_days, now=t)
+                        result.trash_purged = dropped
+                        state.total_trash_purged += dropped
+                        if dropped:
+                            logger.info(
+                                "Purge: dropped %d trashed memories past the "
+                                "%s-day retention", dropped, self.trash_ttl_days)
                 except Exception as exc:
                     result.purge_error = str(exc)
                     logger.exception("Purge run failed: %s", exc)

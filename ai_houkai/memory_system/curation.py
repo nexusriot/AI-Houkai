@@ -1,6 +1,5 @@
 """Curation operations: merge, versions, tag management, path-finding, trash.
 
-
 These grew up in ai-houkai-service, which implemented them by reaching through
 the library's private API — ``store._get_by_id``, ``store._get_all_memories``,
 ``store.collection.update``, ``store._journal``. Every one is a store-level
@@ -8,20 +7,16 @@ primitive: re-pointing an incoming link, rewriting a tag across the collection
 and walking the link graph all need the store's own write path and journal, and
 a downstream consumer cannot do them correctly from outside.
 
-
 They live in a separate module rather than growing ``store.py`` further, and
 attach to :class:`MemoryStore` as mixin methods, so ``store.merge(...)`` works
 without a second object to thread around.
-
 
 **Trash** fills the gap between ``supersede`` (soft, but semantically "replaced
 by X") and ``forget`` (irreversible): a recoverable delete. Decay pruning
 hard-deletes today, so a mis-tuned ``min_score`` is unrecoverable.
 """
 
-
 from __future__ import annotations
-
 
 import gzip
 import json
@@ -31,9 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-
 from .journal import JournalEntry
-
+from .trust import worst_trust
 
 __all__ = [
     "CurationMixin",
@@ -43,9 +37,9 @@ __all__ = [
     "Version",
 ]
 
-
 # Where trashed memories are parked, relative to the store's parent directory.
 TRASH_FILENAME = "trash.jsonl.gz"
+
 
 
 class MergeError(ValueError):
@@ -118,6 +112,16 @@ class CurationMixin:
 
         before = target.to_dict()
         target.text = target.text + separator + other.text
+
+        # The merged text now contains `other`'s content, so the result can be
+        # no more trustworthy than its least trustworthy half. Without this,
+        # merging is a laundering path: absorb an untrusted memory into a
+        # trusted one and the provenance label silently survives.
+        target.trust = worst_trust((target.trust, other.trust))
+        # The pin is the union of the two sides: `other` is deleted by the
+        # merge, so a pin that does not travel is destroyed outright and the
+        # working set silently loses a standing instruction.
+        target.pinned = target.pinned or other.pinned
 
         existing = {(lnk.to, lnk.rel) for lnk in target.links}
         for lnk in other.links:
@@ -200,17 +204,18 @@ class CurationMixin:
 
     def list_tags(self, *, include_superseded: bool = False
                   ) -> list[tuple[str, int]]:
-        """Every tag with its usage count, most-used first then alphabetical."""
-        if self.index is not None and self.index.healthy:
-            counts = self.index.tag_counts(
-                include_superseded=include_superseded)
-        else:
-            counts = {}
-            for m in self.list_recent(limit=0 or 10**9,
-                                      include_superseded=include_superseded,
-                                      include_expired=True):
-                for t in m.tags:
-                    counts[t] = counts.get(t, 0) + 1
+        """Every tag with its usage count, most-used first then alphabetical.
+
+        Requires a full read: tags are stored comma-joined in a single metadata
+        field, so Chroma cannot group by them. Tag cardinality is low and this
+        is a curation command rather than a hot path, so one scan is acceptable.
+        """
+        counts: dict[str, int] = {}
+        for m in self.list_recent(limit=10**9,
+                                  include_superseded=include_superseded,
+                                  include_expired=True):
+            for t in m.tags:
+                counts[t] = counts.get(t, 0) + 1
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
     def _rewrite_tags(self, fn: Callable[[list[str]], list[str] | None]) -> int:
@@ -288,7 +293,8 @@ class CurationMixin:
         ``max_depth``. Undirected because "how are these two related?" does not
         care which way the author happened to draw the arrow.
 
-        Adjacency comes from the sidecar index when enabled; otherwise it is
+        Adjacency requires reading every memory, because Chroma cannot query
+        the link metadata; it is
         built from a single full scan — one scan, not one per hop.
         """
         if self.get(from_id) is None or self.get(to_id) is None:
@@ -389,6 +395,28 @@ class CurationMixin:
             self._write_trash([])
             return len(entries)
         keep = [e for e in entries if e.memory_id != memory_id]
+        purged = len(entries) - len(keep)
+        if purged:
+            self._write_trash(keep)
+        return purged
+
+    def trash_purge_expired(self, ttl_days: float, *,
+                            now: float | None = None) -> int:
+        """Drop trashed memories deleted more than *ttl_days* ago.
+
+        Retention, not reclamation: without it a recoverable delete is really a
+        permanent archive, and the trash file grows without bound. Meant to be
+        driven from a scheduler so the policy holds whether or not anyone runs a
+        maintenance pass by hand.
+
+        ``ttl_days <= 0`` is a no-op rather than "purge everything" — a
+        misconfigured or unset retention must never be read as "delete it all".
+        """
+        if ttl_days <= 0:
+            return 0
+        cutoff = (now if now is not None else time.time()) - ttl_days * 86_400
+        entries = self._read_trash()
+        keep = [e for e in entries if e.deleted_at >= cutoff]
         purged = len(entries) - len(keep)
         if purged:
             self._write_trash(keep)

@@ -51,5 +51,6 @@ def recall(
         )
     if not results:
         typer.echo("No memories found.", err=True)
-        return
+        if not out.is_machine_format(fmt):
+            return
     out.print_memories_table(results, show_score=True, fmt=fmt)

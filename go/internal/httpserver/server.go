@@ -487,7 +487,17 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	if !stored {
-		return 409, conflictPayload(conflicts), nil
+		// Two very different reasons to write nothing. A conflict policy
+		// rejected the write → 409 with the conflicts. An idempotent repeat
+		// found the existing row and bumped it → the feature working, so 200
+		// with that row and stored:false. Mapping both onto 409 made every
+		// replayed batch fail against a store that already knew the fact.
+		if len(conflicts) > 0 {
+			return 409, conflictPayload(conflicts), nil
+		}
+		out := memDict(mem)
+		out["stored"] = false
+		return 200, out, nil
 	}
 	out := memDict(mem)
 	out["stored"] = true
@@ -535,18 +545,32 @@ func (s *Server) rememberMany(r *http.Request) (int, any, error) {
 	if v, ok := b["batch_size"].(float64); ok {
 		batchSize = int(v)
 	}
+	started := float64(time.Now().UnixNano()) / 1e9
 	mems, err := s.store.RememberMany(
 		r.Context(), items, batchSize,
 		memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
+		bodyBool(b, "idempotent"),
 	)
 	if err != nil {
 		return 0, nil, err // validation (raise / bad item) → 400 via wrap
 	}
 	out := make([]map[string]any, len(mems))
+	// `stored` is how many rows the batch CREATED. An idempotent replay returns
+	// the pre-existing rows, and reporting len(mems) told the client it had
+	// written N rows when it had written none. Counting distinct new ids also
+	// collapses intra-batch duplicates, which map to one row.
+	created := map[string]bool{}
 	for i, m := range mems {
 		out[i] = memDict(m)
+		if m.CreatedAt >= started {
+			created[m.ID] = true
+		}
 	}
-	return 201, map[string]any{"stored": len(mems), "memories": out}, nil
+	status := 201
+	if len(created) == 0 {
+		status = 200
+	}
+	return status, map[string]any{"stored": len(created), "memories": out}, nil
 }
 
 func (s *Server) getOne(r *http.Request) (int, any, error) {
@@ -1236,6 +1260,11 @@ func memDict(m memory.Memory) map[string]any {
 		"superseded_by": superseded,
 		"superseded_at": supersededAt,
 		"expires_at":    expiresAt,
+		// Always present, never elided to null: a REST client can set these on
+		// a write, so it has to be able to read them back — and "absent" would
+		// be indistinguishable from "not pinned" / "unlabelled".
+		"pinned": m.Pinned,
+		"trust":  string(memory.TrustOrDefault(m.Trust)),
 	}
 }
 

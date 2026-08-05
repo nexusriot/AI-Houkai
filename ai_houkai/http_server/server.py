@@ -9,7 +9,7 @@ Routes (all JSON in / JSON out):
     GET    /memories?limit=&include_superseded=&include_expired=
                                            recent memories (list_recent)
     POST   /memories                       store a memory (remember; ttl_seconds/expires_at)
-    POST   /memories/batch                 bulk store with batched embedding (remember_many)
+    POST   /memories/batch                 bulk store with batched embedding (remember_many; idempotent?)
     GET    /memories/{id}                  fetch one memory
     PATCH  /memories/{id}                  edit fields in place (journaled; expires_at)
     DELETE /memories/{id}                  forget one memory
@@ -61,6 +61,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
@@ -101,6 +102,11 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         "superseded_by": mem.superseded_by or None,
         "superseded_at": mem.superseded_at or None,
         "expires_at": mem.expires_at or None,
+        # Always present, never elided to null: a REST client can set these on
+        # a write, so it has to be able to read them back — and "absent" would
+        # be indistinguishable from "not pinned" / "unlabelled".
+        "pinned": mem.pinned,
+        "trust": mem.trust,
     }
 
 
@@ -315,6 +321,12 @@ def _get_at(store: MemoryStore, m, q, b):
 
 def _remember(store: MemoryStore, m, q, b):
     text = _require(b, "text")
+    # Asked before the write, because remember() returns the existing row on a
+    # dedupe hit and there is otherwise no way to tell it from a fresh one.
+    # 201/stored:true has to mean "I created something": a client replaying a
+    # batch every session was told it wrote N new rows when it wrote none.
+    deduped = (_body_bool(b, "idempotent")
+               and store.find_by_content_hash(text) is not None)
     try:
         mem = store.remember(
             text=text,
@@ -341,6 +353,8 @@ def _remember(store: MemoryStore, m, q, b):
                 for c in e.conflicts
             ],
         }
+    if deduped:
+        return 200, {"stored": False, **_mem_dict(mem)}
     return 201, {"stored": True, **_mem_dict(mem)}
 
 
@@ -369,16 +383,25 @@ def _remember_many(store: MemoryStore, m, q, b):
             expires_at=_body_float(it, "expires_at"),
             ttl_seconds=_body_float(it, "ttl_seconds"),
         ))
+    started = time.time()
     try:
         mems = store.remember_many(
             items,
             batch_size=_body_int(b, "batch_size", 128),
             on_conflict=b.get("on_conflict"),
+            idempotent=_body_bool(b, "idempotent"),
         )
     except ValueError as e:
         # bad type/tag/policy (incl. on_conflict='raise') → 400, not 500
         raise HttpError(400, str(e))
-    return 201, {"stored": len(mems), "memories": [_mem_dict(x) for x in mems]}
+    # `stored` is how many rows the batch CREATED. An idempotent replay returns
+    # the pre-existing rows, and reporting len(mems) told the client it had
+    # written N rows when it had written none. Counting distinct new ids also
+    # collapses intra-batch duplicates, which map to one row.
+    created = {x.id for x in mems if x.created_at >= started}
+    status = 201 if created else 200
+    return status, {"stored": len(created),
+                    "memories": [_mem_dict(x) for x in mems]}
 
 
 def _get_one(store: MemoryStore, m, q, b):

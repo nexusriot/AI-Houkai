@@ -22,10 +22,6 @@ class Config:
     default_type: str
     default_importance: float | str   # a float, or "auto" → heuristic scorer
     editor: str
-    # "sqlite" enables the derived metadata/FTS sidecar index; None keeps the
-    # historical full-scan reads. An existing store needs `houkai reindex`
-    # after switching this on.
-    index: str | None = None
 
 
 @dataclass
@@ -52,6 +48,10 @@ class MaintenanceConfig:
     # summary, "hard" deletes them. Default soft — without consolidation a
     # scheduled apply-mode reflection re-summarises the same clusters forever.
     reflect_consolidate: bool | str = True
+    # Retention for trashed memories, swept on the same tick as the TTL purge.
+    # 0 keeps them forever. Defaulted so an existing constructor keeps working —
+    # a new config field must not break callers.
+    trash_ttl_days: float = 30.0
 
 
 def _resolve_importance(value: object) -> float | str:
@@ -104,8 +104,6 @@ def load() -> Config:
             file_cfg.get("default_importance", 0.5)
         ),
         editor=file_cfg.get("editor") or os.environ.get("EDITOR", "nano"),
-        index=(os.environ.get("AI_HOUKAI_INDEX")
-               or file_cfg.get("index")) or None,
     )
 
 
@@ -126,6 +124,7 @@ def load_maintenance() -> MaintenanceConfig:
         decay_every=_resolve_interval(m.get("decay_every", "24h")),
         reflect_every=_resolve_interval(m.get("reflect_every", "7d")),
         purge_every=_resolve_interval(m.get("purge_every", "24h")),
+        trash_ttl_days=float(m.get("trash_ttl_days", 30.0)),
         tick_interval=_resolve_interval(m.get("tick_interval", "5m")) or 300,
         log_path=os.path.expanduser(
             str(m.get("log_path", str(_HOUKAI_DIR / "maintenance.log")))

@@ -2,6 +2,7 @@ package eval
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -209,5 +210,47 @@ func TestLoadGoldsetErrors(t *testing.T) {
 func TestLoadGoldsetMissingFile(t *testing.T) {
 	if _, err := LoadGoldset(filepath.Join(t.TempDir(), "absent.jsonl")); err == nil {
 		t.Error("expected an error for a missing file")
+	}
+}
+
+// Golden metric values, duplicated verbatim in tests/test_eval.py
+// (TestPortParityGoldenValues). The eval harness's whole purpose is measuring
+// ranking changes, so the two ports disagreeing by even a rounding step would
+// make a cross-port comparison meaningless. Any change to these numbers must be
+// made in both files, deliberately.
+func TestPortParityGoldenValues(t *testing.T) {
+	for _, c := range []struct {
+		retrieved, relevant             []string
+		k                               int
+		recall, precision, rr, ap, ndcg float64
+	}{
+		{[]string{"a", "x", "b", "y"}, []string{"a", "b"}, 4,
+			1.000000, 0.500000, 1.000000, 0.833333, 0.919721},
+		{[]string{"x", "y", "z"}, []string{"a"}, 3,
+			0.000000, 0.000000, 0.000000, 0.000000, 0.000000},
+		// A duplicated retrieved id is credited once, so nothing exceeds 1.0.
+		{[]string{"a", "a", "b"}, []string{"a", "b"}, 3,
+			1.000000, 1.000000, 1.000000, 0.833333, 0.919721},
+		// k truncates recall but not RR/AP, which score the full ranking.
+		{[]string{"b", "a"}, []string{"a", "b"}, 1,
+			0.500000, 1.000000, 1.000000, 1.000000, 1.000000},
+		{nil, []string{"a"}, 5,
+			0.000000, 0.000000, 0.000000, 0.000000, 0.000000},
+	} {
+		t.Run(fmt.Sprintf("%v_k%d", c.retrieved, c.k), func(t *testing.T) {
+			near(t, RecallAtK(c.retrieved, c.relevant, c.k), c.recall, "recall")
+			near(t, PrecisionAtK(c.retrieved, c.relevant, c.k), c.precision, "precision")
+			near(t, ReciprocalRank(c.retrieved, c.relevant), c.rr, "rr")
+			near(t, AveragePrecision(c.retrieved, c.relevant), c.ap, "ap")
+			near(t, NDCGAtK(c.retrieved, c.relevant, c.k), c.ndcg, "ndcg")
+		})
+	}
+}
+
+// near compares to the same 1e-6 tolerance the Python golden test uses.
+func near(t *testing.T, got, want float64, label string) {
+	t.Helper()
+	if math.Abs(got-want) > 1e-6 {
+		t.Errorf("%s = %.6f, want %.6f (Python port disagrees)", label, got, want)
 	}
 }

@@ -1,6 +1,5 @@
 """End-to-end functional tests — black-box, against the *installed* artifacts.
 
-
 Unlike the unit suite in ``tests/`` (which imports ``MemoryStore`` in-process),
 these drive the real deployment surface:
 
@@ -10,25 +9,20 @@ these drive the real deployment surface:
   * the ``ai-houkai-serve`` HTTP server, started as its own process and hit
     over a real socket — including a concurrency regression test.
 
-
 They are intentionally kept *out* of ``testpaths`` (see pyproject) so a plain
 ``pytest`` run stays fast and never spawns servers. Run them explicitly:
 
     pytest functional_tests/ -v
 
-
 or, hermetically, inside the container (see functional_tests/Dockerfile):
 
     ./functional_tests/run.sh
-
 
 Requires the package installed with the ``cli`` extra (``pip install ".[cli]"``)
 so the ``houkai`` / ``ai-houkai-serve`` entry points are on PATH.
 """
 
-
 from __future__ import annotations
-
 
 import contextlib
 import json
@@ -43,12 +37,9 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
 import pytest
 
-
 COLLECTION = "func"
-
 
 # Every CLI subprocess gets a generous timeout: the first invocation in a fresh
 # process pays a one-off cost to load the sentence-transformers model.
@@ -57,7 +48,6 @@ _CLI_TIMEOUT = 180
 
 def _have_cli() -> bool:
     return shutil.which("houkai") is not None and shutil.which("ai-houkai-serve") is not None
-
 
 pytestmark = pytest.mark.skipif(
     not _have_cli(),
@@ -317,7 +307,6 @@ def http_server(tmp_path):
     with _serve(tmp_path) as base:
         yield base
 
-
 # Bearer token used by the auth-enabled server fixture.
 _AUTH_TOKEN = "func-secret-token"
 
@@ -521,17 +510,14 @@ def test_http_auth_enforced(http_server_auth):
                          headers={"Authorization": f"Bearer {token}"})
     assert status == 200 and "count" in body
 
-
 if __name__ == "__main__":  # allow `python functional_tests/test_e2e.py`
     sys.exit(pytest.main([__file__, "-v"]))
-
 
 #
 # The unit suite already pins the semantics of everything below, in-process.
 # What only these can catch is the deployment wiring: console-script argument
-# parsing, and — for the sidecar index — state that has to stay consistent
-# across process boundaries, which every in-process test papers over by
-# holding one long-lived store.
+# parsing, and state that has to stay consistent across process boundaries —
+# which every in-process test papers over by holding one long-lived store.
 
 
 def list_ids(store: str) -> list[str]:
@@ -622,51 +608,6 @@ def test_cli_pinned_trust_and_idempotent(tmp_path):
     houkai(store, "remember", "Use ruff for linting", "--idempotent")
     houkai(store, "remember", "use  ruff for linting", "--idempotent")
     assert len(list_ids(store)) == before + 1
-
-
-def test_cli_sidecar_index_persists_across_processes(tmp_path):
-    """The sidecar's whole risk is divergence from Chroma between runs.
-
-    Every CLI invocation opens a fresh store, so this exercises the write-
-    through path, the on-open count check, and the FTS lexical channel against
-    an index that was built by *earlier* processes.
-    """
-    store = str(tmp_path / "chroma")
-    env_index = {"AI_HOUKAI_INDEX": "sqlite"}
-
-    def indexed(*args, **kw):
-        cmd = ["houkai", "-S", store, "-C", COLLECTION, *args]
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=_CLI_TIMEOUT, env={**os.environ, **env_index})
-        if kw.get("check", True) and proc.returncode != 0:
-            raise AssertionError(
-                f"`{' '.join(cmd)}` exited {proc.returncode}\n"
-                f"── stdout ──\n{proc.stdout}\n── stderr ──\n{proc.stderr}")
-        return proc
-
-    # Writes from three separate processes must all land in the index.
-    indexed("remember", "the quetzalcoatlus deployment checklist")
-    indexed("remember", "an unrelated note on gardening")
-    hub = indexed("remember", "the hub memory").stdout.strip().splitlines()[-1]
-
-    report = json.loads(indexed("reindex", "--json").stdout)
-    assert report["enabled"] is True and report["healthy"] is True
-    assert report["indexed"] == 3
-
-    # A fresh process reads the index built by the previous ones.
-    listing = json.loads(indexed("list", "--format", "json").stdout)
-    assert len(listing) == 3
-
-    # Reverse links resolve through the index rather than a full scan.
-    src = indexed("remember", "points at the hub").stdout.strip().splitlines()[-1]
-    indexed("link", src, hub, "--rel", "refines")
-    neighbours = json.loads(
-        indexed("neighbors", hub, "--direction", "in", "--format", "json").stdout)
-    assert [n["id"] for n in neighbours] == [src]
-
-    # And the store still reads correctly with the index switched back OFF —
-    # the sidecar is a cache, so disabling it must not lose anything.
-    assert len(list_ids(store)) == 4
 
 
 def test_cli_eval_scores_a_goldset(tmp_path):

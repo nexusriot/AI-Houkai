@@ -2,8 +2,12 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/nexusriot/ai-houkai/internal/vector"
 )
 
 // Pinned tier (F3), idempotent writes (F4) and the trust tier (G).
@@ -290,5 +294,213 @@ func TestOldRowsReadAsTrusted(t *testing.T) {
 	}
 	if TrustRank(m.Trust) > TrustRank(TrustTrusted) {
 		t.Error("a legacy row must survive min_trust=trusted")
+	}
+}
+
+// A pinned memory is a standing-instruction slot (docs/DESIGN.md §27).
+// Superseding one is how you correct a standing instruction, but the pin was
+// dropped and a superseded row is out of the working set — so the slot silently
+// emptied and the agent stopped seeing the rule.
+func TestSupersedeCarriesThePin(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	old, _, _, err := store.Remember(ctx, "indent with tabs",
+		RememberOpts{Pinned: true})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	fresh, _, _, err := store.Remember(ctx, "indent with four spaces", RememberOpts{})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if err := store.Supersede(ctx, old.ID, fresh.ID); err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+
+	got, err := store.GetByID(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if !got.Pinned {
+		t.Error("replacement is not pinned — the standing-instruction slot emptied")
+	}
+	pinned, err := store.PinnedMemories(ctx)
+	if err != nil {
+		t.Fatalf("PinnedMemories: %v", err)
+	}
+	if len(pinned) != 1 || pinned[0].ID != fresh.ID {
+		t.Fatalf("working set = %+v, want just the replacement", pinned)
+	}
+}
+
+func TestSupersedeOfAnUnpinnedMemoryPinsNothing(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	old, _, _, _ := store.Remember(ctx, "a plain fact", RememberOpts{})
+	fresh, _, _, _ := store.Remember(ctx, "a corrected plain fact", RememberOpts{})
+	if err := store.Supersede(ctx, old.ID, fresh.ID); err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+
+	got, _ := store.GetByID(ctx, fresh.ID)
+	if got.Pinned {
+		t.Error("replacement was pinned out of nowhere")
+	}
+}
+
+// Supersede keeps both rows, each with its own provenance — unlike merge, which
+// folds two into one and must take the worse label.
+func TestSupersedeDoesNotCarryTrust(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	old, _, _, _ := store.Remember(ctx, "reported claim",
+		RememberOpts{Pinned: true, Trust: TrustReported})
+	fresh, _, _, _ := store.Remember(ctx, "verified replacement", RememberOpts{})
+	if err := store.Supersede(ctx, old.ID, fresh.ID); err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+
+	got, _ := store.GetByID(ctx, fresh.ID)
+	if got.Trust != TrustTrusted {
+		t.Errorf("trust = %q, want %q", got.Trust, TrustTrusted)
+	}
+}
+
+// Undoing a supersede must not leave two rows of one chain in the working set.
+func TestRestoreHandsThePinBack(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	old, _, _, _ := store.Remember(ctx, "original rule", RememberOpts{Pinned: true})
+	fresh, _, _, _ := store.Remember(ctx, "replacement rule", RememberOpts{})
+	if err := store.Supersede(ctx, old.ID, fresh.ID); err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+	if ok, err := store.Restore(ctx, old.ID); err != nil || !ok {
+		t.Fatalf("Restore = %v, %v", ok, err)
+	}
+
+	back, _ := store.GetByID(ctx, old.ID)
+	replacement, _ := store.GetByID(ctx, fresh.ID)
+	if !back.Pinned {
+		t.Error("restored memory lost its pin")
+	}
+	if replacement.Pinned {
+		t.Error("replacement kept the inherited pin after the undo")
+	}
+	pinned, _ := store.PinnedMemories(ctx)
+	if len(pinned) != 1 || pinned[0].ID != old.ID {
+		t.Fatalf("working set = %+v, want just the restored memory", pinned)
+	}
+}
+
+// countingBackend records how many rows each backend call had to materialise,
+// so a hot-path lookup can be shown to push its filter into the store rather
+// than loading the collection into Go.
+type countingBackend struct {
+	vector.Backend
+	allRows      int
+	allCalls     int
+	metadataHits int
+}
+
+func (b *countingBackend) All(ctx context.Context) ([]vector.Item, error) {
+	items, err := b.Backend.All(ctx)
+	b.allCalls++
+	b.allRows += len(items)
+	return items, err
+}
+
+func (b *countingBackend) SearchMetadata(ctx context.Context, where map[string]string,
+	limit int) ([]vector.Item, error) {
+	items, err := b.Backend.SearchMetadata(ctx, where, limit)
+	b.metadataHits++
+	return items, err
+}
+
+// Python pushes the pinned lookup into Chroma as a `where` filter because it
+// sits on the recall_pack / auto_context hot path; this port kept scanning the
+// whole collection on every pack call, so the cheapest part of the packer was
+// the most expensive. chromem-go's Where is exact-match on string metadata,
+// which is exactly what `pinned` is stored as.
+func TestPinnedLookupDoesNotScanTheCollection(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	inner, err := vector.NewChromem(filepath.Join(dir, "s"), "test", 16)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	t.Cleanup(func() { _ = inner.Close() })
+	counting := &countingBackend{Backend: inner}
+	store := NewMemoryStore(counting, &stubEmbedder{dim: 16},
+		DefaultStoreConfig(dir, "test"))
+
+	for i := 0; i < 30; i++ {
+		if _, _, _, err := store.Remember(ctx,
+			fmt.Sprintf("filler row %d", i), RememberOpts{}); err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+	}
+	want, _, _, err := store.Remember(ctx, "the standing instruction",
+		RememberOpts{Pinned: true})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+
+	counting.allRows, counting.allCalls = 0, 0
+	pinned, err := store.PinnedMemories(ctx)
+	if err != nil {
+		t.Fatalf("PinnedMemories: %v", err)
+	}
+	if len(pinned) != 1 || pinned[0].ID != want.ID {
+		t.Fatalf("pinned = %+v, want just the pinned row", pinned)
+	}
+	if counting.allCalls != 0 {
+		t.Errorf("loaded %d rows via %d All() calls — the filter must run in the "+
+			"store", counting.allRows, counting.allCalls)
+	}
+	if counting.metadataHits == 0 {
+		t.Error("no metadata-filtered query was issued")
+	}
+}
+
+// Superseded and expired rows are not part of the working set even when the
+// metadata filter matches them.
+func TestPinnedLookupSkipsDeadRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+
+	live, _, _, _ := store.Remember(ctx, "live instruction", RememberOpts{Pinned: true})
+	gone, _, _, _ := store.Remember(ctx, "retired instruction", RememberOpts{Pinned: true})
+	replacement, _, _, _ := store.Remember(ctx, "its replacement", RememberOpts{})
+	if err := store.Supersede(ctx, gone.ID, replacement.ID); err != nil {
+		t.Fatalf("Supersede: %v", err)
+	}
+	expired, _, _, _ := store.Remember(ctx, "expired instruction",
+		RememberOpts{Pinned: true, ExpiresAt: f64ptr(1)})
+
+	pinned, err := store.PinnedMemories(ctx)
+	if err != nil {
+		t.Fatalf("PinnedMemories: %v", err)
+	}
+	got := map[string]bool{}
+	for _, m := range pinned {
+		got[m.ID] = true
+	}
+	if !got[live.ID] {
+		t.Error("live pinned memory missing from the working set")
+	}
+	if got[gone.ID] {
+		t.Error("superseded memory is still in the working set")
+	}
+	if got[expired.ID] {
+		t.Error("expired memory is still in the working set")
+	}
+	// The replacement inherited the pin, so it belongs there.
+	if !got[replacement.ID] {
+		t.Error("the replacement should hold the inherited pin")
 	}
 }

@@ -43,6 +43,7 @@ func maintCfg(cfg Config) maintenance.Config {
 		DecayEvery:      float64(cfg.Maintenance.DecayEverySecs),
 		ReflectEvery:    float64(cfg.Maintenance.ReflectEverySecs),
 		PurgeEvery:      float64(cfg.Maintenance.PurgeEverySecs),
+		TrashTTLDays:    cfg.Maintenance.TrashTTLDays,
 		FrequencyWeight: cfg.Maintenance.Decay.FrequencyWeight,
 		Summarizer:      summ,
 	}
@@ -66,7 +67,11 @@ func tickSummary(res maintenance.TickResult) string {
 		parts = append(parts, fmt.Sprintf("reflect created %d", res.Reflected))
 	}
 	if res.RanPurge {
-		parts = append(parts, fmt.Sprintf("purge removed %d", res.Purged))
+		summary := fmt.Sprintf("purge removed %d", res.Purged)
+		if res.TrashPurged > 0 {
+			summary += fmt.Sprintf(" (+%d past trash retention)", res.TrashPurged)
+		}
+		parts = append(parts, summary)
 	}
 	if len(parts) == 0 {
 		return "nothing to do (jobs not due yet)"

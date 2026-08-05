@@ -33,7 +33,7 @@
 22. [Runtime Metrics](#22-runtime-metrics)
 23. [Port Parity](#23-port-parity)
 24. [Pluggable Embedding Backends](#24-pluggable-embedding-backends)
-25. [Metadata + Full-Text Sidecar Index](#25-metadata--full-text-sidecar-index)
+25. [Full-Corpus Lexical Recall](#25-full-corpus-lexical-recall)
 26. [Curation & Trash](#26-curation--trash)
 27. [Working Set: Pinned, Trust, Idempotent](#27-working-set-pinned-trust-idempotent)
 28. [Retrieval Evaluation](#28-retrieval-evaluation)
@@ -737,7 +737,7 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, ran_purge, decayed, reflected, purged, reflect_applied, decay_error, reflect_error, purge_error}` |
+| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, ran_purge, decayed, reflected, purged, trash_purged, reflect_applied, decay_error, reflect_error, purge_error}` |
 | `journal_tail` | `n?`, `op?`, `since_seconds?` | `list[{ts,op,actor,id,summary,meta}]` (newest first) |
 | `history` | `memory_id` | `list[{ts,op,actor,id,before,after,meta,summary}]` — full timeline, oldest first (§18) |
 | `state_at` | `ts` | `{ts, count, memories:[…]}` — store reconstructed as of `ts` (§18) |
@@ -1056,7 +1056,7 @@ LLM API  ──►  assistant reply to user
 | `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
 | `test_metrics.py` | 7 | **Runtime metrics**: op counters (incl. link/unlink/restore/purge mutators), recall-latency recording + p50/p95/p99 percentiles, empty-recall counting, backend count |
 | `test_curation.py` | 49 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
-| `test_sidecar.py` | 38 | **SQLite sidecar index**: opt-in gating, write-through on every mutation path, FTS delete-then-insert (no duplicate rows on edit), reverse links, cursor pagination, full-corpus BM25 reaching a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, tag/type counts, indexed expiry sweep, count-mismatch → disable → scan fallback, `reindex` restoring health, and a write failure disabling rather than raising |
+| `test_corpus_lexical.py` | 15 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, and the Chroma-native `purge_expired` range query |
 | `test_working_set.py` | 36 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
 | `test_mcp_retrieval_knobs.py` | 35 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour |
 | `test_embed.py` | 31 | **Pluggable embedder**: OpenAI-compatible + Ollama backends against a stub server (auth, batching, out-of-order reindexing, count mismatch, wrapped errors), `build_embedder` spec grammar, credentials never from the spec, the store seam + env var + precedence, `FakeEmbedder` determinism/normalisation, and a full store round-trip with no model |
@@ -1374,7 +1374,7 @@ store.recall(query, k, reranker=my_cross_encoder)        # second-stage rerank
 store.recall(query, k, include_expired=True)             # keep TTL-expired hits
 store.recall(query, k, mode="hybrid",
              weights=HybridWeights(graph=0.15))          # graph-proximity fusion
-store.recall(query, k, mode="hybrid", lexical_index="fts")   # full-corpus BM25 (§25)
+store.recall(query, k, mode="hybrid", lexical_index="corpus") # full-corpus lexical (§25)
 store.recall(query, k, min_trust="trusted")              # provenance floor (§27)
 
 # Graph-walk expansion after scoring (multi-hop BFS)
@@ -1762,6 +1762,14 @@ The **purge job** reclaims TTL-expired memories: it calls
 files load unchanged). It is safe to run always-on: expired memories are a new
 concept, so an existing store has none, and the job only ever deletes memories
 whose TTL has already passed.
+
+**Trash retention rides the same job**: after a successful purge the tick calls
+`trash_purge_expired(trash_ttl_days)` (§26, default 30; `<= 0` disables it) and
+accumulates `total_trash_purged`. This matters more now that decay pruning
+routes into the trash — without retention the file would grow with every prune.
+Both ports report the sweep as `trash_purged` on the tick result and in the
+one-line summary; the Go port reads it from `trash_ttl_days` in
+`[maintenance]`.
 
 **Concurrent tickers serialise.** The whole load→run→save cycle holds an
 exclusive `flock` on `<state file>.lock`, so the daemon loop, a cron tick,
@@ -2175,78 +2183,74 @@ absent).
 
 ---
 
-## 25. Metadata + Full-Text Sidecar Index
+## 25. Full-Corpus Lexical Recall
 
-Chroma is authoritative for text, metadata and vectors, but it is not a
-metadata query engine — no reverse-link lookup, no cursor pagination, no tag
-aggregation. So the store scanned the whole collection for work that is one
-line of SQL:
+`_bm25_score_pool` scores lexical relevance only over the vector over-fetch
+pool. The pool is selected by embedding distance alone, so a memory carrying the
+query's exact tokens but embedding weakly never enters it — and therefore can
+never be surfaced by the BM25 term, at any corpus size.
 
-| Call site | Cost before |
-|---|---|
-| `list_recent` | load every row, sort in Python, slice |
-| `_get_all_memories` / `export` / `stats` | load every row |
-| `purge_expired` | load every row to find the few that lapsed |
-| `neighbors(direction="in"\|"both")` | load every row, **once per frontier node per hop** |
-| `DecayEngine.score_all` | `list_recent(limit=100_000)` |
-| `ReflectionEngine` | every candidate row, *with embeddings* |
+`recall(lexical_index="corpus")` closes that gap with Chroma's own
+`where_document={"$contains": token}` filter, which scans the collection
+server-side and works on the ranked query path. `_lexical_candidates` probes the
+four longest query tokens (longest = most selective, and each probe is a scan),
+skips tokens under three characters, and unions the resulting ids into the pool
+before scoring.
 
-`neighbors(depth=2, direction="both")` on a node with ten neighbours therefore
-performed eleven full-collection loads — worse than its own docstring claimed.
+Unioned candidates get their **real** cosine distance, computed against a
+freshly embedded query vector (Chroma does not return the vector it used).
+Fabricating one is wrong in both directions: a neutral value invents vector
+evidence the candidate never earned, and a worst-case value (−1 similarity ×
+the 0.55 cosine weight) buries it below anything the 0.20 lexical weight could
+recover, making the channel decorative. Metadata filters are applied during
+candidate selection, so a lexical hit obeys `type`/`source`/`importance`/date
+filters exactly as a vector hit does.
 
-### Design
+Off by default (`"pool"`), because the scan is real: ~4.5 ms at 25k memories,
+growing linearly.
 
-An **opt-in** SQLite file beside `.chroma` (`index="sqlite"` or
-`AI_HOUKAI_INDEX=sqlite`) mirroring the metadata, plus an FTS5 table over the
-text. Tables: `memories`, `links` (indexed on `dst` — the whole point),
-`tags`, `meta`, and `memories_fts`.
+### Why there is no sidecar index
 
-Writes are mirrored by `IndexedCollection`, a write-through proxy around the
-Chroma collection. Wrapping the collection rather than patching call sites is
-deliberate: the store writes through `add`/`update`/`delete` from sixteen
-places, and an index that misses one is worse than no index at all. An `add`
-supplies both document and metadata so the row is built directly; a
-metadata-only `update` triggers a read-back so the index never records stale
-text.
+An earlier iteration shipped an opt-in SQLite metadata + FTS5 sidecar beside
+`.chroma`, claiming five payoffs: full-corpus BM25, cursor pagination, O(1)
+reverse links, tag counts, and an indexed expiry sweep. Measurement retired it:
 
-The FTS table is **standalone, not external-content**. External content halves
-the storage but makes correctness depend on hand-maintaining rowid deltas —
-issuing the `'delete'` command for a row that was never indexed makes SQLite
-report `database disk image is malformed`. Duplicating the text into a
-rebuildable cache is the cheaper mistake.
+| Operation | 3k rows | 25k rows |
+|---|---|---|
+| Sidecar FTS lookup | 0.03 ms | 0.03 ms (flat — a real inverted index) |
+| Chroma `$contains` | 0.91 ms | 4.52 ms (linear) |
+| Sidecar `list_recent(50)` | 3.24 ms | **13.86 ms** |
+| Chroma `get(limit=50)` | 2.03 ms | **3.72 ms** |
 
-### It is a cache, never a source of truth
+Chroma turned out to do four of the five natively — and two of them *better*:
 
-Every read has a scan fallback. On open, the index's row count is compared with
-Chroma's; a mismatch **disables** it (as does any write failure), so reads
-degrade to *slower*, never to *wrong*. `houkai reindex` is the way back, and it
-is required after enabling the index on an existing store — silently trusting
-an empty table would make `list`/`neighbors` return nothing.
+- **Pagination** — `limit`/`offset`. The sidecar was ~4× slower, because serving
+  ids from the index and then fetching them from Chroma is two round-trips.
+- **Expiry sweep** — `where={"$and": [{"expires_at": {"$gt": 0}}, …]}`.
+  `purge_expired` now pushes the range down instead of loading the collection.
+- **Type counts** — `where={"type": …}` with `include=[]`.
+- **Lexical reachability** — `where_document`, as above.
 
-### Full-corpus lexical recall
+What was genuinely lost is the *flat* lookup curve: at 10⁶ memories a linear
+scan is ~180 ms where an inverted index stays at 0.03 ms. That is a real trade,
+made deliberately. Against it: the sidecar was a second source of truth for data
+Chroma already held, so it needed verify-on-open, disable-on-mismatch and
+`reindex` machinery purely to keep a cache from lying; it duplicated the text; it
+was one database *per collection*, which in a multi-tenant deployment means N
+satellite files with N failure modes; and the primary consumer
+(`ai-houkai-service`) already runs its own WAL SQLite. Three SQLite databases in
+one stack — Chroma's, the service's, and one per collection — to save
+milliseconds on a path dominated by a 50–200 ms hosted embedding call.
 
-`_bm25_score_pool` only ever scored the vector over-fetch pool, so a memory
-matching the query's exact tokens but embedding weakly was unreachable at *any*
-corpus size — it never entered the pool to be scored.
-`recall(lexical_index="fts")` unions the sidecar's top BM25 ids into the pool
-first.
+The remaining structural gap is reverse links: Chroma stores `links` as an
+opaque metadata string, so "who points at me?" is not expressible as a `where`
+clause and `neighbors(direction="in")` reads every memory, once per frontier
+node per hop. The fix is to denormalise the edge — record a→b on both sides —
+which needs no index at all. Tracked in [ROADMAP.md](ROADMAP.md).
 
-Those newcomers get their **real** cosine distance, computed here against a
-freshly embedded query vector (Chroma does not hand back the vector it used).
-Fabricating one was tempting and wrong in both directions: a neutral value
-invents vector evidence the candidate never earned, and a worst-case value
-(−1 similarity × the 0.55 cosine weight) buries it far below anything the 0.20
-lexical weight could recover, making the channel decorative. Metadata filters
-are re-applied through Chroma's own `where` rather than re-implemented, so a
-lexical hit obeys `type`/`source`/`importance`/date filters exactly as a vector
-hit does.
-
-Free-text queries are tokenised and OR-quoted into a safe `MATCH` expression:
-users type prose, not FTS5 syntax, and a bare `-` or `"` would otherwise be an
-operator or a syntax error. OR rather than AND because this feeds a *candidate
-pool* — BM25 does the ranking.
-
----
+If a true inverted index is ever needed at scale, it belongs in the service's
+existing database where it can be shared across collections and maintained in
+one place, not as satellites the library manages behind Chroma's back.
 
 ## 26. Curation & Trash
 
@@ -2278,6 +2282,26 @@ missing middle — a recoverable delete, parked in a gzipped JSONL file beside
 the store. **Decay pruning now routes here instead of hard-deleting**, so a
 mis-tuned `min_score` is no longer unrecoverable.
 
+Entries are **appended** one gzip member at a time rather than rewritten, so
+binning N memories costs O(N) — the read-all-rewrite-all version made a
+400-memory prune take 2.16 s against 0.12 s. Both ports' readers (and Python's
+`gzip` module) consume concatenated members transparently, so a file written by
+either is readable by the other.
+
+`trash_purge_expired(ttl_days)` supplies retention, and the maintenance
+scheduler drives it on the same tick as the TTL purge (`trash_ttl_days`,
+default 30 days). Without it a recoverable delete is really a permanent
+archive and the file grows without bound. `ttl_days <= 0` is a **no-op** rather
+than "purge everything" — a misconfigured or unset retention must never be read
+as "delete it all". Surfaced as `houkai trash purge --older-than`,
+`older_than_days` on the `trash_purge` MCP tool, and `POST /trash/purge`.
+
+This is also why the library's trash is the one that survives when it is
+consumed by `ai-houkai-service`: the service's `trash` table had retention and
+cascade-on-collection-delete, and retention was the only one of those the
+library lacked. Cascade is implicit here, because the trash file lives beside
+the store it belongs to.
+
 ---
 
 ## 27. Working Set: Pinned, Trust, Idempotent
@@ -2290,8 +2314,21 @@ stores load unchanged.
 The only lever for "always consider this" was `importance`, which
 simultaneously drives ranking, decay survival and the `min_importance` filter —
 three jobs, one number. A pinned memory leads `recall_pack`/`auto_context`
-inside the token budget and is exempt from decay pruning and quota eviction,
-giving agents an explicit standing-instruction slot.
+inside the token budget and is exempt from decay pruning, giving agents an
+explicit standing-instruction slot. (Quota eviction is a ROADMAP item, not a
+feature yet; when it lands, pinned rows are exempt there too.)
+
+The pin **follows a supersede onto the replacement**, and `restore` hands it
+back, and `merge` takes the **union** of the two sides' pins — `other` is
+deleted by the merge, so a pin that does not travel is destroyed outright.
+Reflection does the same when it consolidates: a summary of a pinned
+source is born pinned under `soft` (which supersedes the sources) and `hard`
+(which deletes them), but not under `none`, where the sources stay live and
+pinned and a second pinned row would double the slot. Superseding a standing instruction is how you correct one, and a
+superseded row is out of the working set — without the transfer the slot
+silently emptied and the agent stopped seeing the rule. `trust` is deliberately
+not inherited: both rows survive with their own provenance, unlike `merge`,
+which folds two into one and must take the worse label.
 
 ### `trust`
 
@@ -2314,6 +2351,24 @@ and still creates a new row plus a supersede edge. A normalised-text
 `content_hash` lets `remember(idempotent=True)` return the existing memory and
 bump its access count instead, which matters most in `remember_many` where the
 conflict scan is per item.
+
+The surfaces have to **say which happened**. A dedupe hit creates nothing, so
+`POST /memories` answers `200` with `stored: false` and the existing row (a new
+write stays `201`/`stored: true`), and the `remember` MCP tool returns the row
+with `stored: false`. Both ports reported every idempotent repeat as a fresh
+write, so a client replaying its batch each session was told it had stored N new
+rows when it had stored none — and the Go REST port went further and answered
+`409` with an *empty* conflict list, turning the feature into a hard error
+against a store that already knew the fact. `409` is now reserved for an actual
+conflict rejection, which always carries its conflicts.
+`MemoryStore.find_by_content_hash(text)` is the public form of the lookup, so a
+caller can also ask before writing.
+
+`remember_many` follows the same rule: `stored` counts the rows **created**, not
+the items submitted — 0 for a fully replayed batch (`POST /memories/batch` then
+answers `200`), and intra-batch duplicates count once because they collapse to
+one row. Every input still maps to an entry in `ids` / `memories`, with
+duplicates sharing an id.
 
 ---
 

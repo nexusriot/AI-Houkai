@@ -87,6 +87,16 @@ func (s *MemoryStore) Merge(ctx context.Context, targetID, otherID, separator st
 	before := target.ToDict()
 	target.Text = target.Text + separator + other.Text
 
+	// The merged text now contains other's content, so the result can be no more
+	// trustworthy than its least trustworthy half. Without this, merging is a
+	// laundering path: absorb an untrusted memory into a trusted one and the
+	// provenance label silently survives.
+	target.Trust = WorstTrust(target.Trust, other.Trust)
+	// The pin is the union of the two sides: `other` is deleted by the merge,
+	// so a pin that does not travel is destroyed outright and the working set
+	// silently loses a standing instruction.
+	target.Pinned = target.Pinned || other.Pinned
+
 	existing := map[string]bool{}
 	for _, l := range target.Links {
 		existing[l.To+"\x00"+l.Rel] = true
@@ -209,9 +219,7 @@ func (s *MemoryStore) Versions(memoryID string) ([]Version, error) {
 // alphabetical.
 func (s *MemoryStore) ListTags(ctx context.Context, includeSuperseded bool) ([]TagCount, error) {
 	counts := map[string]int{}
-	if s.index != nil && s.index.Healthy() {
-		counts = s.index.TagCounts(includeSuperseded)
-	} else {
+	{
 		mems, err := s.ListRecent(ctx, 0, includeSuperseded, true)
 		if err != nil {
 			return nil, err
@@ -429,14 +437,7 @@ func (s *MemoryStore) Trash(ctx context.Context, memoryID string) (bool, error) 
 		MemoryID: mem.ID, DeletedAt: nowFloat(), Actor: s.actor,
 		Memory: mem.ToDict(),
 	}
-	if err := os.MkdirAll(filepath.Dir(s.TrashPath()), 0o755); err != nil {
-		return false, err
-	}
-	existing, err := s.TrashList()
-	if err != nil {
-		return false, err
-	}
-	if err := s.writeTrash(append(existing, entry)); err != nil {
+	if err := s.appendTrash(entry); err != nil {
 		return false, err
 	}
 	restore := s.AsActor("trash")
@@ -533,6 +534,70 @@ func (s *MemoryStore) TrashPurge(memoryID string) (int, error) {
 		return 0, nil
 	}
 	return purged, s.writeTrash(keep)
+}
+
+// TrashPurgeExpired drops trashed memories deleted more than ttlDays ago.
+//
+// Retention, not reclamation: without it a recoverable delete is really a
+// permanent archive and the trash file grows without bound. Meant to be driven
+// from a scheduler so the policy holds whether or not anyone runs a maintenance
+// pass by hand.
+//
+// ttlDays <= 0 is a no-op rather than "purge everything" — a misconfigured or
+// unset retention must never be read as "delete it all". now == 0 means the
+// current time.
+func (s *MemoryStore) TrashPurgeExpired(ttlDays float64, now float64) (int, error) {
+	if ttlDays <= 0 {
+		return 0, nil
+	}
+	if now == 0 {
+		now = nowFloat()
+	}
+	entries, err := s.TrashList()
+	if err != nil {
+		return 0, err
+	}
+	cutoff := now - ttlDays*86400
+	keep := make([]TrashEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.DeletedAt >= cutoff {
+			keep = append(keep, e)
+		}
+	}
+	purged := len(entries) - len(keep)
+	if purged == 0 {
+		return 0, nil
+	}
+	return purged, s.writeTrash(keep)
+}
+
+// appendTrash adds one entry as a new gzip member.
+//
+// Read-all-then-rewrite made N deletes cost O(N²) — 400 calls took 2.16s
+// against 137ms for the first 100 — and decay pruning routes through here in a
+// loop, so a large prune could stall a maintenance tick. Both this port's
+// reader and Python's gzip module read concatenated members transparently, so
+// the file stays compatible either way.
+func (s *MemoryStore) appendTrash(entry TrashEntry) error {
+	path := s.TrashPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	gz := gzip.NewWriter(f)
+	if err := json.NewEncoder(gz).Encode(entry); err != nil {
+		gz.Close()
+		f.Close()
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (s *MemoryStore) writeTrash(entries []TrashEntry) error {

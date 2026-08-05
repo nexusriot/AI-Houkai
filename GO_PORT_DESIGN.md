@@ -10,10 +10,10 @@ and the retrieval-eval harness).
 
 Parity is no longer a claim maintained by hand: [`parity.json`](parity.json) is
 the single source of truth and each port asserts against it in its own suite, so
-drift fails a build. The one deliberate gap is the SQLite sidecar index, which is
-Python-only — tracked in [docs/ROADMAP.md](docs/ROADMAP.md) Tier 1 #2 and
-deliberately absent from the manifest so it is an explicit gap rather than a
-silent lie.
+drift fails a build. There is no longer a Python-only feature gap: the SQLite
+sidecar index that used to be one was measured and removed from both ports (see
+[docs/DESIGN.md](docs/DESIGN.md) §25 for the numbers), and full-corpus lexical
+recall now rides each backend's own content predicate.
 
 > **This file is the original 2026-05-20 feasibility study, kept as a historical
 > record.** The counts and estimates below (22 MCP tools, 22 CLI commands, a

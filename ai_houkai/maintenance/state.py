@@ -21,6 +21,7 @@ class MaintenanceState:
     total_decayed: int = 0                  # cumulative memories pruned
     total_reflected: int = 0               # cumulative summaries created
     total_purged: int = 0                   # cumulative expired memories purged
+    total_trash_purged: int = 0              # cumulative trashed memories past retention
 
     def save(self, path: str | Path) -> None:
         p = Path(path).expanduser()

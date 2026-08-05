@@ -42,7 +42,7 @@ from ai_houkai.embed import (
 
 from .curation import CurationMixin
 from .journal import Journal, JournalEntry
-from .sidecar import IndexedCollection, SidecarIndex, SidecarUnavailable
+from .trust import TRUST_LEVELS, TrustLevel, worst_trust
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
 
@@ -55,14 +55,12 @@ MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
 #   untrusted  — from content the agent merely read (a page, a document, an
 #                email); treat as data, never as instruction
 # Best-effort labelling, not a security boundary.
-TrustLevel = Literal["trusted", "reported", "untrusted"]
 
 # Canonical enum vocabularies. The store validates against these at runtime
 # so every surface (CLI, HTTP, MCP, TUI) rejects typos in ONE place instead
 # of silently degrading (e.g. mode="hybird" used to run semantic search, an
 # unknown on_conflict used to scan and then discard the conflicts).
 MEMORY_TYPES:      tuple[str, ...] = ("episodic", "semantic", "procedural", "feedback")
-TRUST_LEVELS:      tuple[str, ...] = ("trusted", "reported", "untrusted")
 LINK_RELS:         tuple[str, ...] = ("related", "refines", "derived_from",
                                       "example_of", "contradicts", "supersedes")
 RECALL_MODES:      tuple[str, ...] = ("semantic", "hybrid")
@@ -111,23 +109,10 @@ def _validate_tags(tags: list[str]) -> None:
 # ai_houkai.embed when the embedder became pluggable.
 _get_embed_fn = local_embedder
 
-
-def _index_row(mid: str, document: str, metadata: dict) -> dict[str, Any]:
-    """Flatten a Chroma record into the row shape the sidecar index stores.
-
-    Goes through Memory.from_record so the index inherits exactly the same
-    metadata decoding as every other read — an index that parsed tags or
-    timestamps its own way would drift from the store it mirrors.
-    """
-    mem = Memory.from_record(mid, document, metadata)
-    return {
-        "id": mem.id, "text": mem.text, "type": mem.type, "tags": mem.tags,
-        "importance": mem.importance, "created_at": mem.created_at,
-        "last_accessed": mem.last_accessed, "access_count": mem.access_count,
-        "source": mem.source, "superseded_by": mem.superseded_by,
-        "expires_at": mem.expires_at,
-        "links": [{"to": lnk.to, "rel": lnk.rel} for lnk in mem.links],
-    }
+# Most tokens a corpus-lexical recall will probe. Each costs one server-side
+# scan in Chroma, so a long query must not turn into a long series of them; the
+# longest tokens are the most selective, so they go first.
+_LEXICAL_MAX_TOKENS = 4
 
 ConflictFn = Callable[["Memory", "Memory"], bool]
 
@@ -137,6 +122,7 @@ ConflictFn = Callable[["Memory", "Memory"], bool]
 # memory, in the same order; higher = more relevant. recall() re-sorts by the
 # returned scores and, in explain mode, records the first-stage score/rank.
 Reranker = Callable[[str, "list[Memory]"], "list[float]"]
+
 
 @dataclass
 class Link:
@@ -363,8 +349,9 @@ class Memory:
     # time. "trusted" is the default so existing stores are unchanged.
     trust:         TrustLevel = "trusted"
     # — write-time dedup —
-    # Hash of the normalised text, set when remember(idempotent=True) is used.
-    # Lets a repeated assertion be recognised without a vector query.
+    # Hash of the normalised text, recorded on every write so a repeated
+    # assertion can be recognised without a vector query. Empty only on rows
+    # written before this field existed, which simply never match.
     content_hash:  str = ""
 
     def to_metadata(self) -> dict[str, Any]:
@@ -699,8 +686,6 @@ class MemoryStore(CurationMixin):
         embedding_model: str = "all-MiniLM-L6-v2",
         *,
         embedding_function: "Callable[[list[str]], list[list[float]]] | None" = None,
-        index: Literal["sqlite"] | None = None,
-        index_path: str | Path | None = None,
         conflict_policy: Literal["ignore", "warn", "supersede", "raise"] = "ignore",
         conflict_threshold: float = 0.80,
         contradiction_fn: ConflictFn | None = None,
@@ -742,32 +727,6 @@ class MemoryStore(CurationMixin):
             embedding_function=as_chroma_embedding_function(embed_fn),
             metadata={"hnsw:space": "cosine"},
         )
-
-        # Optional derived SQLite index (see sidecar.py). Off by default: an
-        # existing store has no index, so enabling it silently would make
-        # list/neighbors read an empty table. `houkai reindex` builds it.
-        self.index: SidecarIndex | None = None
-        index_mode = index if index is not None else os.environ.get(
-            "AI_HOUKAI_INDEX", "")
-        if index_mode == "sqlite":
-            try:
-                self.index = SidecarIndex(
-                    index_path or Path(path).parent / f"{collection}.index.sqlite3",
-                    collection=collection,
-                )
-            except SidecarUnavailable as exc:
-                warnings.warn(f"sidecar index unavailable, falling back to "
-                              f"full scans: {exc}", RuntimeWarning, stacklevel=2)
-            else:
-                # A count mismatch means the index is stale or belongs to
-                # another collection; degrade to scanning rather than serve
-                # wrong results.
-                self.index.verify(self.collection.count())
-                self.collection = IndexedCollection(
-                    self.collection, self.index, _index_row)
-        elif index_mode not in ("", None):
-            raise ValueError(
-                f"index must be 'sqlite' or None — got {index_mode!r}")
 
         self._conflict_policy    = conflict_policy
         self._conflict_threshold = conflict_threshold
@@ -839,7 +798,6 @@ class MemoryStore(CurationMixin):
         ttl_seconds: float | None = None,
         pinned: bool = False,
         trust: TrustLevel = "trusted",
-        idempotent: bool = False,
     ) -> Memory:
         """Validate inputs and construct a :class:`Memory` — no store write, no
         journal, no conflict scan.
@@ -882,7 +840,13 @@ class MemoryStore(CurationMixin):
             expires_at=expires_at or 0.0,
             pinned=pinned,
             trust=trust,
-            content_hash=content_hash(clean) if idempotent else "",
+            # Always recorded, not only when this write asked for idempotency.
+            # Gating it on the flag made dedup work solely between writes that
+            # BOTH opted in: an ordinary remember() followed by an
+            # idempotent=True re-assertion of the same fact created a duplicate,
+            # because the first row carried no hash to match against. The cost
+            # is 32 bytes of metadata per memory.
+            content_hash=content_hash(clean),
         )
 
     def remember(
@@ -924,7 +888,7 @@ class MemoryStore(CurationMixin):
         mem = self._build_memory(
             text, type, tags, importance, source,
             polarity=polarity, expires_at=expires_at, ttl_seconds=ttl_seconds,
-            pinned=pinned, trust=trust, idempotent=idempotent,
+            pinned=pinned, trust=trust,
         )
         self.collection.add(
             ids=[mem.id],
@@ -965,6 +929,7 @@ class MemoryStore(CurationMixin):
         batch_size: int = 128,
         on_conflict: Literal["ignore", "warn", "supersede"] | None = None,
         contradiction_fn: ConflictFn | None = None,
+        idempotent: bool = False,
     ) -> list[Memory]:
         """Store many memories with batched embedding.
 
@@ -987,6 +952,14 @@ class MemoryStore(CurationMixin):
           this call is skipped, so no intra-batch supersede cycles form.
         * ``raise`` is rejected — partial-batch rollback is ill-defined for a
           bulk insert; use :meth:`remember` per item if you need it.
+
+        ``idempotent=True`` collapses re-assertions by normalised-text content
+        hash, both against rows already in the store and *within* this call, so
+        a batch replayed every session does not accumulate near-duplicates.
+        This is where dedupe matters most — the conflict scan is per item, so a
+        re-asserted batch is the expensive case. The returned list still has one
+        entry per input, with duplicates mapping to the same memory, so callers
+        can zip it against their input.
         """
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
@@ -999,12 +972,43 @@ class MemoryStore(CurationMixin):
 
         # Build + validate every item first, so a bad item aborts before any
         # write (all-or-nothing on validation).
-        mems = [self._build_memory(**_coerce_remember_item(it)) for it in items]
-        if not mems:
+        built = [self._build_memory(**_coerce_remember_item(it)) for it in items]
+        if not built:
             return []
 
-        for start in range(0, len(mems), batch_size):
-            chunk = mems[start:start + batch_size]
+        if not idempotent:
+            mems = built
+            fresh = built
+        else:
+            # Resolve each input to either an existing memory or a new one,
+            # keeping one entry per input so the result zips with the caller's
+            # list. `first_seen` handles intra-call duplicates, which a
+            # store-only lookup would miss (nothing is written yet).
+            mems = []
+            fresh = []
+            first_seen: dict[str, Memory] = {}
+            touch: list[Memory] = []
+            for m in built:
+                digest = content_hash(m.text)
+                if digest in first_seen:
+                    mems.append(first_seen[digest])
+                    continue
+                existing = self._find_by_content_hash(digest)
+                if existing is not None:
+                    first_seen[digest] = existing
+                    mems.append(existing)
+                    touch.append(existing)
+                    continue
+                first_seen[digest] = m
+                mems.append(m)
+                fresh.append(m)
+            if touch:
+                self._touch_many(touch)
+            if not fresh:
+                return mems
+
+        for start in range(0, len(fresh), batch_size):
+            chunk = fresh[start:start + batch_size]
             self.collection.add(
                 ids=[m.id for m in chunk],
                 documents=[m.text for m in chunk],
@@ -1018,7 +1022,9 @@ class MemoryStore(CurationMixin):
             cfn = contradiction_fn or self._contradiction_fn
             flagged: list[tuple[Memory, list[Conflict]]] = []
             superseded: set[str] = set()
-            for m in mems:
+            # Only newly written rows are scanned: an idempotent hit was already
+            # in the store, so re-scanning it would flag it against itself.
+            for m in fresh:
                 if m.id in superseded:
                     continue
                 conflicts = self._check_conflicts(m, self._conflict_threshold, cfn)
@@ -1121,8 +1127,9 @@ class MemoryStore(CurationMixin):
             text_changed = new_text != mem.text
             mem.text = new_text
             # Keep the dedup hash in step, or an edited memory would still
-            # answer to its original text on the next idempotent write.
-            if text_changed and mem.content_hash:
+            # answer to its original text on the next idempotent write. Also
+            # back-fills a row written before the field existed.
+            if text_changed:
                 mem.content_hash = content_hash(new_text)
 
         after = mem.to_dict()
@@ -1165,14 +1172,16 @@ class MemoryStore(CurationMixin):
         """
         self._metric_calls["purge_expired"] += 1
         t = now if now is not None else time.time()
-        if self.index is not None and self.index.healthy:
-            # An index range scan over expires_at, instead of loading the whole
-            # collection to find the handful of rows that have lapsed.
-            ids = self.index.expired_ids(t)
-            expired = [m for m in (self.get(i) for i in ids) if m is not None]
-        else:
-            expired = [m for m in self._get_all_memories()
-                       if m.expires_at and m.expires_at <= t]
+        # Pushed into Chroma as a range query rather than loading the whole
+        # collection to find the handful of rows that have lapsed. Two operators
+        # on one key need an explicit $and — Chroma rejects a merged leaf.
+        res = self.collection.get(
+            where={"$and": [{"expires_at": {"$gt": 0}},
+                            {"expires_at": {"$lte": t}}]},
+            include=["documents", "metadatas"],
+        )
+        expired = [Memory.from_record(i, d, m) for i, d, m
+                   in zip(res["ids"], res["documents"], res["metadatas"])]
         if not dry_run and expired:
             with self.as_actor("purge"):
                 for m in expired:
@@ -1203,7 +1212,7 @@ class MemoryStore(CurationMixin):
         reranker: "Reranker | None" = None,
         touch: bool = True,
         explain: bool = False,
-        lexical_index: Literal["pool", "fts"] = "pool",
+        lexical_index: Literal["pool", "corpus"] = "pool",
         min_trust: TrustLevel | None = None,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         """Semantic (or hybrid) search with optional metadata filters.
@@ -1237,9 +1246,10 @@ class MemoryStore(CurationMixin):
         trusted (``"trusted"`` admits only trusted; ``"untrusted"`` admits
         everything). Old rows have no trust label and read as ``"trusted"``.
 
-        ``lexical_index="fts"`` (hybrid mode, sidecar index required) unions the
-        best full-corpus BM25 matches into the candidate pool before scoring, so
-        an exact-token match with a weak embedding can be found at all;
+        ``lexical_index="corpus"`` (hybrid mode) also pulls candidates whose
+        text contains the query's tokens into the pool before scoring — via
+        Chroma's ``where_document``, so an exact-token match with a weak
+        embedding is reachable at all. It costs a server-side scan per token.
         ``"pool"`` (default) scores lexical relevance only over the vector
         over-fetch pool, as before.
         """
@@ -1267,13 +1277,17 @@ class MemoryStore(CurationMixin):
         need_emb = diversity is not None or dedup_threshold is not None
         reranker = reranker if reranker is not None else self._reranker
 
-        # The fast path (fetch exactly k) is only safe when no post-query
-        # filtering or re-selection can drop/reorder rows. Expiry filtering and
-        # reranking both do, so they force the overfetch pool too.
+        # The fast path (fetch exactly k) is only safe when NOTHING can drop or
+        # reorder rows after the query. Every post-query filter has to be listed
+        # here: one that is missing does not fail loudly, it silently returns
+        # fewer than k results, because the rows that would have replaced the
+        # dropped ones were never fetched. `min_trust` and the corpus-lexical
+        # union are both post-query and both belong in this guard.
         no_post_filter = (
             mode == "semantic" and include_superseded and include_expired
             and tag is None and not need_emb and min_cosine is None
-            and reranker is None
+            and reranker is None and min_trust is None
+            and lexical_index == "pool"
         )
         n_fetch = k if no_post_filter else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
@@ -1290,12 +1304,8 @@ class MemoryStore(CurationMixin):
             include=include,
         )
 
-        # Full-corpus lexical recall. The vector over-fetch pool is chosen by
-        # embedding distance alone, so a memory that matches the query's exact
-        # tokens but embeds weakly never enters it — and therefore can never be
-        # surfaced by the BM25 term, at any corpus size. Union the sidecar's
-        # top FTS hits into the pool so lexical evidence can actually win.
-        if lexical_index == "fts" and mode == "hybrid":
+        # Full-corpus lexical recall — see _lexical_candidates.
+        if lexical_index == "corpus" and mode == "hybrid":
             res = self._union_lexical(res, query, n_fetch, where, include)
 
         w = weights or self._hybrid_weights or HybridWeights()
@@ -1385,6 +1395,44 @@ class MemoryStore(CurationMixin):
                     for mem, score in out]
         return out
 
+    def _lexical_candidates(
+        self,
+        query: str,
+        limit: int,
+        where: dict | None,
+    ) -> list[str]:
+        """Ids whose text contains any query token, honouring *where*.
+
+        ``where_document`` is a substring match, not a tokenised inverted index:
+        Chroma scans the collection server-side (measured ~4.5 ms at 25k rows,
+        growing linearly). That is the deliberate trade for having no second
+        database — the BM25 *scoring* already happens pool-relative, so all this
+        stage owes is reachability. One request per token, capped, because
+        Chroma's ``$contains`` takes a single string.
+        """
+        tokens = sorted({t for t in _tokenize(query) if len(t) >= 3},
+                        key=len, reverse=True)[:_LEXICAL_MAX_TOKENS]
+        if not tokens:
+            return []
+        seen: list[str] = []
+        found: set[str] = set()
+        for token in tokens:
+            clause = {"$contains": token}
+            try:
+                res = self.collection.get(
+                    where=where, where_document=clause, include=[],
+                    limit=limit,
+                )
+            except Exception:  # noqa: BLE001 — a lexical bonus is never worth a 500
+                continue
+            for mid in res["ids"]:
+                if mid not in found:
+                    found.add(mid)
+                    seen.append(mid)
+            if len(seen) >= limit:
+                break
+        return seen[:limit]
+
     def _union_lexical(
         self,
         res: dict,
@@ -1393,38 +1441,32 @@ class MemoryStore(CurationMixin):
         where: dict | None,
         include: list[str],
     ) -> dict:
-        """Merge full-corpus BM25 hits into a Chroma query result.
+        """Merge full-corpus lexical hits into a Chroma query result.
 
-        Fetches the sidecar's top lexical ids that the vector query missed and
-        appends them to the pool with their *real* cosine distance, computed
-        here against the query vector.
+        The vector over-fetch pool is chosen by embedding distance alone, so a
+        memory carrying the query's exact tokens but embedding weakly never
+        enters it — and therefore can never be surfaced by the BM25 term. This
+        pulls those candidates in with Chroma's own ``where_document`` filter,
+        which scans the whole collection server-side, and lets the existing
+        pool-relative BM25 do the scoring.
 
-        Fabricating a distance was tempting and wrong: a neutral value invents
-        vector evidence a candidate has not earned, and a worst-case value
-        (-1 similarity × the 0.55 cosine weight) buries it far below anything
-        the 0.20 lexical weight could recover — which would make the whole
-        channel decorative.
-
-        Returns *res* unchanged when the index is off, unhealthy, FTS-less, or
-        has nothing to add, so enabling the flag on a store without an index is
-        a no-op rather than an error.
+        Candidates are appended with their *real* cosine distance, computed here
+        against the query vector. Fabricating one was tempting and wrong in both
+        directions: a neutral value invents vector evidence the candidate never
+        earned, and a worst-case value (-1 similarity × the 0.55 cosine weight)
+        buries it below anything the 0.20 lexical weight could recover, making
+        the channel decorative.
         """
-        if self.index is None or not (self.index.healthy and self.index.fts):
-            return res
         existing = set(res["ids"][0])
-        extra = [i for i in self.index.search_lexical(query, limit=n_fetch)
+        extra = [i for i in self._lexical_candidates(query, n_fetch, where)
                  if i not in existing]
         if not extra:
             return res
 
-        # Re-apply the caller's metadata filter through Chroma itself rather
-        # than re-implementing its `where` semantics here: a lexical hit must
-        # obey type/source/importance/date filters exactly as a vector hit does.
         get_include = [c for c in include if c != "distances"]
         if "embeddings" not in get_include:
             get_include = get_include + ["embeddings"]
-        fetched = self.collection.get(
-            ids=extra, where=where, include=get_include)
+        fetched = self.collection.get(ids=extra, include=get_include)
         if not fetched["ids"]:
             return res
 
@@ -1484,7 +1526,7 @@ class MemoryStore(CurationMixin):
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
-        lexical_index: Literal["pool", "fts"] = "pool",
+        lexical_index: Literal["pool", "corpus"] = "pool",
         min_trust: TrustLevel | None = None,
         include_pinned: bool = False,
     ) -> PackResult:
@@ -1546,6 +1588,32 @@ class MemoryStore(CurationMixin):
             compress_min_group=compress_min_group,
         )
 
+    def _pinned_memories(self) -> list[Memory]:
+        """Every live pinned memory, newest first.
+
+        Pushed into Chroma as an equality filter rather than read-and-filter:
+        this sits on the recall_pack / auto_context hot path, and loading the
+        whole collection to find the handful of pinned rows made the cheapest
+        part of the packer the most expensive.
+
+        Rows written before `pinned` existed have no such metadata key, and
+        Chroma equality does not match a missing key — which is correct here,
+        since an absent key means not pinned.
+        """
+        now = time.time()
+        res = self.collection.get(
+            where={"pinned": True}, include=["documents", "metadatas"])
+        out: list[Memory] = []
+        for i, d, m in zip(res["ids"], res["documents"], res["metadatas"]):
+            mem = Memory.from_record(i, d, m)
+            if mem.superseded_by:
+                continue
+            if mem.expires_at and mem.expires_at <= now:
+                continue
+            out.append(mem)
+        out.sort(key=lambda m: m.created_at, reverse=True)
+        return out
+
     def _prepend_pinned(
         self,
         ranked: list[tuple[Memory, float]],
@@ -1558,7 +1626,7 @@ class MemoryStore(CurationMixin):
         instruction is included *because* it is pinned, not because it matched.
         Already-ranked pinned memories are moved rather than duplicated.
         """
-        pinned = [m for m in self.list_recent(limit=10**9) if m.pinned]
+        pinned = self._pinned_memories()
         if min_trust is not None:
             floor = TRUST_LEVELS.index(min_trust)
             pinned = [m for m in pinned if TRUST_LEVELS.index(m.trust) <= floor]
@@ -1706,8 +1774,6 @@ class MemoryStore(CurationMixin):
         re-scan the prefix each time; a cursor does not, which is what makes
         walking a large store viable.
 
-        Without the sidecar index this loads the whole collection and sorts in
-        Python — the historical behaviour, kept as the fallback.
         """
         if limit < 0:
             # memories[:-1] would return everything *except* the oldest —
@@ -1715,19 +1781,6 @@ class MemoryStore(CurationMixin):
             raise ValueError("limit must be >= 0")
         if self.collection.count() == 0:
             return []
-
-        if self.index is not None and self.index.healthy:
-            ids = self.index.recent_ids(
-                limit, before=before,
-                include_superseded=include_superseded,
-                include_expired=include_expired, now=time.time())
-            if not ids:
-                return []
-            res = self.collection.get(ids=ids, include=["documents", "metadatas"])
-            by_id = {i: Memory.from_record(i, d, m) for i, d, m
-                     in zip(res["ids"], res["documents"], res["metadatas"])}
-            # Preserve the index's ordering; Chroma's get() does not promise it.
-            return [by_id[i] for i in ids if i in by_id]
 
         res = self.collection.get(include=["documents", "metadatas"])
         memories = [
@@ -1744,33 +1797,6 @@ class MemoryStore(CurationMixin):
             memories = [m for m in memories if m.created_at < before]
         memories.sort(key=lambda m: m.created_at, reverse=True)
         return memories[:limit]
-
-    def reindex(self) -> dict[str, Any]:
-        """Rebuild the sidecar index from Chroma and re-enable it.
-
-        The only way back from a disabled index. Returns a summary so the CLI
-        can report what happened.
-        """
-        if self.index is None:
-            return {"enabled": False, "indexed": 0,
-                    "error": "no sidecar index configured (index='sqlite')"}
-        rows = [_index_row(i, d, m) for i, d, m in self._iter_records()]
-        indexed = self.index.rebuild(rows)
-        return {
-            "enabled": True,
-            "indexed": indexed,
-            "healthy": self.index.healthy,
-            "fts": self.index.fts,
-            "path": str(self.index.path),
-            "error": self.index.disabled_reason,
-        }
-
-    def _iter_records(self) -> list[tuple[str, str, dict]]:
-        """Every (id, document, metadata) triple in the collection."""
-        if self.collection.count() == 0:
-            return []
-        res = self.collection.get(include=["documents", "metadatas"])
-        return list(zip(res["ids"], res["documents"], res["metadatas"]))
 
     def count(self) -> int:
         return self.collection.count()
@@ -2066,6 +2092,18 @@ class MemoryStore(CurationMixin):
         old.superseded_by = new_id
         old.superseded_at = time.time()
         self.collection.update(ids=[old_id], metadatas=[old.to_metadata()])
+        # The pin follows the live head of the chain. Superseding a standing
+        # instruction is how you correct one, and a superseded memory is out of
+        # the working set — so without this the pinned slot silently emptied and
+        # the agent stopped seeing the rule until somebody re-pinned by hand.
+        # `trust` is deliberately not inherited: both rows survive, each with its
+        # own provenance (unlike merge, which folds two into one).
+        if old.pinned and not new.pinned:
+            new_before = new.to_dict()
+            new.pinned = True
+            self.collection.update(ids=[new_id], metadatas=[new.to_metadata()])
+            self._journal("edit", new_id, before=new_before, after=new.to_dict(),
+                          meta={"pinned_from": old_id})
         self._link_raw(new_id, old_id, "supersedes")
         self._metric_calls["supersede"] += 1
         self._journal(
@@ -2084,6 +2122,17 @@ class MemoryStore(CurationMixin):
         mem.superseded_by = ""
         mem.superseded_at = 0.0
         self.collection.update(ids=[memory_id], metadatas=[mem.to_metadata()])
+        # Hand the pin back: supersede moved it to the superseder, so leaving it
+        # there would put two rows of the same chain in the working set.
+        superseder = self.get(superseder_id)
+        if mem.pinned and superseder is not None and superseder.pinned:
+            sup_before = superseder.to_dict()
+            superseder.pinned = False
+            self.collection.update(ids=[superseder_id],
+                                   metadatas=[superseder.to_metadata()])
+            self._journal("edit", superseder_id, before=sup_before,
+                          after=superseder.to_dict(),
+                          meta={"pinned_back_to": memory_id})
         self._unlink_raw(superseder_id, memory_id, "supersedes")
         self._journal(
             "restore", memory_id,
@@ -2158,19 +2207,14 @@ class MemoryStore(CurationMixin):
     ) -> list[Memory]:
         """Memories with a link pointing at *mid*.
 
-        With the sidecar index this is a lookup on ``links(dst)``. Without it,
-        the only way to answer "who points at me?" is to read every memory —
-        and ``neighbors`` asks once per frontier node per hop, so a depth-2
-        walk over ten neighbours used to mean eleven full-collection loads.
+        Chroma stores ``links`` as an opaque string in metadata, so "who points
+        at me?" is not expressible as a ``where`` clause — the only way to
+        answer it is to read every memory. ``neighbors`` asks once per frontier
+        node per hop, so a depth-2 walk over ten neighbours is eleven full
+        loads. The fix is to denormalise the edge (record a→b on both sides) so
+        this becomes a plain ``get``; until then, callers on large stores should
+        prefer ``direction="out"``.
         """
-        if self.index is not None and self.index.healthy:
-            src_ids = {src for src, _ in self.index.incoming(mid, rel)}
-            if not src_ids:
-                return []
-            res = self.collection.get(
-                ids=sorted(src_ids), include=["documents", "metadatas"])
-            return [Memory.from_record(i, d, m) for i, d, m
-                    in zip(res["ids"], res["documents"], res["metadatas"])]
         return self._get_all_memories()
 
     def neighbors(
@@ -2183,9 +2227,8 @@ class MemoryStore(CurationMixin):
     ) -> list[tuple[Memory, str]]:
         """Return (memory, rel) pairs reachable from *memory_id* via links.
 
-        Outgoing traversal is O(links per node). Incoming traversal is a
-        reverse-link lookup when the sidecar index is enabled, and a full store
-        scan per frontier node per hop when it is not.
+        Outgoing traversal is O(links per node); incoming requires a full store
+        scan per frontier node per hop — see :meth:`_incoming_candidates`.
         """
         _validate_choice(direction, DIRECTIONS, "direction")
         if rel is not None:
@@ -2565,6 +2608,11 @@ class MemoryStore(CurationMixin):
                 documents=[mem.text],
                 metadatas=[mem.to_metadata()],
             )
+            # `trash` deletes through `forget`, so undoing that entry brings the
+            # row back — and a trash entry for a live memory is a recovery point
+            # that recovers nothing, while making `trash_restore` a silent no-op
+            # on the newer row. Drop it. A plain forget has nothing to drop.
+            self.trash_purge(mem.id)
             self._journal("undo", mem.id, after=mem.to_dict(),
                           meta={"of": entry.ts, "of_op": entry.op})
             return True
@@ -2650,6 +2698,19 @@ class MemoryStore(CurationMixin):
 
         # reflect / decay / import / export / undo themselves: not undoable
         return False
+
+    def find_by_content_hash(self, text: str) -> Memory | None:
+        """The live memory whose normalised text matches *text*, or None.
+
+        The public form of the lookup ``remember(idempotent=True)`` does
+        internally, so a caller can ask "do you already know this?" without
+        writing — which is how the HTTP and MCP surfaces report whether a write
+        actually created a row.
+        """
+        clean = text.strip()
+        if not clean:
+            return None
+        return self._find_by_content_hash(content_hash(clean))
 
     def _find_by_content_hash(self, digest: str) -> Memory | None:
         """The live memory carrying *digest*, or None.

@@ -31,7 +31,7 @@ and periodic reflection that condenses experience into knowledge.
 | **Runtime metrics** | `metrics()` — op counters (all mutators) + recall latency (avg/max + p50/p95/p99), via `GET /metrics` and the `metrics` MCP tool |
 | **Retrieval eval** | `houkai eval <goldset.jsonl>` + the `eval_recall` MCP tool — stdlib-only harness scoring recall/precision/MRR/MAP/nDCG against a gold set, in both ports |
 | **Pluggable embedder** | `MemoryStore(embedding_function=…)` or `AI_HOUKAI_EMBEDDER=provider:model` — stdlib OpenAI-compatible / Ollama backends in `ai_houkai.embed`; the local sentence-transformers model is now the `[local]` extra, so the core install needs no torch |
-| **Metadata + FTS index** | Opt-in SQLite sidecar (`index="sqlite"`) — full-corpus BM25 (`lexical_index="fts"`), cursor pagination, O(1) reverse links, tag counts, indexed expiry sweep; `houkai reindex` rebuilds it, and a stale index degrades to scanning rather than to wrong answers |
+| **Full-corpus lexical recall** | Opt-in `lexical_index="corpus"` — pulls candidates whose text contains the query's tokens into the pool via Chroma's own `where_document`, so an exact-token match with a weak embedding is reachable at all. No second database |
 | **Curation** | `merge` (re-points incoming links) · `versions` · tag rename/merge/delete · `find_path` — graduated out of ai-houkai-service, which had been reaching through the library's private API |
 | **Trash** | Recoverable delete between `supersede` and `forget` — `trash` / `trash_list` / `trash_restore` / `trash_purge`; decay pruning routes here instead of hard-deleting |
 | **Pinned working set** | `pinned` memories lead `recall_pack`/`auto_context` inside the budget and are exempt from decay and eviction — a standing-instruction slot, so `importance` stops doing three jobs |
@@ -497,14 +497,21 @@ houkai trash put 72be7903      # soft-delete, recoverable
 houkai trash list
 houkai trash restore 72be7903
 houkai trash purge --yes       # irreversible, empties the trash
+
+# Retention: drop entries trashed more than N days ago. Without this a
+# "recoverable delete" is really a permanent archive and the file grows
+# forever. The maintenance scheduler applies it on the same tick as the TTL
+# purge (`trash_ttl_days` in config, default 30; 0 keeps everything).
+houkai trash purge --older-than 30 --yes
 ```
 
 #### Write-time flags
 
 ```bash
-# Pinned: leads recall_pack/auto_context inside the budget, and is exempt
-# from decay pruning and quota eviction. A standing-instruction slot, so
-# `importance` stops doing triple duty (ranking + decay + filtering).
+# Pinned: leads recall_pack/auto_context inside the budget, is exempt from
+# decay pruning, and follows a supersede onto the replacement. A
+# standing-instruction slot, so `importance` stops doing triple duty
+# (ranking + decay + filtering).
 houkai remember "ALWAYS run make lint before pushing" --pin --type procedural
 
 # Trust: provenance tier for anything that did not come from the user.
@@ -746,7 +753,7 @@ Endpoints (all JSON in / JSON out):
 | `GET /stats` | store statistics |
 | `GET /metrics` | runtime counters + recall latency |
 | `GET /memories?limit=&include_superseded=&include_expired=` | recent memories |
-| `POST /memories` | store a memory (`remember`; accepts `ttl_seconds`/`expires_at`) |
+| `POST /memories` | store a memory (`remember`; accepts `ttl_seconds`/`expires_at`) — `201`/`stored:true` when a row is created, `200`/`stored:false` when `idempotent` matched an existing one, `409` only for a real conflict rejection |
 | `POST /memories/batch` | bulk store (`remember_many`; `{items:[…], batch_size?, on_conflict?}`) with batched embedding |
 | `GET /memories/{id}` | fetch one |
 | `PATCH /memories/{id}` | edit fields in place (journaled, undoable; `expires_at`) |
@@ -822,7 +829,9 @@ type, message, or traceback is leaked to the client.
 compression trio; its response adds the fan-out `queries`. String `tags` in
 `POST /memories` / `PATCH /memories/{id}` are coerced to a one-element list
 (anything other than a string or list of strings is a `400`). `touch`/
-`explain` remain Python-API-only.
+`explain` remain Python-API-only. Every serialised memory carries `pinned` and
+`trust` explicitly — including their defaults (`false` / `"trusted"`), because
+an absent key would be indistinguishable from "not pinned" / "unlabelled".
 
 ---
 
@@ -855,8 +864,7 @@ for Claude Code / Cursor / OpenCode, a Bubble Tea TUI, and diagnostics
 
 Deliberately **not** at parity: the CLIs differ (Python ships installers as
 console scripts, Go has `houkai install` and `houkai config`), so `parity.json`
-does not assert command equality — that would be a lie. The SQLite sidecar index
-is Python-only for now.
+does not assert command equality — that would be a lie.
 
 Embeddings are delegated to Ollama (default), OpenAI, or DigitalOcean instead of
 bundled sentence-transformers — the same pluggable model Python now has via
@@ -1109,47 +1117,36 @@ never perturbs access tracking. Extra keyword args (e.g. `weights=`, `fusion=`,
 
 ---
 
-## Metadata + full-text index
+## Full-corpus lexical recall
 
-Chroma is authoritative for text, metadata and vectors — but it is not a
-metadata query engine. It has no reverse-link lookup, no cursor pagination and
-no tag aggregation, so the store historically scanned the whole collection for
-work that is one line of SQL. `neighbors(depth=2, direction="both")` on a node
-with ten neighbours performed **eleven** full-collection loads.
-
-An **opt-in** SQLite sidecar next to `.chroma` fixes that, and unlocks
-full-corpus lexical recall at the same time:
-
-```bash
-export AI_HOUKAI_INDEX=sqlite     # or index = "sqlite" in config.toml
-houkai reindex                    # build it for an existing store
-```
+The vector over-fetch pool is chosen by embedding distance alone, so a memory
+carrying the query's exact tokens but embedding weakly never enters it — and can
+therefore never be surfaced by the BM25 term, at any corpus size.
 
 ```python
-store = MemoryStore(path="./.chroma", index="sqlite")
-
-# Full-corpus BM25. `_bm25_score_pool` only ever scored the vector over-fetch
-# pool, so a strong exact-token match with a weak embedding was unreachable at
-# *any* corpus size — it never entered the pool to be scored.
-store.recall("quetzalcoatlus", mode="hybrid", lexical_index="fts")
-
-# Keyset pagination: pass the previous page's last created_at.
-page1 = store.list_recent(limit=50)
-page2 = store.list_recent(limit=50, before=page1[-1].created_at)
+store.recall("quetzalcoatlus", mode="hybrid", lexical_index="corpus")
 ```
 
-What it delivers: full-corpus BM25 · cursor pagination · O(1) reverse links ·
-tag and type counts · an indexed expiry sweep.
+`lexical_index="corpus"` also pulls in candidates whose *text* contains the
+query's tokens, using Chroma's own `where_document` filter, and lets the existing
+pool-relative BM25 score them. Unioned candidates keep their real cosine
+distance (computed against the query vector) rather than a fabricated one, and
+they obey the same `type` / `source` / date filters as a vector hit.
 
-**It is a cache, never a source of truth.** Every read has a scan fallback, and
-an index whose row count disagrees with Chroma is disabled on open rather than
-trusted — a stale index must degrade to *slower*, never to *wrong*.
-`houkai reindex` is the way back. It is off by default because an existing
-store has no index, and enabling it silently would make `list`/`neighbors` read
-an empty table.
+It costs one server-side scan per token — measured ~4.5 ms at 25k memories,
+growing linearly — so it is off by default (`"pool"`). Probes are capped at the
+four longest tokens, those being the most selective.
 
-> Requires SQLite built with FTS5 for the lexical channel (the standard CPython
-> build has it). Without FTS5 every other benefit still applies.
+> **Why not a real inverted index?** An earlier version shipped a SQLite FTS5
+> sidecar. Its lookup was genuinely faster and flat (0.03 ms regardless of corpus
+> size), but it was a second source of truth for data Chroma already held —
+> needing verify-on-open, disable-on-mismatch and `reindex` machinery to stay
+> safe — and it made `list_recent` *slower*, because serving ids from the index
+> and then fetching them from Chroma is two round-trips instead of one. On a path
+> already dominated by an embedding call, that did not pay. If you need a true
+> inverted index at scale, it belongs somewhere it can be shared across
+> collections — see [docs/ROADMAP.md](docs/ROADMAP.md).
+
 
 ---
 

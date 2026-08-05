@@ -590,3 +590,89 @@ class TestHistoryEndpoints:
         s, _ = _req(server, "GET",
                     "/memories/" + mem["id"] + "/at?ts=" + str(t))
         assert s == 404
+
+
+class TestWriteFlagsAreReadableBack:
+    """`pinned` and `trust` can be set over HTTP but never read back.
+
+    The MCP serialiser carries both; `_mem_dict` does not, so a REST client —
+    ai-houkai-service is the main one — can pin a memory or mark it untrusted
+    and then has no way to see that state again. Anything rendering a memory
+    list cannot show a pin, and a client cannot tell trusted content from
+    scraped content it labelled itself.
+    """
+
+    def test_post_memories_echoes_the_flags(self, server):
+        status, body = _req(server, "POST", "/memories",
+                            {"text": "a standing rule", "pinned": True,
+                             "trust": "reported"})
+        assert status == 201, body
+        assert body["pinned"] is True
+        assert body["trust"] == "reported"
+
+    def test_get_memory_reports_the_flags(self, server):
+        _, created = _req(server, "POST", "/memories",
+                          {"text": "another standing rule", "pinned": True,
+                           "trust": "untrusted"})
+        status, body = _req(server, "GET", f"/memories/{created['id']}")
+        assert status == 200, body
+        assert body["pinned"] is True
+        assert body["trust"] == "untrusted"
+
+    def test_defaults_are_reported_explicitly(self, server):
+        """Absent is not the same as false: a client must not have to guess."""
+        _, created = _req(server, "POST", "/memories", {"text": "a plain fact"})
+        _, body = _req(server, "GET", f"/memories/{created['id']}")
+        assert body["pinned"] is False
+        assert body["trust"] == "trusted"
+
+    def test_recall_hits_carry_the_flags(self, server):
+        _req(server, "POST", "/memories",
+             {"text": "recallable standing rule", "pinned": True,
+              "trust": "reported"})
+        status, body = _req(server, "POST", "/recall",
+                            {"query": "recallable standing rule", "k": 5})
+        assert status == 200, body
+        hit = next(h for h in body["results"]
+                   if h["text"] == "recallable standing rule")
+        assert hit["pinned"] is True
+        assert hit["trust"] == "reported"
+
+    def test_list_reports_the_flags(self, server):
+        _req(server, "POST", "/memories",
+             {"text": "listed standing rule", "pinned": True})
+        status, body = _req(server, "GET", "/memories?limit=10")
+        assert status == 200, body
+        row = next(m for m in body["memories"]
+                   if m["text"] == "listed standing rule")
+        assert row["pinned"] is True
+        assert row["trust"] == "trusted"
+
+
+class TestIdempotentRepeatReportsNoNewRow:
+    """201/stored:true says "I created something". An idempotent repeat creates
+    nothing — it finds the existing row and bumps it — so a client replaying a
+    batch every session was told it had written N new rows when it wrote none.
+    """
+
+    def test_first_write_is_created(self, server):
+        status, body = _req(server, "POST", "/memories",
+                            {"text": "repeat me", "idempotent": True})
+        assert status == 201, body
+        assert body["stored"] is True
+
+    def test_the_repeat_is_a_200_with_stored_false(self, server):
+        _, first = _req(server, "POST", "/memories",
+                        {"text": "repeat me", "idempotent": True})
+        status, second = _req(server, "POST", "/memories",
+                              {"text": "repeat me", "idempotent": True})
+        assert status == 200, second
+        assert second["stored"] is False
+        assert second["id"] == first["id"]
+        assert "conflicts" not in second
+
+    def test_a_write_without_the_flag_is_always_created(self, server):
+        _req(server, "POST", "/memories", {"text": "no flag here"})
+        status, body = _req(server, "POST", "/memories", {"text": "no flag here"})
+        assert status == 201, body
+        assert body["stored"] is True

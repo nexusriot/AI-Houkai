@@ -18,7 +18,7 @@ func newIngestCmd() *cobra.Command {
 	var memType, source string
 	var tags []string
 	var importance float32
-	var autoImportance, dryRun, yes bool
+	var autoImportance, dryRun, yes, idempotent bool
 	var maxChars, minChars int
 
 	cmd := &cobra.Command{
@@ -122,7 +122,7 @@ paragraph, re-packs long paragraphs on sentence boundaries. Omit files
 					},
 				}
 			}
-			if _, err := store.RememberMany(cmd.Context(), batch, 128, memory.PolicyIgnore); err != nil {
+			if _, err := store.RememberMany(cmd.Context(), batch, 128, memory.PolicyIgnore, idempotent); err != nil {
 				return err
 			}
 			fmt.Printf("Stored %d memories.\n", len(plan))
@@ -135,6 +135,8 @@ paragraph, re-packs long paragraphs on sentence boundaries. Omit files
 	cmd.Flags().StringVar(&source, "source", "", "Source label; default ingest:<filename> (or ingest:stdin)")
 	cmd.Flags().Float32VarP(&importance, "importance", "i", 0, "Importance 0.0–1.0")
 	cmd.Flags().BoolVar(&autoImportance, "auto-importance", false, "Score each chunk heuristically")
+	cmd.Flags().BoolVar(&idempotent, "idempotent", false,
+		"Skip chunks whose normalised text already exists — makes re-ingesting the same file a no-op")
 	cmd.Flags().IntVar(&maxChars, "max-chars", 500, "Max chunk size")
 	cmd.Flags().IntVar(&minChars, "min-chars", 30, "Drop chunks shorter than this")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show chunks without writing")

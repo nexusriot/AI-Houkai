@@ -204,7 +204,18 @@ func (s *Server) trashPurge(r *http.Request) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	n, err := s.store.TrashPurge(bodyStr(b, "memory_id", ""))
+	id := bodyStr(b, "memory_id", "")
+	ttl := bodyFloatPtr(b, "older_than_days")
+	if id != "" && ttl != nil {
+		return 0, nil, errStatus(400,
+			"pass either memory_id or older_than_days, not both")
+	}
+	var n int
+	if ttl != nil {
+		n, err = s.store.TrashPurgeExpired(float64(*ttl), 0)
+	} else {
+		n, err = s.store.TrashPurge(id)
+	}
 	if err != nil {
 		return 0, nil, err
 	}
