@@ -167,3 +167,25 @@ func TestEditorFallback(t *testing.T) {
 		t.Errorf("explicit editor should win: got %q", got)
 	}
 }
+
+// embed_dim = 0 is never valid: it makes every vector zero-length, and the
+// content-scan helpers build a probe vector from it. TOML cannot distinguish
+// "absent" from "0", so an explicit zero reaches the merged config and has to
+// be repaired the same way the other zero-means-unset fields are.
+func TestResolveConfigRepairsAZeroEmbedDim(t *testing.T) {
+	tmpHome := t.TempDir()
+	cfgFile := filepath.Join(tmpHome, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte("embed_dim = 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withEnv(t, map[string]string{
+		"HOME":                     tmpHome,
+		"AI_HOUKAI_CONFIG":         cfgFile,
+		"AI_HOUKAI_COLLECTION":     "",
+		"AI_HOUKAI_EMBED_PROVIDER": "",
+		"AI_HOUKAI_PATH":           "",
+	})
+	if cfg := ResolveConfig("", ""); cfg.EmbedDim != 384 {
+		t.Errorf("embed_dim = %d, want the 384 default rather than 0", cfg.EmbedDim)
+	}
+}

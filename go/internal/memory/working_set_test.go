@@ -107,6 +107,32 @@ func TestIdempotentHashFollowsAnEdit(t *testing.T) {
 	}
 }
 
+func TestEditBackfillsAMissingHash(t *testing.T) {
+	// A row written before content_hash existed reads back with an empty hash.
+	// Editing it must fill one in, as the Python port does — otherwise that row
+	// can never dedup again, however many times its text is rewritten.
+	ctx := context.Background()
+	store := newTestStore(t)
+	m, _, _, _ := store.Remember(ctx, "written before hashing", RememberOpts{})
+	m.ContentHash = ""
+	if err := store.UpdateMemory(ctx, m, false); err != nil {
+		t.Fatal(err)
+	}
+
+	revised := "rewritten after hashing"
+	if _, err := store.Edit(ctx, m.ID, EditOpts{Text: &revised}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetByID(ctx, m.ID)
+	if got.ContentHash != ContentHash(revised) {
+		t.Errorf("hash = %q, want the revised text's", got.ContentHash)
+	}
+	again, _, _, _ := store.Remember(ctx, revised, RememberOpts{Idempotent: true})
+	if again.ID != m.ID {
+		t.Error("the back-filled hash did not make the row dedup")
+	}
+}
+
 func TestPinnedRoundtripsAndEdits(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

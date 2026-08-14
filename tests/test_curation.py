@@ -19,6 +19,7 @@ import ai_houkai.mcp_server.server as srv
 from ai_houkai.cli.main import app
 from ai_houkai.maintenance.scheduler import MaintenanceScheduler
 from ai_houkai.memory_system.curation import MergeError
+from ai_houkai.memory_system.store import content_hash
 
 
 @pytest.fixture()
@@ -85,6 +86,25 @@ class TestMerge:
         fake_store.link(b.id, shared.id, rel="refines")
         merged = fake_store.merge(a.id, b.id)
         assert [(l.to, l.rel) for l in merged.links] == [(shared.id, "refines")]
+
+    def test_keeps_the_dedup_hash_in_step(self, fake_store):
+        """A merged memory must answer to its NEW text, not its pre-merge one.
+
+        The same invariant edit() holds. Left stale, the hash makes the next
+        idempotent write of the pre-merge text look like a repeat, so it is
+        absorbed into the merged row and silently lost.
+        """
+        a = fake_store.remember("first half", idempotent=True)
+        b = fake_store.remember("second half")
+        merged = fake_store.merge(a.id, b.id)
+
+        assert fake_store.get(a.id).content_hash == content_hash(merged.text)
+
+        again = fake_store.remember("first half", idempotent=True)
+        assert again.id != a.id, "the pre-merge text must no longer match"
+
+        same = fake_store.remember(merged.text, idempotent=True)
+        assert same.id == a.id, "the merged text should match the merged row"
 
     def test_rejects_self_merge(self, fake_store):
         a = fake_store.remember("only one")

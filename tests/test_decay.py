@@ -301,3 +301,17 @@ class TestPruneRoutesToTrash:
         assert DecayEngine(store, decay_rate=0.5, min_score=0.9).prune() == []
         assert store.trash_list() == []
         assert store.get(pin.id) is not None and store.get(proc.id) is not None
+
+    def test_a_failed_trash_is_not_reported_as_pruned(self, store, monkeypatch):
+        """The return value is the caller's audit trail.
+
+        `prune` appended unconditionally, so a row that vanished mid-run — or
+        any trash write that failed — was still counted. That over-reports what
+        left the store and inflates the scheduler's cumulative `total_decayed`.
+        """
+        doomed = store.remember("stale enough to prune")
+        self._age(store, doomed)
+        monkeypatch.setattr(store, "trash", lambda memory_id: False)
+
+        pruned = DecayEngine(store, decay_rate=0.5, min_score=0.9).prune()
+        assert pruned == []

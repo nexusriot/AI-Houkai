@@ -7,7 +7,7 @@ import (
 )
 
 // Full-corpus lexical recall via the backend's document-content predicate,
-// replacing the SQLite FTS sidecar. See docs/DESIGN.md §25 for why.
+// rather than a second index. See docs/DESIGN.md §25 for why.
 
 func TestLexicalCorpusReachesOutsideThePool(t *testing.T) {
 	store := newTestStore(t)
@@ -155,5 +155,38 @@ func TestFastPathRespectsCorpusLexical(t *testing.T) {
 	}
 	if len(hits) != 5 {
 		t.Errorf("got %d hits, want 5", len(hits))
+	}
+}
+
+// "corpus" replaced an earlier "fts" spelling. Unvalidated, that name is
+// silently read as "pool", so a caller carrying it forward loses full-corpus
+// recall with no error. Mode, fusion, type and min_trust are all validated;
+// this belongs with them.
+func TestRecallRejectsAnUnknownLexicalIndex(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "something", RememberOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, bad := range []LexicalIndexMode{"fts", "typo-nonsense"} {
+		_, err := store.Recall(ctx, "something", 1, RecallOpts{
+			Mode: ModeHybrid, LexicalIndex: bad,
+		})
+		if err == nil {
+			t.Errorf("Recall(lexical_index=%q) succeeded, want a validation error", bad)
+		}
+	}
+}
+
+// "" means "not specified" and must keep defaulting to pool.
+func TestRecallAcceptsTheEmptyLexicalIndex(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "something", RememberOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Recall(ctx, "something", 1, RecallOpts{Mode: ModeHybrid}); err != nil {
+		t.Errorf("Recall with no lexical_index: %v", err)
 	}
 }

@@ -4,6 +4,8 @@
 # core
 chromadb>=0.5.0
 sentence-transformers>=2.7.0
+# tomllib backport: stdlib from 3.11, so only 3.10 needs the wheel.
+tomli>=2.0.1; python_version < "3.11"
 
 # MCP server
 # <2: mcp 2.0.0 removed mcp.server.fastmcp (see pyproject for the full note).

@@ -173,6 +173,14 @@ func ResolveConfig(storePath, collection string) Config {
 		_ = toml.Unmarshal(data, &cfg)
 	}
 
+	// TOML cannot tell "absent" from "0", so an explicit `embed_dim = 0` lands
+	// here as a real value. It is never valid — every vector would be
+	// zero-length — so treat it as unset rather than carrying it into the
+	// backend, which builds a probe vector from it.
+	if cfg.EmbedDim <= 0 {
+		cfg.EmbedDim = defaultConfig().EmbedDim
+	}
+
 	// Env vars.
 	if v := os.Getenv("AI_HOUKAI_PATH"); v != "" {
 		cfg.StorePath = v

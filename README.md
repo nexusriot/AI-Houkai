@@ -1137,15 +1137,15 @@ It costs one server-side scan per token — measured ~4.5 ms at 25k memories,
 growing linearly — so it is off by default (`"pool"`). Probes are capped at the
 four longest tokens, those being the most selective.
 
-> **Why not a real inverted index?** An earlier version shipped a SQLite FTS5
-> sidecar. Its lookup was genuinely faster and flat (0.03 ms regardless of corpus
-> size), but it was a second source of truth for data Chroma already held —
-> needing verify-on-open, disable-on-mismatch and `reindex` machinery to stay
-> safe — and it made `list_recent` *slower*, because serving ids from the index
-> and then fetching them from Chroma is two round-trips instead of one. On a path
-> already dominated by an embedding call, that did not pay. If you need a true
-> inverted index at scale, it belongs somewhere it can be shared across
-> collections — see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Why not a real inverted index?** A SQLite FTS5 index beside `.chroma` was
+> measured and rejected. Its lookup was genuinely faster and flat (0.03 ms
+> regardless of corpus size), but it would be a second source of truth for data
+> Chroma already holds — needing verify-on-open, disable-on-mismatch and rebuild
+> machinery to stay safe — and it made `list_recent` *slower*, because serving
+> ids from the index and then fetching them from Chroma is two round-trips
+> instead of one. On a path already dominated by an embedding call, that does not
+> pay. If you need a true inverted index at scale, it belongs somewhere it can be
+> shared across collections — see [docs/ROADMAP.md](docs/ROADMAP.md).
 
 
 ---

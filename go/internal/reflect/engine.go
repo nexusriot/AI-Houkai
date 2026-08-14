@@ -142,10 +142,20 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 		embedding []float32
 	}
 
+	now := float64(time.Now().UnixNano()) / 1e9
 	var eps []episodicItem
 	for _, it := range items {
 		m := memory.MetadataToMemory(it.ID, it.Content, it.Metadata)
 		if !e.eligibleType(m.Type) || m.SupersededBy != "" {
+			continue
+		}
+		// An expired memory is on its way out — hidden from recall/list and
+		// waiting for PurgeExpired to reclaim it. Folding it in would copy its
+		// text into a fresh summary that has no TTL of its own, so a deliberate
+		// lifetime would be laundered into a permanent row. Same rule as the
+		// trust inheritance below: a summary must not grant its sources more
+		// reach than they had.
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
 			continue
 		}
 		// A memory already at the deepest allowed tier must not be folded into

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from ai_houkai.memory_system import Memory, MemoryStore, ReflectionEngine
@@ -313,3 +315,77 @@ class TestPolarityClusterSeparation:
             assert not {-1, 1} <= polarities, (
                 "cluster merged explicitly opposite polarities"
             )
+
+
+class TestExpiredSourcesAreNotConsolidated:
+    """An expired memory must not be folded into a summary.
+
+    A TTL means the content stops being available: recall, list and stats all
+    hide it, and `purge_expired` eventually reclaims it. Reflection reads the
+    collection directly, so without an expiry filter it clusters expired rows
+    and writes their text into a **fresh, non-expiring** semantic memory —
+    resurrecting permanently what the caller asked to have a lifetime. Same
+    laundering shape as the trust rule: a summary must not grant its sources
+    more reach than they had.
+    """
+
+    @staticmethod
+    def _constant_embedder():
+        """Every text lands on one vector, so anything fetched clusters.
+
+        That isolates what this is about — which rows are *eligible* — from
+        embedding similarity, and keeps the test off the real model.
+        """
+        def emb(texts):
+            return [[1.0, 0.0] for _ in texts]
+        return emb
+
+    def _store(self, tmp_path, name):
+        return MemoryStore(path=str(tmp_path / "chroma"), collection=name,
+                           embedding_function=self._constant_embedder())
+
+    def test_an_expired_source_is_not_clustered(self, tmp_path):
+        store = self._store(tmp_path, "reflect_expiry")
+        try:
+            _ep(store, "the deploy runbook lives in ops")
+            store.remember("quarterly figures, embargoed", type="episodic",
+                           expires_at=time.time() - 1)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            # Only one live candidate remains, which is below min_cluster_size,
+            # so there is nothing to summarise at all.
+            assert engine.clusters() == []
+            assert engine.reflect() == []
+        finally:
+            store.client.close()
+
+    def test_expired_text_never_reaches_a_summary(self, tmp_path):
+        store = self._store(tmp_path, "reflect_expiry_text")
+        try:
+            for i in range(3):
+                _ep(store, f"live note number {i}")
+            store.remember("EMBARGOED do not resurrect", type="episodic",
+                           expires_at=time.time() - 1)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            created = engine.reflect()
+            assert created, "the three live notes should still summarise"
+            assert not any("EMBARGOED" in m.text for m in created)
+        finally:
+            store.client.close()
+
+    def test_a_live_ttl_is_still_eligible(self, tmp_path):
+        """Only *lapsed* rows are excluded — a future deadline is still live."""
+        store = self._store(tmp_path, "reflect_ttl_live")
+        try:
+            _ep(store, "first live note")
+            store.remember("second note, expires much later", type="episodic",
+                           expires_at=time.time() + 3600)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            assert len(engine.clusters()) == 1
+        finally:
+            store.client.close()

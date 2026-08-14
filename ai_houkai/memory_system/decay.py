@@ -141,8 +141,12 @@ class DecayEngine:
                 if mem.pinned:
                     continue
                 if score < self.min_score:
-                    if not dry_run:
-                        self.store.trash(mem.id)
+                    # Only report what actually left. A row can vanish between
+                    # score_all and here, and the return value is both the
+                    # caller's audit trail and what the scheduler adds to its
+                    # cumulative total.
+                    if not dry_run and not self.store.trash(mem.id):
+                        continue
                     pruned.append(mem)
 
         return pruned

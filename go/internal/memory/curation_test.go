@@ -109,6 +109,34 @@ func TestMergeTransfersOutgoingLinksWithoutSelfLoops(t *testing.T) {
 	}
 }
 
+// A merged memory must answer to its NEW text, not its pre-merge one — the
+// same invariant Edit holds. Left stale, the hash makes the next idempotent
+// write of the pre-merge text look like a repeat, so it is absorbed into the
+// merged row and silently lost.
+func TestMergeKeepsTheDedupHashInStep(t *testing.T) {
+	ctx := context.Background()
+	store := newJournaledMemStore(t)
+	a, _, _, _ := store.Remember(ctx, "first half", RememberOpts{Idempotent: true})
+	b, _, _, _ := store.Remember(ctx, "second half", RememberOpts{})
+
+	merged, err := store.Merge(ctx, a.ID, b.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.ContentHash != ContentHash(merged.Text) {
+		t.Errorf("hash = %s, want the merged text's", merged.ContentHash)
+	}
+
+	again, _, _, _ := store.Remember(ctx, "first half", RememberOpts{Idempotent: true})
+	if again.ID == a.ID {
+		t.Error("the pre-merge text must no longer match the merged row")
+	}
+	same, _, _, _ := store.Remember(ctx, merged.Text, RememberOpts{Idempotent: true})
+	if same.ID != a.ID {
+		t.Error("the merged text should match the merged row")
+	}
+}
+
 func TestMergeRejectsSelfMerge(t *testing.T) {
 	ctx := context.Background()
 	store := newJournaledMemStore(t)

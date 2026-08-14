@@ -55,7 +55,7 @@ func (b *ChromemBackend) Add(ctx context.Context, items []Item) error {
 // itself.
 func (b *ChromemBackend) SearchDocuments(ctx context.Context, substr string, limit int) ([]Item, error) {
 	n := b.collection.Count()
-	if n == 0 || substr == "" || limit <= 0 {
+	if n == 0 || substr == "" || limit <= 0 || b.dim == 0 {
 		return nil, nil
 	}
 	if limit > n {
@@ -89,7 +89,7 @@ func (b *ChromemBackend) SearchDocuments(ctx context.Context, substr string, lim
 func (b *ChromemBackend) SearchMetadata(ctx context.Context, where map[string]string,
 	limit int) ([]Item, error) {
 	n := b.collection.Count()
-	if n == 0 || len(where) == 0 {
+	if n == 0 || len(where) == 0 || b.dim == 0 {
 		return nil, nil
 	}
 	if limit <= 0 || limit > n {

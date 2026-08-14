@@ -355,3 +355,81 @@ class TestAsyncContentHashLookup:
     def test_misses_when_nothing_matches(self, astore):
         _run(astore.remember("something else"))
         assert _run(astore.find_by_content_hash("never written")) is None
+
+
+class TestAsyncSurfaceParity:
+    """The async store is a thin wrapper, so it drifts silently.
+
+    Every knob added to a sync method has to be repeated by hand in the
+    wrapper, and forgetting one is invisible: the parameter simply is not
+    accepted, and only a caller that reaches for it finds out. This compares
+    the two signatures mechanically instead of trusting review.
+
+    ``as_actor`` is deliberately exempt — it is a synchronous context manager
+    for scoping the journal actor, not an awaitable operation.
+    """
+
+    EXEMPT = {"as_actor"}
+
+    @staticmethod
+    def _sync_methods() -> dict[str, object]:
+        """Public callables on ``MemoryStore`` *and* everything it inherits.
+
+        Walking the MRO is the whole point: twelve curation methods (``trash``,
+        ``merge``, the tag ops, …) reach ``MemoryStore`` from ``CurationMixin``,
+        and ``vars(MemoryStore)`` sees none of them — so a sweep built on the
+        class ``__dict__`` would silently exempt a quarter of the surface.
+        """
+        found: dict[str, object] = {}
+        for klass in reversed(MemoryStore.__mro__):
+            if klass is object:
+                continue
+            for name, attr in vars(klass).items():
+                if not name.startswith("_") and callable(attr):
+                    found[name] = attr
+        return found
+
+    def test_the_sweep_reaches_inherited_methods(self):
+        """Guards the guard.
+
+        If ``_sync_methods`` ever narrows back to ``MemoryStore.__dict__``, the
+        two checks below keep passing while covering nothing from the mixin.
+        This fails loudly instead.
+        """
+        found = self._sync_methods()
+        assert "recall" in found, "own methods missing from the sweep"
+        assert {"trash", "merge", "list_tags"} <= set(found), \
+            "inherited CurationMixin methods are not being inspected"
+
+    @staticmethod
+    def _named_params(fn) -> set[str] | None:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):  # pragma: no cover — C-level callables
+            return None
+        return {name for name, p in sig.parameters.items()
+                if name != "self" and p.kind is not p.VAR_KEYWORD}
+
+    def test_every_sync_method_has_a_wrapper(self):
+        missing = [
+            name for name in self._sync_methods()
+            if name not in self.EXEMPT
+            and getattr(AsyncMemoryStore, name, None) is None
+        ]
+        assert not missing, f"AsyncMemoryStore is missing: {sorted(missing)}"
+
+    def test_no_wrapper_drops_a_parameter(self):
+        gaps = []
+        for name, sync_fn in self._sync_methods().items():
+            async_fn = getattr(AsyncMemoryStore, name, None)
+            if async_fn is None or name in self.EXEMPT:
+                continue
+            sync_params = self._named_params(sync_fn)
+            async_params = self._named_params(async_fn)
+            if sync_params is None or async_params is None:
+                continue
+            dropped = sync_params - async_params
+            if dropped:
+                gaps.append(f"{name}: missing {sorted(dropped)}")
+        assert not gaps, "async wrappers dropped parameters:\n  " + \
+            "\n  ".join(sorted(gaps))

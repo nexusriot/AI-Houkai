@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ai_houkai.cli import output as out
-from ai_houkai.memory_system.store import _get_embed_fn
+from ai_houkai.embed import as_chroma_embedding_function
 
 collections_app = typer.Typer(
     name="collections",
@@ -33,11 +33,18 @@ def _client(ctx: typer.Context):
 
 
 def _open(ctx: typer.Context, name: str):
-    """Open a collection the same way MemoryStore does (cosine + same EF)."""
+    """Open a collection the same way MemoryStore does (cosine + same EF).
+
+    Reuses the embedder the store already resolved rather than re-deriving it:
+    the store's precedence is injected callable → AI_HOUKAI_EMBEDDER → the
+    local model, so calling the local loader here would create the collection
+    with a *different* embedder than the one writing to it — and would demand
+    sentence-transformers even on a deployment pointed at a hosted embedder.
+    """
     store = ctx.obj["store"]
     return store.client.get_or_create_collection(
         name=name,
-        embedding_function=_get_embed_fn(store.embedding_model),
+        embedding_function=as_chroma_embedding_function(store._embed_fn),
         metadata={"hnsw:space": "cosine"},
     )
 

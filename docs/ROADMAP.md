@@ -28,7 +28,7 @@ doubled by the two-port parity requirement).
 
 ## ✅ Shipped
 
-### This cycle (see [RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) for the analysis)
+### This cycle (rationale for each lives in the matching [DESIGN.md](DESIGN.md) section)
 
 | Feature | Notes |
 |---|---|
@@ -38,7 +38,7 @@ doubled by the two-port parity requirement).
 | **Pluggable embedder** (§24) | `embedding_function=` seam + `AI_HOUKAI_EMBEDDER`, stdlib OpenAI-compatible/Ollama backends, `sentence-transformers` moved to a `[local]` extra, `ai_houkai.testing.FakeEmbedder`. |
 | **CI + enforced parity** (§23) | `.github/workflows/{ci,release}.yml`; `parity.json` asserted by both ports; a fast suite that needs no torch. |
 | **Eval harness wired** (§28) | `houkai eval`, the `eval_recall` MCP tool, and a Go port. Ranking constants are now measurable. |
-| **Full-corpus lexical recall** (§25) | `lexical_index="corpus"` via Chroma's `where_document`, plus a Chroma-native range query for `purge_expired`. Started as a SQLite FTS sidecar; measurement retired it — see §25 for the numbers and the trade. |
+| **Full-corpus lexical recall** (§25) | `lexical_index="corpus"` via Chroma's `where_document`, plus a Chroma-native range query for `purge_expired`. A SQLite FTS index was measured against it and rejected — see §25 for the numbers and the trade. |
 | **Curation + trash** (§26) | `merge`/`versions`/tag ops/`find_path` graduated out of ai-houkai-service; recoverable delete between `supersede` and `forget`, with decay pruning routed through it. |
 | **Tiered reflection** | `ReflectionEngine(types=…)` instead of episodic-only, with a `level` tag and `max_level` guard so reflections-of-reflections form a hierarchy. |
 | **Pinned / trust / idempotent** (§27) | A standing-instruction slot, a provenance tier, and content-hash dedupe on write. |
@@ -102,7 +102,7 @@ both ports get it from the same data-model change.
 | Feature | V/Fit/Eff | Sketch |
 |---|---|---|
 | **Prometheus metrics** | 3/5/S | p50/p95/p99 and the full mutator counters already ship; what remains is per-*stage* latency and a dependency-free `GET /metrics?format=prometheus`. |
-| **Quota + eviction** | 4/5/M | `max_memories` + policy (`decay`/`lru`/`reject`), batch-evict to a headroom watermark, never evict `procedural`, journal evictions under `as_actor("quota")`. |
+| **Quota + eviction** | 4/5/M | `max_memories` + policy (`decay`/`lru`/`reject`), batch-evict to a headroom watermark, never evict `procedural` (nor `pinned`, §27), journal evictions under `as_actor("quota")`. **The highest-value item in this tier**: it is the one ops feature with no workaround today, because decay pruning is the only bound on store growth and it is time-based, not size-based — a store that grows faster than it ages has nothing holding it. |
 | **Quiesced backup + restore** | 4/4/M | Today's `houkai backup` is an unlocked `copytree` with no real restore. Add a manifest (embedding-model / collection / checksums), a real `houkai restore`, and integrity verification. **ai-houkai-service's `backup.py` already has manifests and a working restore** — another graduation candidate, like the curation set (§26). |
 
 ---
@@ -143,8 +143,9 @@ both ports get it from the same data-model change.
 ## Latent issues worth a quick correctness pass
 
 Both previously listed here (the `metrics()` doc/impl mismatch and the
-incomplete op counters) were already fixed in the shipped code — see
-[RESEARCH-2026-08-01.md](RESEARCH-2026-08-01.md) §1.
+incomplete op counters) were already fixed in the shipped code — percentiles
+and every mutator counter are live, so only the Prometheus exposition format
+and per-*stage* latency remain open (see [DESIGN.md](DESIGN.md) §22).
 
 - **`/ready` has no probe deadline** — the 5 s is a cache TTL, not a timeout,
   and the route is auth-exempt and never caches a failure.

@@ -91,7 +91,7 @@ def remember(store: str, text: str, *extra: str) -> str:
 def test_cli_full_lifecycle(tmp_path):
     store = str(tmp_path / "chroma")
 
-    # — empty store —
+    # Empty store.
     empty = houkai_json(store, "stats", "--format", "json")
     assert empty["total"] == 0
 
@@ -115,7 +115,7 @@ def test_cli_full_lifecycle(tmp_path):
     assert stats["by_type"]["episodic"] == 2
     assert stats["by_type"]["procedural"] == 1
 
-    # — recall finds the right memory (hybrid blends cosine + BM25) —
+    # Recall finds the right memory (hybrid blends cosine + BM25)
     hits = houkai_json(store, "recall", "global interpreter lock threading",
                        "-k", "3", "--mode", "hybrid", "--format", "json")
     assert any(h["id"] == sem1 for h in hits), [h["text"] for h in hits]
@@ -127,17 +127,17 @@ def test_cli_full_lifecycle(tmp_path):
     assert all(h["type"] == "semantic" for h in infra_hits)
     assert all("infra" in h["tags"] for h in infra_hits)
 
-    # — pack into a token budget —
+    # Pack into a token budget.
     pack = houkai_json(store, "pack", "vectors on disk", "-b", "200", "--format", "json")
     assert pack["text"].strip() != ""
     assert pack["used_tokens"] <= pack["budget"]
 
-    # — link + neighbors —
+    # Link + neighbors.
     houkai(store, "link", sem1, sem2, "--rel", "refines")
     nbrs = houkai_json(store, "neighbors", sem1, "--format", "json")
     assert sem2 in {n["id"] for n in nbrs}
 
-    # — export the active set, then import into a fresh collection —
+    # Export the active set, then import into a fresh collection.
     archive = str(tmp_path / "backup.ahkai")
     houkai(store, "export", archive)
     assert os.path.exists(archive)
@@ -147,7 +147,7 @@ def test_cli_full_lifecycle(tmp_path):
     restored = houkai_json(store, "stats", "--format", "json", collection="func_restored")
     assert restored["total"] == 5
 
-    # — supersede hides a memory from default views but keeps it on disk —
+    # Supersede hides a memory from default views but keeps it on disk.
     houkai(store, "supersede", sem2, sem1)
     active = houkai_json(store, "list", "-n", "50", "--format", "json")
     assert sem2 not in {m["id"] for m in active}
@@ -155,7 +155,7 @@ def test_cli_full_lifecycle(tmp_path):
                              "--include-superseded", "--format", "json")
     assert sem2 in {m["id"] for m in with_super}
 
-    # — the audit journal recorded the writes —
+    # The audit journal recorded the writes.
     jrnl = houkai(store, "journal", "tail", "-n", "50")
     assert "remember" in jrnl.stdout.lower()
 
@@ -541,22 +541,22 @@ def test_cli_curation_lifecycle(tmp_path):
     pointer = remember(store, "points at the rollback one")
     houkai(store, "link", pointer, other, "--rel", "refines")
 
-    # — path: undirected, so the arrow direction does not matter —
+    # Path: undirected, so the arrow direction does not matter.
     path = houkai_json(store, "path", other, pointer, "--json")
     assert path["found"] is True and path["length"] == 1
 
-    # — merge: the incoming edge must survive, re-pointed at the target —
+    # Merge: the incoming edge must survive, re-pointed at the target.
     houkai(store, "merge", target, other, "-y")
     nbrs = houkai_json(store, "neighbors", pointer, "--direction", "out",
                        "--format", "json")
     assert [n["id"] for n in nbrs] == [target]
     assert houkai(store, "show", other, check=False).returncode != 0
 
-    # — versions: the merge rewrote the target's text, so it has history —
+    # Versions: the merge rewrote the target's text, so it has history.
     versions = houkai_json(store, "versions", target, "--json")
     assert [v["text"] for v in versions] == ["the deploy runbook"]
 
-    # — tags —
+    # Tags.
     assert houkai_json(store, "tags", "list", "--json") == [
         {"tag": "ops", "count": 1}]
     houkai(store, "tags", "rename", "ops", "operations")
@@ -662,23 +662,23 @@ def test_http_new_routes(http_server):
     status2, b = _http("POST", f"{base}/memories", {"text": "http merge source"})
     assert status == 201 and status2 == 201
 
-    # — subgraph —
+    # Subgraph.
     _http("POST", f"{base}/links", {"src_id": a["id"], "dst_id": b["id"],
                                     "rel": "refines"})
     status, graph = _http("POST", f"{base}/subgraph",
                           {"memory_ids": [a["id"]], "depth": 1})
     assert status == 200 and len(graph["nodes"]) == 2
 
-    # — find_path —
+    # find_path.
     status, path = _http("POST", f"{base}/find_path",
                          {"from_id": b["id"], "to_id": a["id"]})
     assert status == 200 and path["found"] is True
 
-    # — tags —
+    # Tags.
     status, tags = _http("GET", f"{base}/tags")
     assert status == 200 and tags["tags"] == []
 
-    # — trash roundtrip —
+    # Trash roundtrip.
     status, _ = _http("POST", f"{base}/trash", {"memory_id": b["id"]})
     assert status == 200
     status, listing = _http("GET", f"{base}/trash")
@@ -686,20 +686,20 @@ def test_http_new_routes(http_server):
     status, _ = _http("POST", f"{base}/trash/restore", {"memory_id": b["id"]})
     assert status == 200
 
-    # — versions (the merge below will create one) —
+    # Versions (the merge below will create one)
     status, merged = _http("POST", f"{base}/merge",
                            {"target_id": a["id"], "other_id": b["id"]})
     assert status == 200 and "http merge source" in merged["text"]
     status, versions = _http("GET", f"{base}/memories/{a['id']}/versions")
     assert status == 200 and versions["versions"][0]["text"] == "http merge target"
 
-    # — journal + undo —
+    # Journal + undo.
     status, journal = _http("GET", f"{base}/journal?n=1")
     assert status == 200 and journal["count"] == 1
     status, undone = _http("POST", f"{base}/undo", {})
     assert status == 200 and undone["ok"] is True
 
-    # — nuke is guarded —
+    # Nuke is guarded.
     status, _ = _http("POST", f"{base}/nuke", {})
     assert status == 400
     status, wiped = _http("POST", f"{base}/nuke", {"confirm": "DELETE ALL"})

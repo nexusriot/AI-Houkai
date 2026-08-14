@@ -98,9 +98,9 @@ type PackOpts struct {
 	DedupThreshold *float32
 	MinCosine      *float32
 	NoTouch        bool
-	// LexicalIndex forwards to Recall: "fts" unions full-corpus BM25 matches
-	// "corpus" also pulls candidates whose text contains the query's tokens
-	// into the pool (hybrid mode only).
+	// LexicalIndex forwards to Recall: "pool" (the default) scores BM25 only
+	// over the vector over-fetch pool, while "corpus" also pulls candidates
+	// whose text contains the query's tokens into the pool (hybrid mode only).
 	LexicalIndex LexicalIndexMode
 
 	// Query-time compression: candidates that could not be packed individually

@@ -295,6 +295,9 @@ class AsyncMemoryStore:
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
+        min_trust: TrustLevel | None = None,
+        lexical_index: Literal["pool", "corpus"] = "pool",
+        include_pinned: bool = False,
     ) -> PackResult:
         return await self.run(
             self.sync.recall_pack,
@@ -321,6 +324,9 @@ class AsyncMemoryStore:
             compress=compress,
             compress_threshold=compress_threshold,
             compress_min_group=compress_min_group,
+            min_trust=min_trust,
+            lexical_index=lexical_index,
+            include_pinned=include_pinned,
         )
 
     async def auto_context_pack(
@@ -365,12 +371,18 @@ class AsyncMemoryStore:
         *,
         include_superseded: bool = False,
         include_expired: bool = False,
+        before: float | None = None,
     ) -> list[Memory]:
+        """Newest-first memories — see MemoryStore.list_recent.
+
+        ``before`` is the keyset cursor that makes paging a large store viable.
+        """
         return await self.run(
             self.sync.list_recent,
             limit,
             include_superseded=include_superseded,
             include_expired=include_expired,
+            before=before,
         )
 
     async def purge_expired(

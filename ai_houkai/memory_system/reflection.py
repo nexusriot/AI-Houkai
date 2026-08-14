@@ -38,6 +38,7 @@ Usage
 from __future__ import annotations
 
 import math
+import time
 import uuid
 from typing import Callable, Literal
 
@@ -251,11 +252,20 @@ class ReflectionEngine:
         # earlier reflection). Otherwise every run re-clusters the same
         # sources: with consolidate=False it emits duplicate summaries, and
         # with consolidate=soft it re-supersedes them under a fresh summary.
+        now = time.time()
         mems: list[Memory] = []
         kept_embs: list[list[float]] = []
         for i, d, m, e in zip(ids, docs, metas, embs):
             mem = Memory.from_record(i, d, m)
             if mem.superseded_by:
+                continue
+            # An expired memory is on its way out — hidden from recall/list and
+            # waiting for purge_expired to reclaim it. Folding it in would copy
+            # its text into a fresh summary that has no TTL of its own, so a
+            # deliberate lifetime would be laundered into a permanent row. Same
+            # rule as the trust inheritance below: a summary must not grant its
+            # sources more reach than they had.
+            if mem.expires_at and mem.expires_at <= now:
                 continue
             # A memory already at the deepest allowed tier must not be folded
             # into yet another summary — that is the runaway case max_level

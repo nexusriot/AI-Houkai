@@ -44,7 +44,7 @@ Routes (all JSON in / JSON out):
     POST   /trash        {memory_id}               soft-delete (recoverable)
     GET    /trash                                  list soft-deleted memories
     POST   /trash/restore {memory_id}              bring one back
-    POST   /trash/purge  {memory_id?}              permanently drop (irreversible)
+    POST   /trash/purge  {memory_id?, older_than_days?}  permanently drop (irreversible)
 
 Optional bearer-token auth: pass ``auth_token`` (or set ``AI_HOUKAI_HTTP_TOKEN``)
 and every request must carry ``Authorization: Bearer <token>``.  ``/health`` and
@@ -866,7 +866,22 @@ def _trash_restore(store: MemoryStore, m, q, b):
 
 
 def _trash_purge(store: MemoryStore, m, q, b):
-    return 200, {"purged": store.trash_purge(b.get("memory_id"))}
+    """Drop one entry, apply a retention cutoff, or empty the trash.
+
+    ``older_than_days`` is honoured here rather than ignored: read as a plain
+    "no memory_id" request it would fall through to emptying the *whole* trash,
+    so a client asking to reclaim month-old entries would irreversibly destroy
+    every recoverable memory instead. The Go port and the MCP tool both take
+    the two arguments, and both refuse them together.
+    """
+    memory_id = b.get("memory_id") or None
+    older_than = _body_float(b, "older_than_days")
+    if memory_id is not None and older_than is not None:
+        raise HttpError(400,
+                        "pass either memory_id or older_than_days, not both")
+    if older_than is not None:
+        return 200, {"purged": store.trash_purge_expired(older_than)}
+    return 200, {"purged": store.trash_purge(memory_id)}
 
 
 Route = tuple[str, "re.Pattern[str]", Callable, bool]  # method, pat, fn, needs_body

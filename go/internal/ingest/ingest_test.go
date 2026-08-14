@@ -86,3 +86,44 @@ func TestTrailingHeadingKept(t *testing.T) {
 		t.Errorf("got %#v", chunks)
 	}
 }
+
+// minChars drops noise, not the tail of a real paragraph. Greedy sentence
+// packing leaves a short fragment whenever the next sentence will not fit, and
+// applying the noise filter to it deletes ingested text with no warning:
+// separators and stray bullets are noise, the last sentence of a paragraph is
+// content.
+func TestChunkTextKeepsShortSplitFragments(t *testing.T) {
+	tail := "Tiny tail."
+	para := strings.Repeat("A", 38) + ". " + strings.Repeat("B", 38) + ". " +
+		strings.Repeat("C", 96) + ". " + tail
+
+	chunks := ChunkText(para, 100, 30)
+	joined := strings.Join(chunks, " ")
+	for _, want := range []string{
+		strings.Repeat("A", 38) + ".",
+		strings.Repeat("B", 38) + ".",
+		strings.Repeat("C", 96) + ".",
+		tail,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("chunking lost %q; got %q", want, chunks)
+		}
+	}
+}
+
+// A runt can also come first, when one huge sentence follows a tiny one.
+func TestChunkTextKeepsAShortLeadingFragment(t *testing.T) {
+	chunks := ChunkText("Hi. "+strings.Repeat("Z", 300)+".", 100, 30)
+	if !strings.Contains(strings.Join(chunks, " "), "Hi.") {
+		t.Errorf("leading fragment lost; got %q", chunks)
+	}
+}
+
+// The filter must keep doing its job on standalone short blocks.
+func TestChunkTextStillDropsNoiseBlocks(t *testing.T) {
+	body := strings.Repeat("R", 80)
+	chunks := ChunkText("---\n\n"+body+"\n\n*\n", 500, 30)
+	if len(chunks) != 1 || chunks[0] != body {
+		t.Errorf("noise blocks should still be dropped; got %q", chunks)
+	}
+}

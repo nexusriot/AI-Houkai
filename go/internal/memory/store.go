@@ -606,6 +606,15 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if opts.MinCosine != nil && (*opts.MinCosine < -1 || *opts.MinCosine > 1) {
 		return nil, validationErrorf("min_cosine must be in [-1, 1]")
 	}
+	// "" means unspecified and defaults to pool. Anything else has to be a
+	// known mode: "corpus" replaced an earlier "fts" spelling, and unvalidated
+	// that name reads as "pool", losing full-corpus recall with no error.
+	if opts.LexicalIndex != "" {
+		if err := validateChoice(string(opts.LexicalIndex),
+			LexicalIndexes, "lexical_index"); err != nil {
+			return nil, err
+		}
+	}
 
 	t0 := time.Now()
 	s.recordCall("recall")
@@ -922,6 +931,10 @@ const (
 	LexicalCorpus LexicalIndexMode = "corpus"
 )
 
+// LexicalIndexes is the validated vocabulary, mirroring Python's
+// LEXICAL_INDEXES. The retired "fts" spelling is deliberately absent.
+var LexicalIndexes = []string{string(LexicalPool), string(LexicalCorpus)}
+
 // Forget deletes a memory by ID. Returns true if found and deleted.
 func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
 	items, err := s.backend.Get(ctx, []string{id})
@@ -1019,8 +1032,11 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 		}
 		textChanged = newText != mem.Text
 		// Keep the dedup hash in step, or an edited memory would still answer
-		// to its original text on the next idempotent write.
-		if textChanged && mem.ContentHash != "" {
+		// to its original text on the next idempotent write. Unconditional, as
+		// in the Python port: a row written before the field existed reads back
+		// with an empty hash, and skipping it here would leave that row unable
+		// to dedup for the rest of its life.
+		if textChanged {
 			mem.ContentHash = ContentHash(newText)
 		}
 		mem.Text = newText

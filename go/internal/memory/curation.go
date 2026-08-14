@@ -117,6 +117,12 @@ func (s *MemoryStore) Merge(ctx context.Context, targetID, otherID, separator st
 		target.Links = append(target.Links, Link{To: l.To, Rel: l.Rel})
 	}
 
+	// The dedup hash has to move with the text, exactly as Edit moves it. Left
+	// stale, the merged row still answers to its *pre-merge* text: the next
+	// idempotent write of that text is absorbed as a duplicate and silently
+	// lost, while the text the row now actually holds never matches at all.
+	target.ContentHash = ContentHash(target.Text)
+
 	// Text changed, so the vector must be recomputed — a merged memory that
 	// kept the pre-merge embedding would not be findable by its new half.
 	if err := s.UpdateMemory(ctx, target, true); err != nil {

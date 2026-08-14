@@ -676,3 +676,43 @@ class TestIdempotentRepeatReportsNoNewRow:
         status, body = _req(server, "POST", "/memories", {"text": "no flag here"})
         assert status == 201, body
         assert body["stored"] is True
+
+
+class TestTrashPurgeHonoursRetention:
+    """`older_than_days` must not fall through to "empty the whole trash".
+
+    The handler used to read only `memory_id`, so a client asking to reclaim
+    month-old entries got every recoverable memory destroyed instead — silently,
+    and with no way back. The Go port and the MCP tool both take the argument.
+    """
+
+    def _trash_two(self, server):
+        ids = []
+        for text in ("first to bin", "second to bin"):
+            _, mem = _req(server, "POST", "/memories", {"text": text})
+            _req(server, "POST", "/trash", {"memory_id": mem["id"]})
+            ids.append(mem["id"])
+        return ids
+
+    def test_a_retention_cutoff_spares_fresh_entries(self, server):
+        self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge",
+                            {"older_than_days": 30})
+        assert status == 200, body
+        assert body["purged"] == 0, "just-trashed entries are not 30 days old"
+        _, listed = _req(server, "GET", "/trash")
+        assert len(listed["entries"]) == 2
+
+    def test_both_arguments_together_are_rejected(self, server):
+        ids = self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge",
+                            {"memory_id": ids[0], "older_than_days": 30})
+        assert status == 400, body
+        _, listed = _req(server, "GET", "/trash")
+        assert len(listed["entries"]) == 2, "a rejected request must purge nothing"
+
+    def test_an_empty_body_still_empties_the_trash(self, server):
+        self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge", {})
+        assert status == 200, body
+        assert body["purged"] == 2

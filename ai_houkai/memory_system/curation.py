@@ -41,7 +41,6 @@ __all__ = [
 TRASH_FILENAME = "trash.jsonl.gz"
 
 
-
 class MergeError(ValueError):
     """merge() could not proceed (missing memory, or a self-merge)."""
 
@@ -132,6 +131,13 @@ class CurationMixin:
                 continue
             existing.add((lnk.to, lnk.rel))
             target.links.append(type(lnk)(to=lnk.to, rel=lnk.rel))
+
+        # The dedup hash has to move with the text, exactly as edit() moves it.
+        # Left stale, the merged row still answers to its *pre-merge* text: the
+        # next idempotent write of that text is absorbed as a duplicate and
+        # silently lost, while the text the row now actually holds never
+        # matches at all.
+        self._rehash(target)
 
         # Text changed, so the vector must be recomputed — a merged memory that
         # kept the pre-merge embedding would not be findable by its new half.

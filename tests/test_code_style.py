@@ -36,13 +36,21 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 
-# A full-line comment that trails off into a run of 3+ divider characters.
-# Keying on the trailing rule catches every ordering of label and rule, while
-# leaving prose that merely contains a dash alone.
+# A full-line comment that is decorated rather than written: it either trails
+# off into a rule, or wraps a label in dashes. Keying on the trailing rule
+# catches every ordering of label and rule while leaving prose that merely
+# contains a dash alone.
+#
+# The rule must be ONE character repeated, not any mix of divider-ish
+# characters — otherwise the Python encoding cookie `# -*- coding: utf-8 -*-`
+# reads as a banner, because `-`, `*` and `-` are each divider-ish on their own.
 _BANNER = re.compile(
-    r"""^\s*(?:\#|//)      # the line is nothing but a comment
-        .*?                # whatever it says
-        [-=─—~*_]{3,}\s*$  # trailing decorative rule
+    r"""^\s*(?:\#|//)\s*                      # the line is nothing but a comment
+        (?:
+            .*?([-=─—~*_])\1{2,}              # …trailing decorative rule, or
+          | [-–—]{1,2}\s+\S.*\S\s+[-–—]{1,2}  # …a label bookended by dashes
+        )
+        \s*$
     """,
     re.VERBOSE,
 )
@@ -152,6 +160,20 @@ def test_imports_are_at_module_top():
     ("x = 1  # --- not a full-line comment", False),
     # Two dividers is punctuation, not decoration.
     ("# an aside -- like this one", False),
+    # Bookended labels: the same decorative table-of-contents habit written with
+    # a single dash on each side instead of a rule.
+    ("# — linking —", True),
+    ("    # — empty store —", True),
+    ("// — helpers —", True),
+    ("# - setup -", True),
+    # An em-dash used as punctuation mid-sentence is not a bookended label.
+    ("# recall reads the pool — and only the pool", False),
+    ("# see also: the note above", False),
+    # A rule is one character repeated. The Python encoding cookie ends in
+    # "-*-", three characters that are all individually divider-ish, so a
+    # detector keying on a mixed run rejects a legal source line.
+    ("# -*- coding: utf-8 -*-", False),
+    ("# -*- mode: python -*-", False),
 ])
 def test_banner_pattern_discriminates(line, is_banner):
     """The detector has to be sharp enough to be worth having."""

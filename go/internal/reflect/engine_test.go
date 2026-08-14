@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	"github.com/nexusriot/ai-houkai/internal/vector"
@@ -504,5 +505,74 @@ func TestReflectDryRunShowsThePinItWouldSet(t *testing.T) {
 	if len(created) != 1 || !created[0].Pinned {
 		t.Fatalf("dry-run summary = %+v, want it pinned — a preview must show "+
 			"what would actually be written", created)
+	}
+}
+
+// episodeExpiring builds an episodic item whose TTL deadline is expiresAt.
+func episodeExpiring(id string, vec []float32, imp float32, expiresAt float64) vector.Item {
+	m := memory.Memory{
+		ID:         id,
+		Type:       memory.Episodic,
+		Importance: imp,
+		Tags:       []string{"t-" + id},
+		ExpiresAt:  expiresAt,
+	}
+	return vector.Item{
+		ID:        id,
+		Content:   "text-" + id,
+		Embedding: vec,
+		Metadata:  memory.MemoryToMetadata(m),
+	}
+}
+
+// A TTL means the content stops being available: recall, list and stats hide it
+// and PurgeExpired eventually reclaims it. Reflect reads the collection
+// directly, so without an expiry filter it clusters lapsed rows and writes
+// their text into a fresh, NON-expiring summary — resurrecting permanently what
+// the caller gave a lifetime. Same laundering shape as the trust rule.
+func TestReflectSkipsExpiredSources(t *testing.T) {
+	past := float64(time.Now().Add(-time.Hour).Unix())
+	store := &fakeReflectStore{items: []vector.Item{
+		episode("live", []float32{1, 0, 0}, 0.9),
+		episodeExpiring("lapsed", []float32{0.99, 0.01, 0}, 0.8, past),
+	}}
+	e := New(store, 0.5, 2, nil)
+
+	clusters, err := e.Clusters(context.Background())
+	if err != nil {
+		t.Fatalf("Clusters: %v", err)
+	}
+	// Only one live candidate remains, below minClusterSize, so nothing
+	// summarises at all.
+	if len(clusters) != 0 {
+		t.Errorf("Clusters() = %d clusters, want 0 once the lapsed row is excluded", len(clusters))
+	}
+
+	created, err := e.Reflect(context.Background(), false, "")
+	if err != nil {
+		t.Fatalf("Reflect: %v", err)
+	}
+	for _, m := range created {
+		if strings.Contains(m.Text, "text-lapsed") {
+			t.Errorf("summary %q carries an expired source's text", m.Text)
+		}
+	}
+}
+
+// Only *lapsed* rows are excluded — a deadline in the future is still live.
+func TestReflectKeepsUnexpiredTTLSources(t *testing.T) {
+	future := float64(time.Now().Add(time.Hour).Unix())
+	store := &fakeReflectStore{items: []vector.Item{
+		episode("a", []float32{1, 0, 0}, 0.9),
+		episodeExpiring("b", []float32{0.99, 0.01, 0}, 0.8, future),
+	}}
+	e := New(store, 0.5, 2, nil)
+
+	clusters, err := e.Clusters(context.Background())
+	if err != nil {
+		t.Fatalf("Clusters: %v", err)
+	}
+	if len(clusters) != 1 {
+		t.Errorf("Clusters() = %d, want 1 (a future TTL is still eligible)", len(clusters))
 	}
 }

@@ -1,6 +1,9 @@
 package memory
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestNegationParity(t *testing.T) {
 	cases := []struct {
@@ -131,5 +134,34 @@ func TestDetectConflictsSkipsSelf(t *testing.T) {
 	got := detectConflicts(a, []MemoryWithScore{{Memory: a, Score: 1.0}}, 0.5, nil)
 	if len(got) != 0 {
 		t.Errorf("self-match should be skipped, got %d conflicts", len(got))
+	}
+}
+
+// A lapsed memory must not be reported as a conflict. Expired rows are hidden
+// from recall/list and findByContentHash skips them, so a re-assertion creates a
+// fresh memory rather than resurrecting a dead one. Without the same filter here
+// an invisible row rejects a legitimate write under on_conflict="raise" — a
+// conflict the caller cannot inspect, resolve, or even see.
+func TestDetectConflictsSkipsExpired(t *testing.T) {
+	past := float64(time.Now().Add(-time.Hour).Unix())
+	a := Memory{ID: "a", Type: Semantic, Text: "the build is green", Tags: []string{"ci"}}
+	lapsed := Memory{ID: "b", Type: Semantic, Text: "the build is green",
+		Tags: []string{"ci"}, ExpiresAt: past}
+	got := detectConflicts(a, []MemoryWithScore{{Memory: lapsed, Score: 1.0}}, 0.8, nil)
+	if len(got) != 0 {
+		t.Errorf("expired candidate must be skipped, got %d conflicts", len(got))
+	}
+}
+
+// Only *lapsed* rows are excluded — a deadline in the future is still live, so
+// the filter must not blunt the feature.
+func TestDetectConflictsKeepsUnexpired(t *testing.T) {
+	future := float64(time.Now().Add(time.Hour).Unix())
+	a := Memory{ID: "a", Type: Semantic, Text: "the build is green", Tags: []string{"ci"}}
+	live := Memory{ID: "b", Type: Semantic, Text: "the build is green",
+		Tags: []string{"ci"}, ExpiresAt: future}
+	got := detectConflicts(a, []MemoryWithScore{{Memory: live, Score: 1.0}}, 0.8, nil)
+	if len(got) != 1 {
+		t.Errorf("a future TTL is still a live conflict, got %d", len(got))
 	}
 }

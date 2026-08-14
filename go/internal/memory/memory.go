@@ -77,15 +77,28 @@ const (
 // an index comparison implements "at least this trusted".
 var TrustLevels = []string{"trusted", "reported", "untrusted"}
 
-// TrustRank returns the position of a level in TrustLevels; an empty or
-// unknown value reads as trusted, matching how old rows deserialise.
+// TrustRank returns the position of a level in TrustLevels — higher is less
+// trusted.
+//
+// An *empty* level reads as trusted, matching how old rows deserialise: a store
+// written before the field existed must not change behaviour just by being
+// opened with a newer build.
+//
+// An *unrecognised* non-empty level reads as the worst case. It can only come
+// from a hand-edited store or a build that knows a level this one does not, and
+// failing safe is the only defensible default for a provenance label — reading
+// it as trusted would launder unknown content into an answer the caller asked
+// to be trusted.
 func TrustRank(t TrustLevel) int {
+	if t == "" {
+		return 0
+	}
 	for i, s := range TrustLevels {
 		if string(t) == s {
 			return i
 		}
 	}
-	return 0
+	return len(TrustLevels) - 1
 }
 
 // WorstTrust returns the least-trusted level among levels.
@@ -95,6 +108,11 @@ func TrustRank(t TrustLevel) int {
 // untrusted; merging untrusted text into a trusted memory makes the result
 // untrusted. Anything else is a laundering path: content the agent did not
 // author ends up recallable under MinTrust="trusted".
+//
+// No levels at all yields "trusted". Every caller passes at least one — a
+// cluster's members, or the two sides of a merge — so this is an unreachable
+// edge rather than a policy choice; it is spelled out because it used to be
+// silent.
 func WorstTrust(levels ...TrustLevel) TrustLevel {
 	worst := 0
 	for _, l := range levels {

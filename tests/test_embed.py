@@ -193,7 +193,11 @@ class TestBuildEmbedder:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         assert build_embedder("openai:m").api_key == ""
 
+    @pytest.mark.needs_model
     def test_local_returns_the_cached_loader(self):
+        # Both sides construct the real SentenceTransformerEmbeddingFunction:
+        # the identity holds because local_embedder is lru_cached, but reaching
+        # it at all needs sentence-transformers installed.
         assert build_embedder("local:all-MiniLM-L6-v2") is local_embedder(
             "all-MiniLM-L6-v2")
 

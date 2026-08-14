@@ -35,6 +35,10 @@ dependencies = [
     # cannot import. Lift the cap in the same change that ports
     # ai_houkai/mcp_server/server.py to the 2.x API.
     "mcp>=1.2.0,<2",
+    # config.toml parsing. tomllib landed in the 3.11 stdlib; on 3.10 the
+    # config loader falls back to its backport, and the loader is reached from
+    # the MCP server as well as the CLI, so this belongs in the core deps.
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 

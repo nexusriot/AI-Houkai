@@ -5,12 +5,12 @@ carrying the query's exact tokens but embedding weakly never enters it — and s
 can never be surfaced by the BM25 term. `lexical_index="corpus"` closes that
 gap using Chroma's own `where_document` filter.
 
-This replaced a SQLite FTS5 sidecar. The sidecar's lexical lookup was faster in
-absolute terms (0.03 ms flat vs ~4.5 ms at 25k rows, since it was a real
-inverted index) but it was a second source of truth for data Chroma already
-held, and it needed verify-on-open / disable-on-mismatch / reindex machinery to
-stay safe. On a path already dominated by an embedding call, and in a service
-that runs its own SQLite, that trade did not pay.
+A SQLite FTS5 index was measured against this and rejected. Its lexical lookup
+was faster in absolute terms (0.03 ms flat vs ~4.5 ms at 25k rows, being a real
+inverted index) but it would be a second source of truth for data Chroma already
+holds, needing verify-on-open / disable-on-mismatch / rebuild machinery to stay
+safe. On a path already dominated by an embedding call, and in a service that
+runs its own SQLite, that trade does not pay. See docs/DESIGN.md §25.
 """
 
 from __future__ import annotations
@@ -183,6 +183,69 @@ class TestTokenHandling:
             # proves the call site has no second guard hiding a real bug.
             store.recall("resilience", k=1, mode="hybrid",
                          lexical_index="corpus")
+
+
+class TestSelectionSurvivesTheUnion:
+    """Unioning lexical candidates must not cost the pool its embeddings.
+
+    ``_union_lexical`` rebuilds Chroma's result dict, and MMR / dedup are the
+    only consumers of its ``embeddings`` key. Losing that key does not raise —
+    dedup stops firing and the diversity penalty silently goes to zero — so
+    only a behavioural test notices. Chroma hands embeddings back as a numpy
+    array rather than a list, which is exactly what a rebuild is liable to drop.
+    """
+
+    @staticmethod
+    def _keyed_embedder(marker: str):
+        """Rows containing *marker* embed orthogonally to every other row.
+
+        That lets a query which does not contain the marker rank those rows
+        last by vector distance, so they can only enter the pool through the
+        lexical union — while still matching it as a literal token for BM25.
+        """
+        def emb(texts):
+            return [[1.0, 0.0] if marker in t else [0.0, 1.0] for t in texts]
+        return emb
+
+    def test_union_keeps_embeddings_for_the_whole_pool(self, tmp_path):
+        s = MemoryStore(path=str(tmp_path / "chroma"), collection="union_embs",
+                        embedding_function=self._keyed_embedder("dup"))
+        try:
+            s.remember("quetzalcoatlus dup")
+            s.remember_many([f"filler number {i}" for i in range(6)])
+
+            include = ["documents", "metadatas", "distances", "embeddings"]
+            res = s.collection.query(query_texts=["quetzalcoatlus"],
+                                     n_results=1, where=None, include=include)
+            merged = s._union_lexical(res, "quetzalcoatlus", 1, None, include)
+
+            assert len(merged["ids"][0]) > len(res["ids"][0]), \
+                "the union added no candidate, so this proves nothing"
+            # Every row in the merged pool must still resolve to a vector,
+            # including the ones that were already there.
+            assert len(s._emb_map(merged)) == len(merged["ids"][0])
+        finally:
+            s.client.close()
+
+    def test_dedup_still_fires_on_a_unioned_pool(self, tmp_path):
+        """The symptom the dropped key produces: a byte-identical pair, cosine
+        1.0 apart, both surviving a 0.95 dedup threshold."""
+        s = MemoryStore(path=str(tmp_path / "chroma"), collection="union_dedup",
+                        embedding_function=self._keyed_embedder("dup"))
+        try:
+            a = s.remember("quetzalcoatlus dup")
+            b = s.remember("quetzalcoatlus dup")
+            s.remember_many([f"filler number {i}" for i in range(20)])
+
+            # k=2 / overfetch=1 makes the vector pool two rows wide out of 22,
+            # so the pair is outside it and arrives only via the union.
+            hits = s.recall("quetzalcoatlus", k=2, overfetch=1, mode="hybrid",
+                            weights=LEXICAL_FIRST, dedup_threshold=0.95,
+                            lexical_index="corpus")
+            ids = [m.id for m, _ in hits]
+            assert ids.count(a.id) + ids.count(b.id) == 1
+        finally:
+            s.client.close()
 
 
 class TestChromaNativeExpiry:

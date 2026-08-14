@@ -107,10 +107,17 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 		}
 		if e.scoreAt(m, now) < e.MinScore {
 			if !dryRun {
+				// Only report what actually left. A row can vanish between the
+				// listing and here, and this slice is both the caller's audit
+				// trail and what the scheduler adds to its cumulative total.
+				var removed bool
 				if recoverable {
-					_, _ = bin.Trash(ctx, m.ID)
+					removed, _ = bin.Trash(ctx, m.ID)
 				} else {
-					_, _ = e.store.Forget(ctx, m.ID)
+					removed, _ = e.store.Forget(ctx, m.ID)
+				}
+				if !removed {
+					continue
 				}
 			}
 			pruned = append(pruned, m)

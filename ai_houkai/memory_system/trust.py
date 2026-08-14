@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Iterable, Literal
 
-__all__ = ["TRUST_LEVELS", "TrustLevel", "worst_trust"]
+__all__ = ["TRUST_LEVELS", "TrustLevel", "trust_rank", "worst_trust"]
 
 # How much a memory's ORIGIN is trusted — not how confident we are that it is
 # true (that is `importance`) and not whether it is current (that is
@@ -22,6 +22,30 @@ __all__ = ["TRUST_LEVELS", "TrustLevel", "worst_trust"]
 TrustLevel = Literal["trusted", "reported", "untrusted"]
 
 TRUST_LEVELS: tuple[str, ...] = ("trusted", "reported", "untrusted")
+
+
+def trust_rank(level: str) -> int:
+    """Position of *level* in :data:`TRUST_LEVELS` — higher is less trusted.
+
+    Two cases that look alike but are not:
+
+    An **absent** level (``""``) ranks as trusted. Rows written before the
+    trust field existed deserialise that way, and opening an old store with a
+    newer build must not change what recall returns.
+
+    An **unrecognised** non-empty level ranks as the worst case. It can only
+    reach here from a hand-edited store or from a build that knows a level this
+    one does not, and failing safe is the only defensible default for a
+    provenance label. Reading it as trusted would launder unknown content into
+    an answer the caller asked to be trusted; raising would let one odd row
+    break every provenance-filtered recall.
+    """
+    if not level:
+        return 0
+    try:
+        return TRUST_LEVELS.index(level)
+    except ValueError:
+        return len(TRUST_LEVELS) - 1
 
 
 def worst_trust(levels: Iterable[str]) -> str:
@@ -34,14 +58,9 @@ def worst_trust(levels: Iterable[str]) -> str:
     content the agent did not author ends up recallable under
     ``min_trust="trusted"``.
 
-    An unrecognised level (from a hand-edited store, or a future level this
-    build does not know) is treated as the worst case rather than ignored —
-    failing safe is the only defensible default for a provenance label.
+    No levels at all yields ``"trusted"``. Every caller passes at least one — a
+    cluster's members, or the two sides of a merge — so this is an unreachable
+    edge rather than a policy choice; it is spelled out because it used to be
+    silent.
     """
-    worst = 0
-    for level in levels:
-        try:
-            worst = max(worst, TRUST_LEVELS.index(level))
-        except ValueError:
-            return TRUST_LEVELS[-1]
-    return TRUST_LEVELS[worst]
+    return TRUST_LEVELS[max((trust_rank(level) for level in levels), default=0)]

@@ -579,7 +579,7 @@ semantic "summary" memory.
 ### Algorithm
 
 ```
-1. Fetch all episodic memories from ChromaDB (with stored embeddings).
+1. Fetch candidates of the configured types from ChromaDB (with embeddings).
 2. Sort by importance descending — highest importance seeds first.
 3. Greedy single-linkage clustering:
       for each unseeded memory (highest importance first):
@@ -587,13 +587,48 @@ semantic "summary" memory.
           absorb every other unseeded memory whose cosine
           similarity to the seed ≥ similarity_threshold
 4. Discard clusters with fewer than min_cluster_size members.
-5. For each qualifying cluster:
+5. Skip any cluster whose members are already at max_level.
+6. For each qualifying cluster:
       text       = summarizer(cluster_members)
-      tags       = ["reflection"] + union of all source tags
+      tags       = ["reflection", "level:N"] + union of source tags
       importance = mean(source importances)
+      trust      = worst trust among the sources
       store new semantic memory  →  MemoryStore.remember()
-6. If consolidate=True: delete all source episodic memories.
+7. consolidate: none = leave sources; soft = supersede them;
+   hard = delete them.
 ```
+
+### What gets clustered, and how deep
+
+`types` was hard-coded to `("episodic",)`, which had two consequences. Semantic
+memories — **including reflections themselves** — never consolidated, so a
+long-lived store accumulated summaries without bound; and `feedback` /
+`procedural` never benefited at all. It is now a parameter, defaulting to
+`("episodic",)` so existing behaviour is unchanged.
+
+Letting reflections re-cluster raises the opposite risk: a summary of summaries
+of summaries, eating the store. Each summary is tagged `level:N` and a cluster
+whose members already sit at `max_level` is skipped. `max_level=1` (the default)
+reproduces the old behaviour — summaries are produced but never re-summarised —
+and raising it builds a deliberate tier hierarchy.
+
+A summary inherits the **worst** trust among its sources: reflecting over
+content the agent did not author would otherwise launder it into a `trusted`
+memory that `min_trust="trusted"` happily returns (§27). It is born `pinned`
+only when `consolidate` removes the sources from the working set — see §27.
+
+Candidates are filtered before clustering, and the reasons rhyme. A
+**superseded** row was already consolidated, so re-clustering it would emit a
+duplicate summary every run. A **lapsed** row (§21) is hidden from recall and
+waiting for `purge_expired`; folding it in would copy its text into a fresh
+summary carrying no TTL of its own, turning a deliberate lifetime into a
+permanent row. In both cases a summary must not grant its sources more reach
+than they had — the same rule as the trust inheritance above.
+
+**Known limitation.** `_cluster` is O(n²) over a pure-Python `_cosine`: fine at
+a thousand memories, painful at twenty thousand. The cheap mitigation, if it
+ever bites, is to cluster within a vector-index candidate pool rather than the
+full cross-product.
 
 ### Clustering properties
 
@@ -677,12 +712,15 @@ from ai_houkai.memory_system import MemoryStore, ReflectionEngine
 engine = ReflectionEngine(store,
                           similarity_threshold=0.75,
                           min_cluster_size=2,
-                          summarizer=None)
+                          summarizer=None,
+                          types=("episodic",),   # what to cluster
+                          max_level=1)           # tiers of reflection-of-reflection
 
 clusters = engine.clusters()              # list[list[Memory]], no writes
 previews = engine.reflect(dry_run=True)   # list[Memory], not persisted
-created  = engine.reflect()               # persist semantic memories
-created  = engine.reflect(consolidate=True)  # + delete source episodics
+created  = engine.reflect()               # persist summaries, sources untouched
+created  = engine.reflect(consolidate=True)   # + supersede the sources
+created  = engine.reflect(consolidate="hard") # + delete the sources
 ```
 
 ### ChromaDB numpy array guard
@@ -1018,7 +1056,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 1094 tests across 44 files
+### 1232 tests across 45 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -1027,19 +1065,19 @@ LLM API  ──►  assistant reply to user
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
 | `test_pack.py` | 54 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
-| `test_validation.py` | 44 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
+| `test_validation.py` | 46 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
-| `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
+| `test_conflicts.py` | 39 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic, and that a **lapsed** candidate never clashes with a new write |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
-| `test_reflection.py` | 24 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources, polarity-cluster separation |
-| `test_async_store.py` | 24 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose |
+| `test_reflection.py` | 27 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded **and lapsed** sources, polarity-cluster separation |
+| `test_async_store.py` | 51 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose, plus a mechanical signature check — walking the MRO, so the twelve curation methods inherited from `CurationMixin` are covered too — so a wrapper cannot quietly drop a parameter the sync method gained |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_journal.py` | 22 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
-| `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
+| `test_ingest.py` | 26 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips, and that splitting a long paragraph never loses a short fragment to the noise filter |
 | `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
 | `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
-| `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
+| `test_decay.py` | 26 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store, routing to the trash, and not counting a row whose removal failed), recall reinforcement (`frequency_weight`) |
 | `test_remember_many.py` | 20 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
 | `test_mcp_server.py` | 22 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
@@ -1048,6 +1086,7 @@ LLM API  ──►  assistant reply to user
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
 | `test_installers.py` | 14 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
+| `test_trust.py` | 13 | **Provenance trust** rules: `worst_trust` takes the worst case (so a derived memory cannot launder its sources), `trust_rank` separates an *absent* level — old rows, which read as trusted — from an *unrecognised* one, which fails safe as least-trusted so a hand-edited or future-version row is filtered out rather than crashing a `min_trust` recall (ranked pool and the `include_pinned` lane alike) |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_doctor.py` | 11 | **Diagnostics**: `probe_embedding`/`readiness` (incl. embedder-failure, cache TTL, no-cache-on-failure), `GET /ready` (200/503, auth-exempt, sanitized body), `houkai doctor` CLI (text + `--json`) |
 | `test_history.py` | 10 | **History / point-in-time**: `history()` timeline (incl. link/supersede counterparts), `state_at` / `get_at` replay, nuke reset, link-delta replay |
@@ -1056,13 +1095,13 @@ LLM API  ──►  assistant reply to user
 | `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
 | `test_metrics.py` | 7 | **Runtime metrics**: op counters (incl. link/unlink/restore/purge mutators), recall-latency recording + p50/p95/p99 percentiles, empty-recall counting, backend count |
 | `test_curation.py` | 49 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
-| `test_corpus_lexical.py` | 15 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, and the Chroma-native `purge_expired` range query |
+| `test_corpus_lexical.py` | 17 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, the merged pool keeping its embeddings so MMR/dedup still apply, and the Chroma-native `purge_expired` range query |
 | `test_working_set.py` | 36 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
 | `test_mcp_retrieval_knobs.py` | 35 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour |
 | `test_embed.py` | 31 | **Pluggable embedder**: OpenAI-compatible + Ollama backends against a stub server (auth, batching, out-of-order reindexing, count mismatch, wrapped errors), `build_embedder` spec grammar, credentials never from the spec, the store seam + env var + precedence, `FakeEmbedder` determinism/normalisation, and a full store round-trip with no model |
 | `test_eval_wiring.py` | 23 | Gold-set parsing (comments, malformed lines, id-prefix resolution, unresolvable id is an error not a zero score), `houkai eval` scores + recorded config + read-only guarantee, the `eval_recall` MCP tool |
 | `test_surface_coverage.py` | 23 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands |
-| `test_code_style.py` | 11 | House rules enforced mechanically: no banner comments, no function-level imports (plus the detector's own discrimination cases) |
+| `test_code_style.py` | 31 | House rules enforced mechanically: no banner comments (trailing rules **and** dash-bookended labels, across .py/.go/.sh/.yml/.toml/Makefile/Dockerfile), no import below module top, plus the detectors' own discrimination cases |
 | `test_public_get.py` | 9 | `MemoryStore.get()` as public API: plain read (no touch, no journal), returns superseded/expired, async wrapper, deprecated `_get_by_id` alias, MCP `get` tool |
 | `test_parity.py` | 8 | The Python surface matches `parity.json` — MCP tool list, HTTP routes, recall knobs — and every tool/route appears in its module docstring |
 | `test_fd_hygiene.py` | 1 | ChromaDB file-descriptor reclamation across many store open/close cycles |
@@ -1182,6 +1221,8 @@ Pass `include_superseded=True` to see them.
 ```
 candidates(a) = recall(a.text, n=12)
 for b in candidates:
+    if b.superseded_by             → skip
+    if b has lapsed (expires_at)   → skip
     if b.type != a.type            → skip
     if sim(a,b) < threshold        → skip   (default 0.80)
     if both have tags & disjoint   → skip   (an untagged side never triggers
@@ -1195,6 +1236,12 @@ for b in candidates:
 
 `negation_diff`: strips apostrophes, tokenises, counts negation words
 (`not`, `never`, `no`, `dont`, …), returns True if parity differs.
+
+Superseded and **lapsed** candidates are skipped for the same reason
+`find_by_content_hash` skips them: they are hidden from recall, list and stats,
+so letting one clash with a new write would reject it under
+`on_conflict="raise"` with a conflict the caller cannot see or resolve — and
+under `"supersede"` would re-label a row that is already on its way out.
 
 ### on_conflict policies
 
@@ -2209,34 +2256,36 @@ filters exactly as a vector hit does.
 Off by default (`"pool"`), because the scan is real: ~4.5 ms at 25k memories,
 growing linearly.
 
-### Why there is no sidecar index
+### Why there is no second index
 
-An earlier iteration shipped an opt-in SQLite metadata + FTS5 sidecar beside
-`.chroma`, claiming five payoffs: full-corpus BM25, cursor pagination, O(1)
-reverse links, tag counts, and an indexed expiry sweep. Measurement retired it:
+Full-corpus lexical recall could instead be served by a SQLite metadata + FTS5
+index beside `.chroma`, promising five payoffs: full-corpus BM25, cursor
+pagination, O(1) reverse links, tag counts, and an indexed expiry sweep.
+Measurement ruled it out:
 
 | Operation | 3k rows | 25k rows |
 |---|---|---|
-| Sidecar FTS lookup | 0.03 ms | 0.03 ms (flat — a real inverted index) |
+| SQLite FTS lookup | 0.03 ms | 0.03 ms (flat — a real inverted index) |
 | Chroma `$contains` | 0.91 ms | 4.52 ms (linear) |
-| Sidecar `list_recent(50)` | 3.24 ms | **13.86 ms** |
+| SQLite `list_recent(50)` | 3.24 ms | **13.86 ms** |
 | Chroma `get(limit=50)` | 2.03 ms | **3.72 ms** |
 
-Chroma turned out to do four of the five natively — and two of them *better*:
+Chroma does four of the five natively — and two of them *better*:
 
-- **Pagination** — `limit`/`offset`. The sidecar was ~4× slower, because serving
-  ids from the index and then fetching them from Chroma is two round-trips.
+- **Pagination** — `limit`/`offset`. Going through an index was ~4× slower,
+  because serving ids from it and then fetching them from Chroma is two
+  round-trips.
 - **Expiry sweep** — `where={"$and": [{"expires_at": {"$gt": 0}}, …]}`.
-  `purge_expired` now pushes the range down instead of loading the collection.
+  `purge_expired` pushes the range down instead of loading the collection.
 - **Type counts** — `where={"type": …}` with `include=[]`.
 - **Lexical reachability** — `where_document`, as above.
 
-What was genuinely lost is the *flat* lookup curve: at 10⁶ memories a linear
-scan is ~180 ms where an inverted index stays at 0.03 ms. That is a real trade,
-made deliberately. Against it: the sidecar was a second source of truth for data
-Chroma already held, so it needed verify-on-open, disable-on-mismatch and
-`reindex` machinery purely to keep a cache from lying; it duplicated the text; it
-was one database *per collection*, which in a multi-tenant deployment means N
+What a linear scan gives up is the *flat* lookup curve: at 10⁶ memories it costs
+~180 ms where an inverted index stays at 0.03 ms. That is a real trade, made
+deliberately. Against paying for it: a second index is a second source of truth
+for data Chroma already holds, so it needs verify-on-open, disable-on-mismatch
+and rebuild machinery purely to keep a cache from lying; it duplicates the text;
+it is one database *per collection*, which in a multi-tenant deployment means N
 satellite files with N failure modes; and the primary consumer
 (`ai-houkai-service`) already runs its own WAL SQLite. Three SQLite databases in
 one stack — Chroma's, the service's, and one per collection — to save

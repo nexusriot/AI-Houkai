@@ -45,7 +45,7 @@
 //	POST   /trash        {memory_id}               soft-delete (recoverable)
 //	GET    /trash                                  list soft-deleted memories
 //	POST   /trash/restore {memory_id}              bring one back
-//	POST   /trash/purge  {memory_id?}              permanently drop (irreversible)
+//	POST   /trash/purge  {memory_id?, older_than_days?}  permanently drop (irreversible)
 //
 // Optional bearer-token auth: pass a token (or set AI_HOUKAI_HTTP_TOKEN) and
 // every request must carry "Authorization: Bearer <token>". /health and /ready

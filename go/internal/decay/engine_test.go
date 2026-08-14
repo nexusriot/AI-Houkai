@@ -234,3 +234,31 @@ func TestPruneFallsBackToForgetWithoutTrash(t *testing.T) {
 		t.Fatalf("forgot = %v, want [old]", fs.forgot)
 	}
 }
+
+// failingTrash accepts Trash calls but reports that nothing was removed, the
+// way a vanished row or a failed trash write does.
+type failingTrash struct{ mems []memory.Memory }
+
+func (f *failingTrash) ListRecent(_ context.Context, _ int, _, _ bool) ([]memory.Memory, error) {
+	return f.mems, nil
+}
+func (f *failingTrash) Forget(_ context.Context, _ string) (bool, error) { return false, nil }
+func (f *failingTrash) Trash(_ context.Context, _ string) (bool, error)  { return false, nil }
+
+// Prune's return value is the caller's audit trail, and the scheduler adds its
+// length to a cumulative total. Counting a row it did not manage to remove
+// over-reports what left the store.
+func TestPruneDoesNotReportAFailedTrash(t *testing.T) {
+	store := &failingTrash{mems: []memory.Memory{
+		{ID: "doomed", Importance: 0.1, LastAccessed: ts(400)},
+	}}
+	e := New(store, 0.5, 0.9, nil, 0)
+
+	pruned, err := e.Prune(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("reported %d pruned, want 0 when the trash write failed", len(pruned))
+	}
+}

@@ -42,7 +42,7 @@ from ai_houkai.embed import (
 
 from .curation import CurationMixin
 from .journal import Journal, JournalEntry
-from .trust import TRUST_LEVELS, TrustLevel, worst_trust
+from .trust import TRUST_LEVELS, TrustLevel, trust_rank, worst_trust
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
 
@@ -64,6 +64,10 @@ MEMORY_TYPES:      tuple[str, ...] = ("episodic", "semantic", "procedural", "fee
 LINK_RELS:         tuple[str, ...] = ("related", "refines", "derived_from",
                                       "example_of", "contradicts", "supersedes")
 RECALL_MODES:      tuple[str, ...] = ("semantic", "hybrid")
+# Where hybrid recall draws its lexical candidates from. "corpus" replaced an
+# earlier "fts" spelling, so that name must be rejected rather than read as
+# "pool" — see _lexical_candidates.
+LEXICAL_INDEXES:   tuple[str, ...] = ("pool", "corpus")
 FUSIONS:           tuple[str, ...] = ("weighted", "rrf")
 CONFLICT_POLICIES: tuple[str, ...] = ("ignore", "warn", "supersede", "raise")
 IMPORT_POLICIES:   tuple[str, ...] = ("skip", "overwrite", "rename", "error")
@@ -113,6 +117,12 @@ _get_embed_fn = local_embedder
 # scan in Chroma, so a long query must not turn into a long series of them; the
 # longest tokens are the most selective, so they go first.
 _LEXICAL_MAX_TOKENS = 4
+
+# The per-query lists a Chroma query returns, each wrapped one level deep (one
+# row per query text). Listed explicitly because rebuilding a result dict by
+# inspecting value types drops `embeddings`, which comes back as a numpy array
+# rather than a list — see _union_lexical.
+_QUERY_RESULT_KEYS = ("ids", "documents", "metadatas", "distances", "embeddings")
 
 ConflictFn = Callable[["Memory", "Memory"], bool]
 
@@ -325,30 +335,24 @@ class Memory:
     last_accessed: float      = field(default_factory=time.time)
     access_count:  int        = 0
     source:        str | None = None
-    # — linking —
     links:         list[Link] = field(default_factory=list)
-    # — conflict management —
     superseded_by: str  = ""    # id of the superseding memory, "" if active
     superseded_at: float = 0.0
     polarity:      int  = 0     # -1 / 0 / +1
-    # — expiry (TTL) —
     # Unix timestamp after which the memory is treated as expired: hidden from
     # recall/list and reclaimable by purge_expired(). 0.0 means "never expires".
     expires_at:    float = 0.0
-    # — working set —
     # A pinned memory is always offered to the packer and is never pruned by
     # decay or evicted. `importance` cannot express this: it simultaneously
     # drives ranking, decay survival and the min_importance filter, so raising
     # it to protect a standing instruction also distorts every search.
     pinned:        bool = False
-    # — provenance trust —
     # How much the *origin* of this memory is trusted, distinct from how
     # important or how confident it is. Anything reaching remember() becomes
     # durable, well-ranked agent context later, so a memory scraped from a web
     # page and one stated by the user need to be distinguishable at recall
     # time. "trusted" is the default so existing stores are unchanged.
     trust:         TrustLevel = "trusted"
-    # — write-time dedup —
     # Hash of the normalised text, recorded on every write so a repeated
     # assertion can be recognised without a vector query. Empty only on rows
     # written before this field existed, which simply never match.
@@ -1255,6 +1259,7 @@ class MemoryStore(CurationMixin):
         """
         _validate_choice(mode, RECALL_MODES, "mode")
         _validate_choice(fusion, FUSIONS, "fusion")
+        _validate_choice(lexical_index, LEXICAL_INDEXES, "lexical_index")
         if min_trust is not None:
             _validate_choice(min_trust, TRUST_LEVELS, "min_trust")
         if type is not None:
@@ -1328,7 +1333,7 @@ class MemoryStore(CurationMixin):
         if min_trust is not None:
             floor = TRUST_LEVELS.index(min_trust)
             scored = [(mem, s_) for mem, s_ in scored
-                      if TRUST_LEVELS.index(mem.trust) <= floor]
+                      if trust_rank(mem.trust) <= floor]
 
         # Drop expired memories (post-filter, not a Chroma where-clause, so old
         # rows without the expires_at key are unaffected). Done before rerank /
@@ -1478,9 +1483,17 @@ class MemoryStore(CurationMixin):
             return res
         fetched_embs = fetched.get("embeddings")
 
-        merged = {key: [list(value[0])] for key, value in res.items()
-                  if isinstance(value, list) and value
-                  and isinstance(value[0], list)}
+        # Rebuilt from an explicit key list rather than by sniffing the value
+        # types. Chroma hands `embeddings` back as a numpy array, not a list, so
+        # an `isinstance(value[0], list)` filter silently dropped the key — and
+        # with it every vector in the pool, leaving MMR and dedup with nothing
+        # to compare and no error to report.
+        merged: dict[str, list] = {}
+        for key in _QUERY_RESULT_KEYS:
+            value = res.get(key)
+            if value is None or len(value) == 0:
+                continue
+            merged[key] = [list(value[0])]
         for pos, mid in enumerate(fetched["ids"]):
             merged["ids"][0].append(mid)
             if "documents" in merged:
@@ -1629,7 +1642,7 @@ class MemoryStore(CurationMixin):
         pinned = self._pinned_memories()
         if min_trust is not None:
             floor = TRUST_LEVELS.index(min_trust)
-            pinned = [m for m in pinned if TRUST_LEVELS.index(m.trust) <= floor]
+            pinned = [m for m in pinned if trust_rank(m.trust) <= floor]
         if not pinned:
             return ranked
         pinned_ids = {m.id for m in pinned}
@@ -2699,6 +2712,15 @@ class MemoryStore(CurationMixin):
         # reflect / decay / import / export / undo themselves: not undoable
         return False
 
+    def _rehash(self, mem: Memory) -> None:
+        """Recompute *mem*'s dedup hash from its current text.
+
+        Lives on the store so curation.py can reach it through ``self``:
+        ``content_hash`` is defined in this module, and importing it back from
+        the mixin would close an import cycle.
+        """
+        mem.content_hash = content_hash(mem.text)
+
     def find_by_content_hash(self, text: str) -> Memory | None:
         """The live memory whose normalised text matches *text*, or None.
 
@@ -2797,7 +2819,12 @@ class MemoryStore(CurationMixin):
             return {}
         ids = res["ids"][0]
         embs = raw[0]
-        return {ids[i]: list(embs[i]) for i in range(len(ids)) if i < len(embs)}
+        # A row can carry no vector (the lexical union appends whatever the
+        # backend hands back). Omit it rather than storing None: every consumer
+        # already treats a missing id as "no embedding", while a None would turn
+        # into a TypeError the moment it was measured.
+        return {ids[i]: list(embs[i]) for i in range(len(ids))
+                if i < len(embs) and embs[i] is not None}
 
     def _emb_for_ids(self, ids: list[str]) -> dict[str, list[float]]:
         """Fetch stored embeddings for specific ids — used to run MMR / dedup
@@ -2896,6 +2923,14 @@ class MemoryStore(CurationMixin):
                 continue
             candidate = Memory.from_record(mid, doc, meta)
             if candidate.superseded_by:
+                continue
+            # A lapsed row is hidden from recall/list and waiting for
+            # purge_expired, so it must not clash with a new write: under
+            # on_conflict="raise" it would reject the write with a conflict the
+            # caller cannot see or resolve, and under "supersede" it would
+            # re-label a memory that is already on its way out.
+            # _find_by_content_hash skips expired rows for the same reason.
+            if candidate.expires_at and candidate.expires_at <= time.time():
                 continue
             if candidate.type != mem.type:
                 continue
