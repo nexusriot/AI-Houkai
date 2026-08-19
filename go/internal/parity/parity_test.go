@@ -180,6 +180,21 @@ func TestRecallPackExposesRankingKnobs(t *testing.T) {
 	}
 }
 
+// TestAutoContextExposesProvenanceAndLexicalKnobs mirrors the Python parity
+// assertion. auto_context is the fan-out an agent calls WITHOUT choosing a
+// query, so it cannot take the full ranking set (fusion is meaningless across a
+// fan-out — RRF scores are rank-relative to each query's own pool). But the two
+// knobs deciding what may enter the context block at all must be present, or the
+// safest-by-default entry point is the one with no trust floor.
+func TestAutoContextExposesProvenanceAndLexicalKnobs(t *testing.T) {
+	props := goToolSchema(t, "auto_context")
+	for _, knob := range []string{"min_trust", "lexical_index"} {
+		if _, ok := props[knob]; !ok {
+			t.Errorf("auto_context is missing knob %q", knob)
+		}
+	}
+}
+
 func TestHTTPRoutesMatchManifest(t *testing.T) {
 	m := loadManifest(t)
 	handler := httpserver.New(newStore(t), "/p", "parity", "").Handler()

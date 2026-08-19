@@ -83,3 +83,40 @@ func clamp01(v float32) float32 {
 // Float32Ptr returns a pointer to v — convenience for optional fields like
 // RememberOpts.Importance where nil means "unset".
 func Float32Ptr(v float32) *float32 { return &v }
+
+// resolveValidity normalises and checks a validity interval, returning
+// (from, until).
+//
+// nil and 0 both mean "unbounded on that end", which is what makes the fields
+// invisible to every row written before they existed. The interval is half-open
+// — [from, until) — so two facts that succeed one another can share a boundary
+// instant without both being true at it, which is the whole point of recording
+// validity separately from the journal.
+func resolveValidity(validFrom, validUntil *float64) (float64, float64, error) {
+	var vf, vu float64
+	if validFrom != nil {
+		vf = *validFrom
+	}
+	if validUntil != nil {
+		vu = *validUntil
+	}
+	if vf < 0 || vu < 0 {
+		return 0, 0, validationErrorf("valid_from / valid_until must be >= 0")
+	}
+	if vf != 0 && vu != 0 && vu <= vf {
+		return 0, 0, validationErrorf(
+			"valid_until must be > valid_from — got %v .. %v", vf, vu)
+	}
+	return vf, vu, nil
+}
+
+// isValidAt reports whether m was true at ts, over the half-open interval.
+func isValidAt(m Memory, ts float64) bool {
+	if m.ValidFrom != 0 && ts < m.ValidFrom {
+		return false
+	}
+	if m.ValidUntil != 0 && ts >= m.ValidUntil {
+		return false
+	}
+	return true
+}

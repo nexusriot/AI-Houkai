@@ -55,6 +55,14 @@ type Memory struct {
 	// called with Idempotent. Lets a repeated assertion be recognised without
 	// a vector query.
 	ContentHash string `json:"content_hash,omitempty"`
+	// ValidFrom/ValidUntil are VALID time — the half-open interval
+	// [ValidFrom, ValidUntil) during which this memory was true *in the world*.
+	// Distinct from the journal, which records TRANSACTION time (when we learned
+	// it): StateAt answers "as of when we knew", RecallOpts.AsOf answers "what
+	// was true then". 0 on either end means unbounded, so a row written before
+	// these fields existed reads as "always valid" and nothing changes for it.
+	ValidFrom  float64 `json:"valid_from"`
+	ValidUntil float64 `json:"valid_until"`
 }
 
 // TrustLevel is how much the ORIGIN of a memory is trusted:
@@ -292,6 +300,12 @@ func MetadataToMemory(id, text string, meta map[string]string) Memory {
 	if v, ok := meta["content_hash"]; ok {
 		m.ContentHash = v
 	}
+	if v, ok := meta["valid_from"]; ok {
+		m.ValidFrom, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := meta["valid_until"]; ok {
+		m.ValidUntil, _ = strconv.ParseFloat(v, 64)
+	}
 	return m
 }
 
@@ -318,6 +332,8 @@ func MemoryToMetadata(m Memory) map[string]string {
 		"pinned":        strconv.FormatBool(m.Pinned),
 		"trust":         string(TrustOrDefault(m.Trust)),
 		"content_hash":  m.ContentHash,
+		"valid_from":    fmt.Sprintf("%f", m.ValidFrom),
+		"valid_until":   fmt.Sprintf("%f", m.ValidUntil),
 	}
 }
 
@@ -361,6 +377,8 @@ func (m Memory) ToDict() map[string]any {
 		"pinned":        m.Pinned,
 		"trust":         string(TrustOrDefault(m.Trust)),
 		"content_hash":  m.ContentHash,
+		"valid_from":    m.ValidFrom,
+		"valid_until":   m.ValidUntil,
 	}
 }
 
@@ -431,6 +449,8 @@ func MemoryFromDict(d map[string]any) Memory {
 		Pinned:       asBool(d["pinned"]),
 		Trust:        TrustOrDefault(TrustLevel(asString(d["trust"]))),
 		ContentHash:  asString(d["content_hash"]),
+		ValidFrom:    asFloat(d["valid_from"]),
+		ValidUntil:   asFloat(d["valid_until"]),
 	}
 }
 

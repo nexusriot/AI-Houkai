@@ -150,6 +150,8 @@ class AsyncMemoryStore:
         pinned: bool = False,
         trust: TrustLevel = "trusted",
         idempotent: bool = False,
+        valid_from: float | None = None,
+        valid_until: float | None = None,
     ) -> Memory:
         return await self.run(
             self.sync.remember,
@@ -164,6 +166,8 @@ class AsyncMemoryStore:
             pinned=pinned,
             trust=trust,
             idempotent=idempotent,
+            valid_from=valid_from,
+            valid_until=valid_until,
             on_conflict=on_conflict,
             contradiction_fn=contradiction_fn,
         )
@@ -202,6 +206,8 @@ class AsyncMemoryStore:
         source: str | None = MemoryStore._UNSET,
         pinned: bool | None = None,
         trust: TrustLevel | None = None,
+        valid_from: float | None = None,
+        valid_until: float | None = None,
     ) -> Memory:
         """Update fields of an existing memory in place — see MemoryStore.edit."""
         return await self.run(
@@ -209,6 +215,7 @@ class AsyncMemoryStore:
             text=text, type=type, tags=tags, importance=importance,
             polarity=polarity, expires_at=expires_at, source=source,
             pinned=pinned, trust=trust,
+            valid_from=valid_from, valid_until=valid_until,
         )
 
     async def nuke(self) -> int:
@@ -241,6 +248,7 @@ class AsyncMemoryStore:
         explain: bool = False,
         min_trust: TrustLevel | None = None,
         lexical_index: Literal["pool", "corpus"] = "pool",
+        as_of: float | None = None,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         return await self.run(
             self.sync.recall,
@@ -266,6 +274,7 @@ class AsyncMemoryStore:
             touch=touch,
             min_trust=min_trust,
             lexical_index=lexical_index,
+            as_of=as_of,
             explain=explain,
         )
 
@@ -298,6 +307,7 @@ class AsyncMemoryStore:
         min_trust: TrustLevel | None = None,
         lexical_index: Literal["pool", "corpus"] = "pool",
         include_pinned: bool = False,
+        as_of: float | None = None,
     ) -> PackResult:
         return await self.run(
             self.sync.recall_pack,
@@ -327,6 +337,7 @@ class AsyncMemoryStore:
             min_trust=min_trust,
             lexical_index=lexical_index,
             include_pinned=include_pinned,
+            as_of=as_of,
         )
 
     async def auto_context_pack(
@@ -343,6 +354,8 @@ class AsyncMemoryStore:
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
+        lexical_index: Literal["pool", "corpus"] = "pool",
+        min_trust: TrustLevel | None = None,
     ) -> PackResult:
         return await self.run(
             self.sync.auto_context_pack,
@@ -357,6 +370,8 @@ class AsyncMemoryStore:
             compress=compress,
             compress_threshold=compress_threshold,
             compress_min_group=compress_min_group,
+            lexical_index=lexical_index,
+            min_trust=min_trust,
         )
 
     async def get(self, memory_id: str) -> Memory | None:

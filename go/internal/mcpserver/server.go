@@ -369,6 +369,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("graph", mcp.Description("Graph-proximity weight (hybrid mode only): lifts candidates linked to other strong hits. Omit/0 disables the channel")),
 		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; corpus also pulls candidates whose text contains the query's tokens into the pool (hybrid mode)")),
 		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted (omit for no filter)")),
+		mcp.WithNumber("as_of", mcp.Description("Unix time: return what was TRUE at that moment, using each memory's valid_from/valid_until interval. Superseded memories that were valid then ARE included — that is the point. Omit for 'valid now'. Distinct from state_at, which replays the journal for 'as of when we knew'")),
 	}
 	tool := mcp.NewTool("recall", withExpandArgs(recallOpts...)...)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -402,6 +403,7 @@ func addRecall(s *server.MCPServer, store *memory.MemoryStore) {
 			Expand:            expandFromReq(req),
 			LexicalIndex:      memory.LexicalIndexMode(req.GetString("lexical_index", "")),
 			MinTrust:          memory.TrustLevel(req.GetString("min_trust", "")),
+			AsOf:              req.GetFloat("as_of", 0),
 		}
 		results, err := store.Recall(ctx, query, k, opts)
 		if err != nil {
@@ -468,6 +470,7 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("header", mcp.Description("Heading prepended to the block, not counted against token_budget (default: \"## Relevant memory\"; \"\" for none)")),
 		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; corpus also pulls candidates whose text contains the query's tokens into the pool (hybrid mode)")),
 		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted")),
+		mcp.WithNumber("as_of", mcp.Description("Unix time: pack what was TRUE at that moment, using each memory's valid_from/valid_until interval. Omit for 'valid now'")),
 		mcp.WithBoolean("include_pinned", mcp.Description("Prepend every pinned memory ahead of the ranked hits, so a standing instruction is present whether or not it matches the query. They compete for the same budget")),
 	}
 	tool := mcp.NewTool("recall_pack", withExpandArgs(packOpts...)...)
@@ -510,6 +513,7 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 			Header:            header,
 			LexicalIndex:      memory.LexicalIndexMode(req.GetString("lexical_index", "")),
 			MinTrust:          memory.TrustLevel(req.GetString("min_trust", "")),
+			AsOf:              req.GetFloat("as_of", 0),
 			IncludePinned:     req.GetBool("include_pinned", false),
 		})
 		if err != nil {
@@ -568,6 +572,8 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("compress_min_group", mcp.Description("Minimum cluster size to compress (default: 2)")),
 		mcp.WithBoolean("touch", mcp.Description("Bump access-count/last_accessed on every fan-out recall (default: true; false = read-only)")),
 		mcp.WithString("header", mcp.Description("Heading prepended to the block, not counted against token_budget (default: \"## Relevant memory\"; \"\" for none)")),
+		mcp.WithString("lexical_index", mcp.Description("pool (default) scores BM25 only over the vector over-fetch pool; corpus also pulls candidates whose text contains the query's tokens into the pool (hybrid mode). Applies to every fan-out query")),
+		mcp.WithString("min_trust", mcp.Description("trusted|reported|untrusted — keep only memories whose provenance is at least this trusted. Worth setting here in particular: this is the tool you call without choosing a query, so it is the one most likely to pull scraped material into context unattended")),
 	)
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		task, err := req.RequireString("task")
@@ -589,6 +595,8 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 			CompressMinGroup:  req.GetInt("compress_min_group", 2),
 			NoTouch:           !req.GetBool("touch", true),
 			Header:            header,
+			LexicalIndex:      memory.LexicalIndexMode(req.GetString("lexical_index", "")),
+			MinTrust:          memory.TrustLevel(req.GetString("min_trust", "")),
 		})
 		if err != nil {
 			return errResult(err), nil

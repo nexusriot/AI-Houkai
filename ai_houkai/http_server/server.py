@@ -107,6 +107,10 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         # be indistinguishable from "not pinned" / "unlabelled".
         "pinned": mem.pinned,
         "trust": mem.trust,
+        # Valid time — when the memory was true, as opposed to when we learned
+        # it. 0 on either end means unbounded.
+        "valid_from": mem.valid_from,
+        "valid_until": mem.valid_until,
     }
 
 
@@ -342,6 +346,8 @@ def _remember(store: MemoryStore, m, q, b):
             pinned=_body_bool(b, "pinned"),
             trust=b.get("trust") or "trusted",
             idempotent=_body_bool(b, "idempotent"),
+            valid_from=_body_float(b, "valid_from"),
+            valid_until=_body_float(b, "valid_until"),
             on_conflict=b.get("on_conflict"),
         )
     except ConflictError as e:
@@ -439,6 +445,10 @@ def _edit(store: MemoryStore, m, q, b):
         kwargs["pinned"] = _body_bool(b, "pinned")
     if b.get("trust") is not None:
         kwargs["trust"] = b["trust"]
+    if b.get("valid_from") is not None:
+        kwargs["valid_from"] = _body_float(b, "valid_from")
+    if b.get("valid_until") is not None:
+        kwargs["valid_until"] = _body_float(b, "valid_until")
     if b.get("expires_at") is not None:
         # null = unchanged; an explicit 0 clears the TTL.
         kwargs["expires_at"] = _body_float(b, "expires_at")
@@ -531,6 +541,7 @@ def _recall_params(q, b):
             "expand": _expand_from_body(b),
             "lexical_index": get("lexical_index") or "pool",
             "min_trust": get("min_trust"),
+            "as_of": _body_float(b, "as_of"),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -549,6 +560,9 @@ def _recall_params(q, b):
         "include_superseded": _as_bool(_qs_one(q, "include_superseded")),
         "include_expired": _as_bool(_qs_one(q, "include_expired")),
         "explain": _as_bool(_qs_one(q, "explain")),
+        # A plain scalar, so unlike the nested tuning knobs it maps fine onto a
+        # query string and is offered on GET too.
+        "as_of": _as_float(_qs_one(q, "as_of")),
     }
 
 
@@ -609,6 +623,7 @@ def _recall_pack(store: MemoryStore, m, q, b):
         expand=_expand_from_body(b),
         lexical_index=b.get("lexical_index") or "pool",
         min_trust=b.get("min_trust"),
+        as_of=_body_float(b, "as_of"),
         include_pinned=_body_bool(b, "include_pinned"),
         max_items=_body_int(b, "max_items", 50),
         include_superseded=_body_bool(b, "include_superseded"),
@@ -632,6 +647,8 @@ def _auto_context(store: MemoryStore, m, q, b):
         compress=_body_bool(b, "compress"),
         compress_threshold=_compress_threshold(b),
         compress_min_group=_body_int(b, "compress_min_group", 2),
+        lexical_index=b.get("lexical_index") or "pool",
+        min_trust=b.get("min_trust") or None,
     )
     payload = _pack_payload(res)
     payload["queries"] = [task] + extract_key_phrases(

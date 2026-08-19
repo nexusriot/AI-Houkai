@@ -98,6 +98,35 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:32]
 
 
+def _validate_validity(valid_from: float | None,
+                       valid_until: float | None) -> tuple[float, float]:
+    """Normalise and check a validity interval, returning (from, until).
+
+    ``None`` and ``0.0`` both mean "unbounded on that end", which is what makes
+    the fields invisible to every row written before they existed. The interval
+    is half-open — ``[valid_from, valid_until)`` — so two facts that succeed one
+    another can share a boundary instant without both being true at it, which is
+    the whole point of recording validity separately from the journal.
+    """
+    vf = 0.0 if valid_from is None else float(valid_from)
+    vu = 0.0 if valid_until is None else float(valid_until)
+    if vf < 0 or vu < 0:
+        raise ValueError("valid_from / valid_until must be >= 0")
+    if vf and vu and vu <= vf:
+        raise ValueError(
+            f"valid_until must be > valid_from — got {vf!r} .. {vu!r}")
+    return vf, vu
+
+
+def _is_valid_at(mem: "Memory", ts: float) -> bool:
+    """Whether *mem* was true at *ts*, over the half-open validity interval."""
+    if mem.valid_from and ts < mem.valid_from:
+        return False
+    if mem.valid_until and ts >= mem.valid_until:
+        return False
+    return True
+
+
 def _validate_tags(tags: list[str]) -> None:
     """Tags are stored comma-joined in Chroma metadata, so a comma inside a
     tag would silently split it into two on the next read."""
@@ -215,11 +244,14 @@ class RememberItem:
     ttl_seconds: float | None = None
     pinned:      bool = False
     trust:       TrustLevel = "trusted"
+    valid_from:  float | None = None
+    valid_until: float | None = None
 
 
 _REMEMBER_ITEM_FIELDS = (
     "text", "type", "tags", "importance", "source",
     "polarity", "expires_at", "ttl_seconds", "pinned", "trust",
+    "valid_from", "valid_until",
 )
 
 
@@ -357,6 +389,14 @@ class Memory:
     # assertion can be recognised without a vector query. Empty only on rows
     # written before this field existed, which simply never match.
     content_hash:  str = ""
+    # VALID time — the half-open interval [valid_from, valid_until) during which
+    # this memory was true *in the world*. Distinct from the journal, which
+    # records TRANSACTION time (when we learned it): `state_at` answers "as of
+    # when we knew", `recall(as_of=)` answers "what was true then". 0.0 on
+    # either end means unbounded, so a row written before these fields existed
+    # reads as "always valid" and nothing changes for it.
+    valid_from:    float = 0.0
+    valid_until:   float = 0.0
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -375,6 +415,8 @@ class Memory:
             "pinned":        self.pinned,
             "trust":         self.trust,
             "content_hash":  self.content_hash,
+            "valid_from":    self.valid_from,
+            "valid_until":   self.valid_until,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -397,6 +439,8 @@ class Memory:
             "pinned":        self.pinned,
             "trust":         self.trust,
             "content_hash":  self.content_hash,
+            "valid_from":    self.valid_from,
+            "valid_until":   self.valid_until,
         }
 
     @classmethod
@@ -419,6 +463,8 @@ class Memory:
             pinned=bool(d.get("pinned") or False),
             trust=d.get("trust") or "trusted",
             content_hash=str(d.get("content_hash") or ""),
+            valid_from=float(d.get("valid_from") or 0.0),
+            valid_until=float(d.get("valid_until") or 0.0),
         )
 
     @classmethod
@@ -451,6 +497,8 @@ class Memory:
             pinned=bool(meta.get("pinned", False)),
             trust=meta.get("trust") or "trusted",
             content_hash=str(meta.get("content_hash") or ""),
+            valid_from=float(meta.get("valid_from", 0.0)),
+            valid_until=float(meta.get("valid_until", 0.0)),
         )
 
 
@@ -802,6 +850,8 @@ class MemoryStore(CurationMixin):
         ttl_seconds: float | None = None,
         pinned: bool = False,
         trust: TrustLevel = "trusted",
+        valid_from: float | None = None,
+        valid_until: float | None = None,
     ) -> Memory:
         """Validate inputs and construct a :class:`Memory` — no store write, no
         journal, no conflict scan.
@@ -823,6 +873,7 @@ class MemoryStore(CurationMixin):
             expires_at = time.time() + ttl_seconds
         if expires_at is not None and expires_at < 0:
             raise ValueError("expires_at must be >= 0")
+        valid_from, valid_until = _validate_validity(valid_from, valid_until)
         tags = list(tags)
         _validate_tags(tags)
         # importance=None → auto-score when an importance_fn is configured,
@@ -844,6 +895,8 @@ class MemoryStore(CurationMixin):
             expires_at=expires_at or 0.0,
             pinned=pinned,
             trust=trust,
+            valid_from=valid_from,
+            valid_until=valid_until,
             # Always recorded, not only when this write asked for idempotency.
             # Gating it on the flag made dedup work solely between writes that
             # BOTH opted in: an ordinary remember() followed by an
@@ -869,6 +922,8 @@ class MemoryStore(CurationMixin):
         pinned: bool = False,
         trust: TrustLevel = "trusted",
         idempotent: bool = False,
+        valid_from: float | None = None,
+        valid_until: float | None = None,
     ) -> Memory:
         """Store a new memory.
 
@@ -881,6 +936,12 @@ class MemoryStore(CurationMixin):
         access count is bumped and it is returned unchanged. Agents re-assert
         the same fact every session, and the alternative — a vector conflict
         scan per write — costs an embedding query and still creates a row.
+
+        ``valid_from``/``valid_until`` record when the memory was true *in the
+        world* (half-open, 0 = unbounded). That is separate from the journal,
+        which records when we *learned* it: use these to say "the office moved
+        in March", then ask :meth:`recall` with ``as_of`` to get the answer that
+        held at a chosen moment.
         """
         if on_conflict is not None:
             _validate_choice(on_conflict, CONFLICT_POLICIES, "on_conflict")
@@ -893,6 +954,7 @@ class MemoryStore(CurationMixin):
             text, type, tags, importance, source,
             polarity=polarity, expires_at=expires_at, ttl_seconds=ttl_seconds,
             pinned=pinned, trust=trust,
+            valid_from=valid_from, valid_until=valid_until,
         )
         self.collection.add(
             ids=[mem.id],
@@ -1078,6 +1140,8 @@ class MemoryStore(CurationMixin):
         source: str | None = _UNSET,
         pinned: bool | None = None,
         trust: TrustLevel | None = None,
+        valid_from: float | None = None,
+        valid_until: float | None = None,
     ) -> Memory:
         """Update fields of an existing memory in place, keeping its id.
 
@@ -1089,6 +1153,12 @@ class MemoryStore(CurationMixin):
         The change is journaled (op ``edit``, with before/after snapshots) and
         reversible via :meth:`undo`. A call that changes nothing is a no-op:
         no write, no journal entry.
+
+        ``valid_from``/``valid_until`` correct the interval during which the
+        memory was true. Closing an interval is how a fact retires without being
+        deleted: it drops out of a default recall while staying reachable via
+        ``recall(as_of=T)`` for any T inside the old interval. Pass ``0`` to
+        reopen an end.
 
         Raises KeyError if *memory_id* does not exist, ValueError on a bad
         type / polarity / importance.
@@ -1117,6 +1187,13 @@ class MemoryStore(CurationMixin):
         if trust is not None:
             _validate_choice(trust, TRUST_LEVELS, "trust")
             mem.trust = trust
+        if valid_from is not None or valid_until is not None:
+            # Validated as a pair against the memory's *resulting* interval, so
+            # closing one end cannot silently produce until <= from.
+            mem.valid_from, mem.valid_until = _validate_validity(
+                mem.valid_from if valid_from is None else valid_from,
+                mem.valid_until if valid_until is None else valid_until,
+            )
         if tags is not None:
             new_tags = list(tags)
             _validate_tags(new_tags)
@@ -1218,6 +1295,7 @@ class MemoryStore(CurationMixin):
         explain: bool = False,
         lexical_index: Literal["pool", "corpus"] = "pool",
         min_trust: TrustLevel | None = None,
+        as_of: float | None = None,
     ) -> list[tuple[Memory, float]] | list[tuple[Memory, float, dict[str, Any]]]:
         """Semantic (or hybrid) search with optional metadata filters.
 
@@ -1256,12 +1334,31 @@ class MemoryStore(CurationMixin):
         embedding is reachable at all. It costs a server-side scan per token.
         ``"pool"`` (default) scores lexical relevance only over the vector
         over-fetch pool, as before.
+
+        ``as_of`` asks what was true at a past moment, using the memories'
+        VALID-time interval (see :attr:`Memory.valid_from`). Two things follow
+        from that, and both are deliberate:
+
+        * Without ``as_of``, results are filtered to what is valid *now*, so a
+          memory whose ``valid_until`` has passed drops out of ordinary recall.
+          Rows that never set the fields are unbounded and so always pass.
+        * With ``as_of``, superseded memories are admitted before the validity
+          filter runs. A memory that has since been replaced is exactly what
+          "what was true then" should return, and hiding it would make ``as_of``
+          answer with today's beliefs wearing a past timestamp. Memories with no
+          interval recorded are unbounded, so they still pass — this is
+          best-effort over whatever validity data was actually written.
+
+        This is valid time, not transaction time: :meth:`state_at` replays the
+        journal to answer "as of when we *knew*".
         """
         _validate_choice(mode, RECALL_MODES, "mode")
         _validate_choice(fusion, FUSIONS, "fusion")
         _validate_choice(lexical_index, LEXICAL_INDEXES, "lexical_index")
         if min_trust is not None:
             _validate_choice(min_trust, TRUST_LEVELS, "min_trust")
+        if as_of is not None and as_of < 0:
+            raise ValueError("as_of must be >= 0")
         if type is not None:
             _validate_choice(type, MEMORY_TYPES, "type")
         if diversity is not None and not (0.0 <= diversity <= 1.0):
@@ -1292,10 +1389,16 @@ class MemoryStore(CurationMixin):
             mode == "semantic" and include_superseded and include_expired
             and tag is None and not need_emb and min_cosine is None
             and reranker is None and min_trust is None
-            and lexical_index == "pool"
+            and lexical_index == "pool" and as_of is None
         )
         n_fetch = k if no_post_filter else min(k * overfetch, count)
         n_fetch = max(n_fetch, k)
+
+        # A memory replaced since T is exactly what "what was true at T" should
+        # return, so as_of admits superseded rows into the pool and lets the
+        # validity filter below decide. Without this, as_of would answer with
+        # today's beliefs wearing a past timestamp.
+        pool_superseded = include_superseded or as_of is not None
 
         where = _build_where(type, min_importance, source, since, until)
 
@@ -1318,13 +1421,13 @@ class MemoryStore(CurationMixin):
         if mode == "hybrid":
             if fusion == "rrf":
                 scored = self._rrf_score(
-                    res, query, tag, include_superseded, weights, min_cosine, expl)
+                    res, query, tag, pool_superseded, weights, min_cosine, expl)
             else:
                 scored = self._hybrid_score(
-                    res, query, tag, include_superseded, weights, min_cosine, expl)
+                    res, query, tag, pool_superseded, weights, min_cosine, expl)
         else:
             scored = self._semantic_filter(
-                res, tag, include_superseded, w.polarity_weight, min_cosine, expl)
+                res, tag, pool_superseded, w.polarity_weight, min_cosine, expl)
 
         # Drop memories whose origin is trusted less than the caller demands.
         # A post-filter for the same reason as expiry: old rows have no "trust"
@@ -1334,6 +1437,15 @@ class MemoryStore(CurationMixin):
             floor = TRUST_LEVELS.index(min_trust)
             scored = [(mem, s_) for mem, s_ in scored
                       if trust_rank(mem.trust) <= floor]
+
+        # Drop memories that were not true at the moment being asked about.
+        # Default (as_of=None) means "now", so closing a valid_until retires a
+        # fact from ordinary recall without deleting it. A post-filter for the
+        # same reason as trust and expiry: old rows carry no validity keys, and
+        # a Chroma clause would silently exclude every one of them.
+        validity_ts = time.time() if as_of is None else as_of
+        scored = [(mem, s_) for mem, s_ in scored
+                  if _is_valid_at(mem, validity_ts)]
 
         # Drop expired memories (post-filter, not a Chroma where-clause, so old
         # rows without the expires_at key are unaffected). Done before rerank /
@@ -1542,6 +1654,7 @@ class MemoryStore(CurationMixin):
         lexical_index: Literal["pool", "corpus"] = "pool",
         min_trust: TrustLevel | None = None,
         include_pinned: bool = False,
+        as_of: float | None = None,
     ) -> PackResult:
         """Assemble the highest-ranked memories that fit a token budget into a
         ready-to-inject context block.
@@ -1592,6 +1705,7 @@ class MemoryStore(CurationMixin):
             touch=touch,
             lexical_index=lexical_index,
             min_trust=min_trust,
+            as_of=as_of,
         )
         if include_pinned:
             ranked = self._prepend_pinned(ranked, min_trust=min_trust)
@@ -1720,6 +1834,8 @@ class MemoryStore(CurationMixin):
         compress: bool = False,
         compress_threshold: float = 0.30,
         compress_min_group: int = 2,
+        lexical_index: Literal["pool", "corpus"] = "pool",
+        min_trust: TrustLevel | None = None,
     ) -> PackResult:
         """Fan-out recall over *task* and extracted key phrases, deduplicate, and pack.
 
@@ -1734,6 +1850,12 @@ class MemoryStore(CurationMixin):
         with weak hits. ``touch=False`` skips the access-count bump on every
         fan-out recall (read-only packing).
 
+        ``min_trust`` and ``lexical_index`` apply to every fan-out query, exactly
+        as they do in :meth:`recall_pack`. The trust floor matters more here than
+        anywhere else: this is the entry point an agent calls *without* choosing
+        a query, so it is the one most likely to pull scraped material into a
+        context block unattended.
+
         Note: this uses the default *weighted* fusion. ``fusion="rrf"`` is not
         offered here because RRF scores are rank-relative to each query's own
         candidate pool, so they cannot be compared across the fan-out queries.
@@ -1745,6 +1867,7 @@ class MemoryStore(CurationMixin):
         for q in queries:
             for mem, score in self.recall(
                 query=q, k=10, mode=mode, min_cosine=min_cosine, touch=touch,
+                lexical_index=lexical_index, min_trust=min_trust,
             ):
                 if mem.id not in best or score > best[mem.id][1]:
                     best[mem.id] = (mem, score)

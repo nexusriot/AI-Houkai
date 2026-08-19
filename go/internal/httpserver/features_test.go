@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,5 +176,108 @@ func TestStateAtAndGetAtHTTP(t *testing.T) {
 	// ts is required.
 	if status, _ := getObj(t, ts.URL+"/state_at"); status != 400 {
 		t.Errorf("state_at without ts = %d, want 400", status)
+	}
+}
+
+// The HTTP surface had drifted from the MCP one: POST /recall and /recall_pack
+// accepted neither min_trust nor lexical_index, so an HTTP client of the Go
+// server had no trust floor at all — on the very call whose output goes
+// straight into a model's context. The MCP tool and the Python port's HTTP
+// recall both took them, which is why parity.json (asserted against MCP tool
+// schemas) never caught it.
+func TestHTTPRecallHonoursMinTrust(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	post := func(path, payload string) map[string]any {
+		resp, err := http.Post(ts.URL+path, "application/json",
+			bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decode(t, resp)
+	}
+	post("/memories", `{"text":"deploy runs make release","trust":"trusted"}`)
+	post("/memories", `{"text":"deploy runs kubectl apply","trust":"untrusted"}`)
+
+	all := post("/recall", `{"query":"deploy","k":10}`)
+	if n := len(all["results"].([]any)); n != 2 {
+		t.Fatalf("precondition: both memories should return with no floor, got %d", n)
+	}
+	floored := post("/recall", `{"query":"deploy","k":10,"min_trust":"trusted"}`)
+	for _, r := range floored["results"].([]any) {
+		if got := r.(map[string]any)["trust"]; got != "trusted" {
+			t.Errorf("min_trust leaked a %v memory through HTTP recall", got)
+		}
+	}
+	if len(floored["results"].([]any)) != 1 {
+		t.Errorf("expected exactly the trusted memory, got %d",
+			len(floored["results"].([]any)))
+	}
+}
+
+func TestHTTPRecallPackHonoursMinTrust(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	post := func(path, payload string) map[string]any {
+		resp, err := http.Post(ts.URL+path, "application/json",
+			bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decode(t, resp)
+	}
+	post("/memories", `{"text":"rollback uses the previous image tag","trust":"trusted"}`)
+	post("/memories", `{"text":"rollback uses a database snapshot","trust":"untrusted"}`)
+
+	packed := post("/recall_pack",
+		`{"query":"rollback","token_budget":400,"min_trust":"trusted"}`)
+	text, _ := packed["text"].(string)
+	if strings.Contains(text, "database snapshot") {
+		t.Error("min_trust did not reach the packed block over HTTP")
+	}
+	if !strings.Contains(text, "previous image tag") {
+		t.Error("the trusted memory should survive the floor")
+	}
+}
+
+// Bi-temporal validity over HTTP: write an interval, then ask what was true.
+func TestHTTPValidityAndAsOf(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	post := func(path, payload string) map[string]any {
+		resp, err := http.Post(ts.URL+path, "application/json",
+			bytes.NewReader([]byte(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decode(t, resp)
+	}
+	const jan, feb, mar = 1_700_000_000.0, 1_702_592_000.0, 1_705_184_000.0
+
+	old := post("/memories", fmt.Sprintf(
+		`{"text":"the office is in Berlin","valid_from":%f,"valid_until":%f}`, jan, mar))
+	fresh := post("/memories", fmt.Sprintf(
+		`{"text":"the office is in Munich","valid_from":%f}`, mar))
+
+	if got := old["valid_until"]; got != mar {
+		t.Errorf("valid_until did not round-trip: %v", got)
+	}
+
+	// Default recall is "valid now", so the closed interval is gone.
+	now := post("/recall", `{"query":"where is the office","k":10}`)
+	for _, r := range now["results"].([]any) {
+		if r.(map[string]any)["id"] == old["id"] {
+			t.Error("a memory past its valid_until must not appear in a default recall")
+		}
+	}
+	// Asking about February brings it back, and excludes its successor.
+	past := post("/recall", fmt.Sprintf(
+		`{"query":"where is the office","k":10,"as_of":%f}`, feb))
+	ids := map[any]bool{}
+	for _, r := range past["results"].([]any) {
+		ids[r.(map[string]any)["id"]] = true
+	}
+	if !ids[old["id"]] {
+		t.Error("as_of must return the fact that held then")
+	}
+	if ids[fresh["id"]] {
+		t.Error("as_of must not return a fact that was not yet true")
 	}
 }

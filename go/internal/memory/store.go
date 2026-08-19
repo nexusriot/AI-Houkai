@@ -206,6 +206,11 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 		expiresAt = *opts.ExpiresAt
 	}
 
+	validFrom, validUntil, err := resolveValidity(opts.ValidFrom, opts.ValidUntil)
+	if err != nil {
+		return Memory{}, err
+	}
+
 	// Importance nil means "unset" → auto-score when an ImportanceFn is
 	// configured, else keep the configured default. An explicit value —
 	// including 0 — is honoured, clamped to [0, 1].
@@ -240,6 +245,8 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 		ExpiresAt:    expiresAt,
 		Pinned:       opts.Pinned,
 		Trust:        TrustOrDefault(opts.Trust),
+		ValidFrom:    validFrom,
+		ValidUntil:   validUntil,
 	}
 	// Always recorded, not only when this write asked for idempotency. Gating it
 	// on the flag made dedup work solely between writes that BOTH opted in: an
@@ -408,6 +415,12 @@ type RememberOpts struct {
 	// every session, and the alternative — a vector conflict scan per write —
 	// costs an embedding query and still creates a row.
 	Idempotent bool
+	// ValidFrom/ValidUntil record when the memory was true *in the world*
+	// (half-open, nil/0 = unbounded). Separate from the journal, which records
+	// when we learned it: use these to say "the office moved in March", then ask
+	// Recall with AsOf to get the answer that held at a chosen moment.
+	ValidFrom  *float64
+	ValidUntil *float64
 }
 
 // RememberItem is one entry for RememberMany: a text plus the same optional
@@ -586,6 +599,9 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 			return nil, err
 		}
 	}
+	if opts.AsOf < 0 {
+		return nil, validationErrorf("as_of must be >= 0")
+	}
 	if opts.Fusion == "" {
 		opts.Fusion = FusionWeighted
 	}
@@ -653,7 +669,7 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		opts.Tag == "" && opts.Type == "" && opts.MinImportance <= 0 &&
 		opts.Source == "" && opts.Since == 0 && opts.Until == 0 &&
 		!needEmb && opts.MinCosine == nil && opts.MinTrust == "" &&
-		opts.LexicalIndex != LexicalCorpus
+		opts.LexicalIndex != LexicalCorpus && opts.AsOf == 0
 
 	nFetch := k
 	if !noPostFilter {
@@ -681,6 +697,18 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	}
 
 	now := nowFloat()
+
+	// Which instant the validity interval is tested against: "now" unless the
+	// caller asked about a past moment.
+	validityTS := now
+	if opts.AsOf > 0 {
+		validityTS = opts.AsOf
+	}
+	// A memory replaced since AsOf is exactly what "what was true then" should
+	// return, so AsOf admits superseded rows into the pool and lets the validity
+	// filter decide. Without this, AsOf would answer with today's beliefs
+	// wearing a past timestamp.
+	poolSuperseded := opts.IncludeSuperseded || opts.AsOf > 0
 
 	// The "where-clause" filters (type/importance/source/since/until) form the
 	// scoring pool; tag/superseded/min_cosine are applied inside the scorers so
@@ -712,6 +740,12 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		if !opts.IncludeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
 			continue
 		}
+		// Drop memories that were not true at the moment being asked about.
+		// Default (AsOf unset) means "now", so closing a ValidUntil retires a
+		// fact from ordinary recall without deleting it.
+		if !isValidAt(m, validityTS) {
+			continue
+		}
 		pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
 	}
 
@@ -741,12 +775,12 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		}
 		bm25 := bm25Score(query, docs)
 		if opts.Fusion == FusionRRF {
-			scored = s.scoreRRF(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now, 60)
+			scored = s.scoreRRF(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now, 60)
 		} else {
-			scored = s.scoreWeighted(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now)
+			scored = s.scoreWeighted(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now)
 		}
 	} else {
-		scored = scoreSemantic(pool, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl)
+		scored = scoreSemantic(pool, w, opts.Tag, poolSuperseded, opts.MinCosine, expl)
 	}
 
 	// Second-stage rerank over the surviving pool, before the top-k cut.
@@ -921,6 +955,14 @@ type RecallOpts struct {
 	// own content predicate (chromem-go's $contains), so a memory whose wording
 	// matches but whose vector does not can still surface.
 	LexicalIndex LexicalIndexMode
+	// AsOf asks what was true at a past moment, using the memories' VALID-time
+	// interval (see Memory.ValidFrom). Without it, results are filtered to what
+	// is valid *now*, so a memory whose ValidUntil has passed drops out of
+	// ordinary recall. With it, superseded memories are admitted before the
+	// validity filter runs — a memory that has since been replaced is exactly
+	// what "what was true then" should return, and hiding it would make AsOf
+	// answer with today's beliefs wearing a past timestamp. 0 = not set.
+	AsOf float64
 }
 
 // LexicalIndexMode selects the lexical candidate source for hybrid recall.
@@ -966,6 +1008,12 @@ type EditOpts struct {
 	// Pinned / Trust: nil = unchanged.
 	Pinned *bool
 	Trust  *TrustLevel
+	// ValidFrom/ValidUntil correct the interval during which the memory was
+	// true; nil = unchanged. Closing an interval is how a fact retires without
+	// being deleted: it drops out of a default recall while staying reachable
+	// via Recall with AsOf inside the old interval. Pass 0 to reopen an end.
+	ValidFrom  *float64
+	ValidUntil *float64
 }
 
 // Edit updates fields of an existing memory in place, keeping its id.
@@ -1014,6 +1062,22 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 			return Memory{}, err
 		}
 		mem.Trust = *opts.Trust
+	}
+	if opts.ValidFrom != nil || opts.ValidUntil != nil {
+		// Validated as a pair against the memory's *resulting* interval, so
+		// closing one end cannot silently produce until <= from.
+		from, until := mem.ValidFrom, mem.ValidUntil
+		if opts.ValidFrom != nil {
+			from = *opts.ValidFrom
+		}
+		if opts.ValidUntil != nil {
+			until = *opts.ValidUntil
+		}
+		vf, vu, err := resolveValidity(&from, &until)
+		if err != nil {
+			return Memory{}, err
+		}
+		mem.ValidFrom, mem.ValidUntil = vf, vu
 	}
 	if opts.Tags != nil {
 		if err := validateTags(opts.Tags); err != nil {

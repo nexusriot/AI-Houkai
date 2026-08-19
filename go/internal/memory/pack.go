@@ -117,6 +117,8 @@ type PackOpts struct {
 	// They still compete for the same budget: a pinned memory that does not
 	// fit is dropped like any other.
 	IncludePinned bool
+	// AsOf packs what was TRUE at a past moment (see RecallOpts.AsOf).
+	AsOf float64
 }
 
 const defaultPackHeader = "## Relevant memory"
@@ -167,6 +169,7 @@ func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpt
 		NoTouch:           opts.NoTouch,
 		LexicalIndex:      opts.LexicalIndex,
 		MinTrust:          opts.MinTrust,
+		AsOf:              opts.AsOf,
 	})
 	if err != nil {
 		return PackResult{}, err

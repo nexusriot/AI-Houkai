@@ -6,7 +6,7 @@
     "toolchain and drift in either port fails that port's build.",
     "",
     "Adding a tool or route means editing this file in the SAME change that adds",
-    "it to both ports \u2014 that is the point. The A1 regression (the Python MCP",
+    "it to both ports — that is the point. The A1 regression (the Python MCP",
     "recall silently missing every ranking knob the Go one had) is exactly the",
     "class of drift this catches.",
     "",
@@ -101,6 +101,7 @@
     "POST /unlink"
   ],
   "recall_knobs": [
+    "as_of",
     "dedup_threshold",
     "diversity",
     "explain",

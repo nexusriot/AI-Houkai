@@ -68,6 +68,12 @@ type AutoContextOpts struct {
 	Compress          bool
 	CompressThreshold float32
 	CompressMinGroup  int
+	// LexicalIndex and MinTrust apply to every fan-out query, exactly as they do
+	// in RecallPack. The trust floor matters more here than anywhere else: this
+	// is the entry point an agent calls *without* choosing a query, so it is the
+	// one most likely to pull scraped material into a context block unattended.
+	LexicalIndex LexicalIndexMode
+	MinTrust     TrustLevel
 }
 
 // AutoContextPack fans out recall over the task plus its extracted key phrases,
@@ -105,6 +111,7 @@ func (s *MemoryStore) AutoContextPack(ctx context.Context, task string, opts Aut
 	for _, q := range queries {
 		res, err := s.Recall(ctx, q, 10, RecallOpts{
 			Mode: opts.Mode, MinCosine: opts.MinCosine, NoTouch: opts.NoTouch,
+			LexicalIndex: opts.LexicalIndex, MinTrust: opts.MinTrust,
 		})
 		if err != nil {
 			return PackResult{}, err

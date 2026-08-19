@@ -4,6 +4,6 @@ package version
 // defaults below are the in-source fallback for `go run` / `go build`
 // without -ldflags; the Makefile / release scripts override both.
 var (
-	Version   = "0.7.0"
+	Version   = "0.8.0"
 	BuildTime = "unknown"
 )

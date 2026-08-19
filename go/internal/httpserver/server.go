@@ -470,6 +470,14 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		Trust:      memory.TrustLevel(bodyStr(b, "trust", "")),
 		Idempotent: bodyBool(b, "idempotent"),
 	}
+	// Valid time — when the memory was true, as opposed to when we learned it.
+	// Probed as float64 like the TTL below: an epoch needs the precision.
+	if v, ok := b["valid_from"].(float64); ok {
+		opts.ValidFrom = &v
+	}
+	if v, ok := b["valid_until"].(float64); ok {
+		opts.ValidUntil = &v
+	}
 	// TTL: probe as float64 (JSON numbers) — an epoch needs float64 precision,
 	// which bodyFloatPtr (*float32) can't carry.
 	if v, ok := b["expires_at"].(float64); ok {
@@ -603,6 +611,14 @@ func (s *Server) edit(r *http.Request) (int, any, error) {
 	if v, ok := b["trust"].(string); ok && v != "" {
 		t := memory.TrustLevel(v)
 		opts.Trust = &t
+	}
+	// Valid time: correct the interval during which the memory was true. 0 on
+	// an end reopens it.
+	if v, ok := b["valid_from"].(float64); ok {
+		opts.ValidFrom = &v
+	}
+	if v, ok := b["valid_until"].(float64); ok {
+		opts.ValidUntil = &v
 	}
 	fields := 0
 	if v, ok := b["text"].(string); ok {
@@ -745,6 +761,13 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		// Same gap as recall had: these were reachable through the MCP tool but
+		// not over HTTP, so an HTTP client could not set a trust floor on the
+		// one call whose output goes straight into a model's context.
+		MinTrust:      memory.TrustLevel(bodyStr(b, "min_trust", "")),
+		LexicalIndex:  memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+		IncludePinned: bodyBool(b, "include_pinned"),
+		AsOf:          bodyFloat(b, "as_of", 0),
 	}
 	// header: absent → default; explicit "" → no header line (PackOpts.Header
 	// contract). bodyStr can't express the empty string, so probe the map.
@@ -805,6 +828,8 @@ func (s *Server) autoContext(r *http.Request) (int, any, error) {
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		LexicalIndex:      memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+		MinTrust:          memory.TrustLevel(bodyStr(b, "min_trust", "")),
 	})
 	if err != nil {
 		return 0, nil, err
@@ -1144,6 +1169,12 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Expand:            expandFromBody(b),
 			NoTouch:           !bodyBoolDef(b, "touch", true),
 			Explain:           bodyBool(b, "explain"),
+			// These three were reachable through the MCP tool and through the
+			// Python port's HTTP recall, but not here — so an HTTP client of the
+			// Go server had no trust floor at all.
+			MinTrust:     memory.TrustLevel(bodyStr(b, "min_trust", "")),
+			LexicalIndex: memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+			AsOf:         bodyFloat(b, "as_of", 0),
 		}, int(bodyFloat(b, "k", 5)), nil
 	}
 
@@ -1167,6 +1198,10 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		IncludeSuperseded: qsBool(r, "include_superseded"),
 		IncludeExpired:    qsBool(r, "include_expired"),
 		Explain:           qsBool(r, "explain"),
+		// Plain scalars, so they map onto a query string too.
+		MinTrust:     memory.TrustLevel(qsStr(r, "min_trust", "")),
+		LexicalIndex: memory.LexicalIndexMode(qsStr(r, "lexical_index", "")),
+		AsOf:         qsFloat(r, "as_of", 0),
 	}, qsInt(r, "k", 5), nil
 }
 
@@ -1265,6 +1300,10 @@ func memDict(m memory.Memory) map[string]any {
 		// be indistinguishable from "not pinned" / "unlabelled".
 		"pinned": m.Pinned,
 		"trust":  string(memory.TrustOrDefault(m.Trust)),
+		// Valid time — when the memory was true, as opposed to when we learned
+		// it. 0 on either end means unbounded.
+		"valid_from":  m.ValidFrom,
+		"valid_until": m.ValidUntil,
 	}
 }
 

@@ -104,3 +104,16 @@ class TestRecallKnobParity:
         expected = ranking | set(manifest["recall_expand_knobs"])
         assert expected <= params, \
             f"recall_pack is missing {sorted(expected - params)}"
+
+    def test_auto_context_carries_the_provenance_and_lexical_knobs(self):
+        """auto_context is the fan-out an agent calls WITHOUT choosing a query.
+
+        It cannot take the full ranking set — `fusion` is meaningless across a
+        fan-out (RRF scores are rank-relative to each query's own pool), and the
+        filters that scope a single query do not generalise. But the two knobs
+        that decide *what may enter the context block at all* must be here, or
+        the safest-by-default entry point is the one with no trust floor.
+        """
+        params = set(inspect.signature(mcp_srv.auto_context).parameters)
+        assert {"min_trust", "lexical_index"} <= params, \
+            f"auto_context is missing {sorted({'min_trust', 'lexical_index'} - params)}"

@@ -113,6 +113,8 @@ def remember(
     pinned: bool = False,
     trust: str = "trusted",
     idempotent: bool = False,
+    valid_from: float | None = None,
+    valid_until: float | None = None,
 ) -> dict[str, Any]:
     """Store a new memory.
     type: episodic | semantic | procedural | feedback.
@@ -154,6 +156,8 @@ def remember(
             pinned=pinned,
             trust=trust,          # type: ignore[arg-type]
             idempotent=idempotent,
+            valid_from=valid_from,
+            valid_until=valid_until,
         )
     except ValueError as e:
         return {"stored": False, "error": str(e)}
@@ -282,6 +286,7 @@ def recall(
     expand_rerank: bool | None = None,
     lexical_index: str = "pool",
     min_trust: str | None = None,
+    as_of: float | None = None,
 ) -> list[dict[str, Any]]:
     """Semantic (or hybrid) search across stored memories.
     mode: "semantic" (default) | "hybrid" (cosine + BM25 + recency + importance).
@@ -341,6 +346,7 @@ def recall(
                        expand_score, expand_decay, expand_rerank),
         lexical_index=lexical_index,  # type: ignore[arg-type]
         min_trust=min_trust,          # type: ignore[arg-type]
+        as_of=as_of,
     )
 
     def _hit(m: Any, score: float) -> dict[str, Any]:
@@ -393,6 +399,7 @@ def recall_pack(
     lexical_index: str = "pool",
     min_trust: str | None = None,
     include_pinned: bool = False,
+    as_of: float | None = None,
 ) -> dict[str, Any]:
     """Assemble the most relevant memories into a token-budgeted context block.
 
@@ -445,6 +452,7 @@ def recall_pack(
                        expand_score, expand_decay, expand_rerank),
         lexical_index=lexical_index,  # type: ignore[arg-type]
         min_trust=min_trust,          # type: ignore[arg-type]
+        as_of=as_of,
         include_pinned=include_pinned,
     )
     return {
@@ -488,6 +496,8 @@ def auto_context(
     compress: bool = False,
     compress_threshold: float = 0.30,
     compress_min_group: int = 2,
+    lexical_index: str = "pool",
+    min_trust: str | None = None,
 ) -> dict[str, Any]:
     """Build a ready-to-inject context block by fanning out over multiple recall angles.
 
@@ -504,6 +514,11 @@ def auto_context(
     touch=false makes the whole fan-out read-only. compress* behave as on
     recall_pack. fusion is not offered here: RRF scores are rank-relative to each
     query's own pool, so they cannot be compared across the fan-out.
+
+    min_trust and lexical_index apply to every fan-out query, as on recall_pack.
+    The trust floor is worth setting here in particular: this is the tool you call
+    without choosing a query, so it is the one most likely to pull scraped
+    material into a context block unattended.
     """
     queries = [task] + extract_key_phrases(task, max_phrases)
     pack = get_store().auto_context_pack(
@@ -517,6 +532,8 @@ def auto_context(
         compress=compress,
         compress_threshold=compress_threshold,
         compress_min_group=compress_min_group,
+        lexical_index=lexical_index,   # type: ignore[arg-type]
+        min_trust=min_trust,           # type: ignore[arg-type]
     )
     return {
         "text": pack.text,
@@ -601,6 +618,8 @@ def edit(
     expires_at: float | None = None,
     pinned: bool | None = None,
     trust: str | None = None,
+    valid_from: float | None = None,
+    valid_until: float | None = None,
 ) -> dict[str, Any]:
     """Update fields of an existing memory in place, keeping its id.
 
@@ -633,6 +652,10 @@ def edit(
         kwargs["trust"] = trust
     if expires_at is not None:
         kwargs["expires_at"] = expires_at
+    if valid_from is not None:
+        kwargs["valid_from"] = valid_from
+    if valid_until is not None:
+        kwargs["valid_until"] = valid_until
     if source is not None:
         kwargs["source"] = source
     if clear_source:
