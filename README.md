@@ -496,7 +496,7 @@ so a mis-tuned `min_score` is no longer unrecoverable.
 houkai trash put 72be7903      # soft-delete, recoverable
 houkai trash list
 houkai trash restore 72be7903
-houkai trash purge --yes       # irreversible, empties the trash
+houkai trash purge --yes       # irreversible, empties this collection's trash
 
 # Retention: drop entries trashed more than N days ago. Without this a
 # "recoverable delete" is really a permanent archive and the file grows
@@ -763,7 +763,7 @@ Endpoints (all JSON in / JSON out):
 | `GET /memories/{id}/at?ts=` | reconstruct one memory as of a past time |
 | `GET /state_at?ts=` | reconstruct all live memories as of a past time |
 | `POST /purge_expired` | hard-delete TTL-expired memories (`{dry_run?}`) |
-| `GET\|POST /recall` | search — supports `source`, `since`, `until`, `include_expired`, `explain`; the POST body additionally takes `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph`, `lexical_index`, `min_trust` and a nested `expand` object |
+| `GET\|POST /recall` | search — supports `source`, `since`, `until`, `include_expired`, `explain`, `overfetch`, `as_of`, `min_trust`, `lexical_index`, `touch`; the POST body additionally takes `fusion`, `diversity`, `dedup_threshold`, `min_cosine`, `graph` and a nested `expand` object |
 | `POST /recall_pack` | token-budgeted context block |
 | `POST /auto_context` | multi-angle context block (`auto_context_pack`) |
 | `POST /links` · `POST /unlink` | manage the link graph |
@@ -828,10 +828,12 @@ type, message, or traceback is leaked to the client.
 `token_budget`, `max_phrases`, `mode`, `min_cosine`, `header`, and the same
 compression trio; its response adds the fan-out `queries`. String `tags` in
 `POST /memories` / `PATCH /memories/{id}` are coerced to a one-element list
-(anything other than a string or list of strings is a `400`). `touch`/
-`explain` remain Python-API-only. Every serialised memory carries `pinned` and
-`trust` explicitly — including their defaults (`false` / `"trusted"`), because
-an absent key would be indistinguishable from "not pinned" / "unlabelled".
+(anything other than a string or list of strings is a `400`). `touch=false`
+(GET or POST) makes recall read-only — access counters aren't bumped, so
+eval/monitoring traffic doesn't feed decay reinforcement. Every serialised
+memory carries `pinned` and `trust` explicitly — including their defaults
+(`false` / `"trusted"`), because an absent key would be indistinguishable
+from "not pinned" / "unlabelled".
 
 ---
 

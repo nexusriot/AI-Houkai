@@ -661,9 +661,12 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	// filter — not just tag — forces an over-fetch to avoid under-returning.
 	// Expiry filtering and reranking both reorder/drop rows, so they force it too.
 	//
-	// EVERY post-query filter has to be listed here. One that is missing does
-	// not fail loudly: it silently returns fewer than k results, because the
-	// rows that would have replaced the dropped ones were never fetched.
+	// EVERY optional post-query filter has to be listed here. One that is
+	// missing does not fail loudly: it silently returns fewer than k results,
+	// because the rows that would have replaced the dropped ones were never
+	// fetched. The validity filter cannot be listed — it is always on — so the
+	// fast path re-queries with overfetch on a shortfall below, which also
+	// catches any future filter this list misses.
 	noPostFilter := opts.Mode == ModeSemantic && opts.IncludeSuperseded &&
 		opts.IncludeExpired && reranker == nil &&
 		opts.Tag == "" && opts.Type == "" && opts.MinImportance <= 0 &&
@@ -686,15 +689,6 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if err != nil {
 		return nil, err
 	}
-	hits, err := s.backend.Query(ctx, vecs[0], nFetch)
-	if err != nil {
-		return nil, err
-	}
-
-	// Full-corpus lexical recall — see unionLexical.
-	if opts.LexicalIndex == LexicalCorpus && opts.Mode == ModeHybrid {
-		hits = s.unionLexical(ctx, hits, query, vecs[0], nFetch)
-	}
 
 	now := nowFloat()
 
@@ -710,45 +704,6 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	// wearing a past timestamp.
 	poolSuperseded := opts.IncludeSuperseded || opts.AsOf > 0
 
-	// The "where-clause" filters (type/importance/source/since/until) form the
-	// scoring pool; tag/superseded/min_cosine are applied inside the scorers so
-	// the BM25 pool matches Python's server-side-filtered document set.
-	var pool []cand
-	for _, h := range hits {
-		m := MetadataToMemory(h.ID, h.Content, h.Metadata)
-		if opts.Type != "" && m.Type != opts.Type {
-			continue
-		}
-		if m.Importance < opts.MinImportance {
-			continue
-		}
-		if opts.Source != "" && m.Source != opts.Source {
-			continue
-		}
-		if opts.MinTrust != "" && TrustRank(m.Trust) > TrustRank(opts.MinTrust) {
-			continue
-		}
-		if opts.Since > 0 && m.CreatedAt < opts.Since {
-			continue
-		}
-		if opts.Until > 0 && m.CreatedAt > opts.Until {
-			continue
-		}
-		// Drop expired unless asked to keep them. Post-filter (not a backend
-		// query filter), so rows written before TTL existed (ExpiresAt 0) are
-		// unaffected.
-		if !opts.IncludeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
-			continue
-		}
-		// Drop memories that were not true at the moment being asked about.
-		// Default (AsOf unset) means "now", so closing a ValidUntil retires a
-		// fact from ordinary recall without deleting it.
-		if !isValidAt(m, validityTS) {
-			continue
-		}
-		pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
-	}
-
 	w := opts.Weights
 	if w == (HybridWeights{}) {
 		w = DefaultWeights()
@@ -763,24 +718,104 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	}
 
 	var expl map[string]map[string]any
-	if opts.Explain {
-		expl = map[string]map[string]any{}
-	}
-
 	var scored []scoredCand
-	if opts.Mode == ModeHybrid {
-		docs := make([]string, len(pool))
-		for i, c := range pool {
-			docs[i] = c.mem.Text
+	for {
+		hits, qerr := s.backend.Query(ctx, vecs[0], nFetch)
+		if qerr != nil {
+			return nil, qerr
 		}
-		bm25 := bm25Score(query, docs)
-		if opts.Fusion == FusionRRF {
-			scored = s.scoreRRF(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now, 60)
+
+		// Full-corpus lexical recall — see unionLexical.
+		if opts.LexicalIndex == LexicalCorpus && opts.Mode == ModeHybrid {
+			hits = s.unionLexical(ctx, hits, query, vecs[0], nFetch)
+		}
+
+		// The "where-clause" filters (type/importance/source/since/until) form
+		// the scoring pool; tag/superseded/min_cosine are applied inside the
+		// scorers so the BM25 pool matches Python's server-side-filtered
+		// document set. Trust, validity and expiry deliberately do NOT trim
+		// the pool: Python filters them after scoring, and dropping rows here
+		// would shift BM25 statistics and RRF ranks away from the reference
+		// port.
+		var pool []cand
+		for _, h := range hits {
+			m := MetadataToMemory(h.ID, h.Content, h.Metadata)
+			if opts.Type != "" && m.Type != opts.Type {
+				continue
+			}
+			if m.Importance < opts.MinImportance {
+				continue
+			}
+			if opts.Source != "" && m.Source != opts.Source {
+				continue
+			}
+			if opts.Since > 0 && m.CreatedAt < opts.Since {
+				continue
+			}
+			if opts.Until > 0 && m.CreatedAt > opts.Until {
+				continue
+			}
+			pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
+		}
+
+		expl = nil
+		if opts.Explain {
+			expl = map[string]map[string]any{}
+		}
+
+		if opts.Mode == ModeHybrid {
+			docs := make([]string, len(pool))
+			for i, c := range pool {
+				docs[i] = c.mem.Text
+			}
+			bm25 := bm25Score(query, docs)
+			if opts.Fusion == FusionRRF {
+				scored = s.scoreRRF(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now, 60)
+			} else {
+				scored = s.scoreWeighted(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now)
+			}
 		} else {
-			scored = s.scoreWeighted(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now)
+			scored = scoreSemantic(pool, w, opts.Tag, poolSuperseded, opts.MinCosine, expl)
 		}
-	} else {
-		scored = scoreSemantic(pool, w, opts.Tag, poolSuperseded, opts.MinCosine, expl)
+
+		// Post-scoring filters, in the reference port's order: trust, then
+		// validity, then expiry. Rows written before these features existed
+		// carry zero values and pass untouched.
+		kept := scored[:0]
+		for _, sc := range scored {
+			if opts.MinTrust != "" && TrustRank(sc.mem.Trust) > TrustRank(opts.MinTrust) {
+				continue
+			}
+			// Drop memories that were not true at the moment being asked
+			// about. Default (AsOf unset) means "now", so closing a
+			// ValidUntil retires a fact from ordinary recall without
+			// deleting it.
+			if !isValidAt(sc.mem, validityTS) {
+				continue
+			}
+			if !opts.IncludeExpired && sc.mem.ExpiresAt > 0 && sc.mem.ExpiresAt <= now {
+				continue
+			}
+			kept = append(kept, sc)
+		}
+		scored = kept
+
+		// Fast-path shortfall: the always-on validity filter can drop rows
+		// the fetch-exactly-k guard cannot anticipate. When it does — and
+		// unfetched rows remain — fall back to one overfetched pass rather
+		// than silently returning fewer than k.
+		if noPostFilter && len(scored) < k && nFetch < count {
+			noPostFilter = false
+			nFetch = k * overfetch
+			if nFetch > count {
+				nFetch = count
+			}
+			if nFetch < k {
+				nFetch = k
+			}
+			continue
+		}
+		break
 	}
 
 	// Second-stage rerank over the surviving pool, before the top-k cut.

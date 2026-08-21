@@ -108,7 +108,7 @@ def print_memories_table(
         else:
             normalized.append((r, None))
 
-    output_fmt = fmt if fmt != "auto" else ("rich" if _is_tty() else "tsv")
+    output_fmt = resolve_format(fmt)
 
     if output_fmt == "json":
         print_memories_json(normalized)

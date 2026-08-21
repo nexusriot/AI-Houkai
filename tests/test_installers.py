@@ -128,12 +128,44 @@ def test_write_json_atomic_and_roundtrip(tmp_path: Path) -> None:
     assert [p.name for p in path.parent.iterdir()] == ["cfg.json"]
 
 
-def test_load_json_tolerates_garbage(tmp_path: Path) -> None:
+def test_load_json_refuses_garbage_by_default(tmp_path: Path) -> None:
+    """An unparseable config must never be silently treated as empty —
+    install() writes the merged result back, so {} here would replace the
+    user's whole client config with just our server block."""
     path = tmp_path / "bad.json"
     path.write_text("{not json")
-    assert load_json(str(path)) == {}
-    with pytest.raises(json.JSONDecodeError):
-        load_json(str(path), overwrite_unparseable=False)
+    with pytest.raises(ValueError, match="bad.json"):
+        load_json(str(path))
+    assert path.read_text() == "{not json"   # original untouched
+
+    # Opting into the overwrite parks a .bak copy of the original first.
+    assert load_json(str(path), overwrite_unparseable=True) == {}
+    assert (tmp_path / "bad.json.bak").read_text() == "{not json"
+
+
+def test_load_json_refuses_non_object(tmp_path: Path) -> None:
+    """Valid JSON that is not an object would crash the setdefault-based
+    merge — reject it with the same clear error as unparseable JSON."""
+    path = tmp_path / "list.json"
+    path.write_text('["not", "an", "object"]')
+    with pytest.raises(ValueError, match="expected a JSON object"):
+        load_json(str(path))
+    assert load_json(str(path), overwrite_unparseable=True) == {}
+    assert (tmp_path / "list.json.bak").exists()
+
+
+def test_install_direct_refuses_corrupt_config(tmp_path: Path,
+                                               monkeypatch) -> None:
+    """--install against a corrupt user config must fail loudly, not
+    replace the file (the pre-fix behavior lost the user's entire
+    ~/.claude.json to one trailing comma)."""
+    cfg = tmp_path / "claude.json"
+    cfg.write_text('{"mcpServers": {},}')   # trailing comma: invalid JSON
+    monkeypatch.setattr(cc_mod.shutil, "which", lambda _: None)
+    inst = ClaudeCodeInstaller(config_path=str(cfg))
+    with pytest.raises(ValueError, match="claude.json"):
+        inst.install()
+    assert cfg.read_text() == '{"mcpServers": {},}'   # file untouched
 
 
 def test_importing_installers_creates_no_store(tmp_path: Path) -> None:

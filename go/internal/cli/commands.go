@@ -641,13 +641,11 @@ func newGraphCmd() *cobra.Command {
 // graphToASCII renders a subgraph as an indented node/edge listing.
 func graphToASCII(g memory.Graph) string {
 	var b strings.Builder
-	labels := map[string]string{}
 	for _, n := range g.Nodes {
 		snippet := n.Text
 		if r := []rune(snippet); len(r) > 50 {
 			snippet = string(r[:50]) + "…"
 		}
-		labels[n.ID] = snippet
 		fmt.Fprintf(&b, "%s (%s) %s\n", fmtID(n.ID), n.Type, snippet)
 	}
 	for _, e := range g.Edges {
@@ -1062,8 +1060,10 @@ func newJournalTailCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Tail-N then reverse.
-			if len(entries) > n {
+			// Tail-N then reverse. n <= 0 would slice out of bounds.
+			if n <= 0 {
+				entries = nil
+			} else if len(entries) > n {
 				entries = entries[len(entries)-n:]
 			}
 			if len(entries) == 0 {

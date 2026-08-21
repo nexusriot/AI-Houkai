@@ -90,7 +90,7 @@ class CursorInstaller:
     def build_settings_block(self) -> dict:
         return {"mcpServers": {self.server_name: self.build_mcp_block()}}
 
-    def install(self, *, overwrite_unparseable: bool = True) -> str:
+    def install(self, *, overwrite_unparseable: bool = False) -> str:
         """Patch the Cursor mcp.json with the MCP server block. Returns the path."""
         config = load_json(self.settings_path,
                            overwrite_unparseable=overwrite_unparseable)
@@ -106,10 +106,14 @@ class CursorInstaller:
               f"'{self.server_name}' is listed.\n", file=stream)
 
     def verify(self, *, stream=sys.stdout) -> bool:
-        ok = verify_server(self.server_name, memory_path=self.memory_path,
+        ok = verify_server(memory_path=self.memory_path,
                            collection=self.collection, stream=stream)
         if os.path.isfile(self.settings_path):
-            cfg = load_json(self.settings_path)
+            try:
+                cfg = load_json(self.settings_path)
+            except ValueError as exc:
+                print(f"  warn {exc}", file=stream)
+                cfg = {}
             if self.server_name in cfg.get("mcpServers", {}):
                 print(f"  ok   registered in {self.settings_path}", file=stream)
             else:
@@ -171,7 +175,11 @@ def _main(argv: Optional[list] = None) -> int:
         print("\n\n")
 
     if args.install:
-        path = inst.install()
+        try:
+            path = inst.install()
+        except ValueError as exc:
+            print(f"  err  {exc}")
+            return 1
         print(f"  written: {path}")
         print("  Reload Cursor, then check Settings → MCP.\n")
     elif not (args.verify or args.rule):

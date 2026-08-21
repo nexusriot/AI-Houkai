@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from rich.text import Text
 
 from ai_houkai.tui.data import (
     Navigator,
@@ -207,3 +208,29 @@ async def test_nuke_disarmed_by_navigation(seeded):
         assert app._nuke_pending is False
         await pilot.press("X")                    # this X re-arms, not nukes
         assert store.count() == 3
+
+
+class TestMarkupSafety:
+    """Memory text reaches Rich-markup contexts (DataTable cells, the detail
+    Static). Un-escaped, a stored `[/bold]` crashes the whole app with
+    MarkupError and `arr[i]` is silently eaten from the display."""
+
+    def test_snippet_survives_markup_round_trip(self, store):
+        store.remember("indexing arr[i] fails on the [/bold] row")
+        view = recent_view(store)
+        snippet = view.rows[0][5]
+        assert Text.from_markup(snippet).plain == \
+            "indexing arr[i] fails on the [/bold] row"
+
+    def test_detail_markup_escapes_text_tags_and_source(self, store):
+        m = store.remember("list[int] beats [/dim] here",
+                           tags=["a[b]"], source="scraper[3]")
+        rendered = Text.from_markup(detail_markup(m)).plain
+        assert "list[int] beats [/dim] here" in rendered
+        assert "#a[b]" in rendered
+        assert "scraper[3]" in rendered
+
+    def test_search_title_escapes_query(self, store):
+        store.remember("anything")
+        view = search_view(store, "weird [/red] query")
+        assert "[/red]" in Text.from_markup(view.title).plain

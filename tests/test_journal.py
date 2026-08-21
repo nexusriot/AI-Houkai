@@ -343,3 +343,63 @@ def test_trash_restore_does_not_clobber_a_live_memory(store: MemoryStore) -> Non
 
     store.trash_restore(mem.id)
     assert store.get(mem.id).tags == ["after"]
+
+
+def test_truncated_archive_keeps_history_readable(tmp_path: Path) -> None:
+    """A crash mid-compression can leave a truncated .log.gz (pre-fix
+    rotations compressed under the final name). Reading it raises at the
+    gzip layer, not per line — it must not take the rest of history down."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(5):
+        j.append(_entry(i))
+    j._rotate()
+    for i in range(5, 8):
+        j.append(_entry(i))
+
+    archive = next(tmp_path.glob("j-*.log.gz"))
+    raw = archive.read_bytes()
+    archive.write_bytes(raw[: len(raw) // 2])
+
+    ids = [e.id for e in j.read(include_archives=True)]
+    # The active file's entries must all survive; the truncated archive
+    # contributes whatever decompressed cleanly.
+    assert ids[-3:] == ["id-5", "id-6", "id-7"]
+
+
+def test_plain_rotation_wins_over_same_stem_archive(tmp_path: Path) -> None:
+    """When both x.log and x.log.gz exist (crash between compress and
+    unlink), entries must not be yielded twice."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(4):
+        j.append(_entry(i))
+    j._rotate()
+    archive = next(tmp_path.glob("j-*.log.gz"))
+    plain = archive.with_name(archive.name[: -len(".gz")])
+    with gzip.open(archive, "rt", encoding="utf-8") as f:
+        plain.write_text(f.read())
+
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(4)]
+
+
+def test_rotate_compresses_via_temp_name(tmp_path: Path, monkeypatch) -> None:
+    """A crash mid-compression must never leave a truncated file under the
+    final archive name — the half-written file keeps a .tmp suffix."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(5):
+        j.append(_entry(i))
+
+    real_open = journal_mod.gzip.open
+    def dies_mid_write(*a, **k):
+        handle = real_open(*a, **k)
+        handle.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(journal_mod.gzip, "open", dies_mid_write)
+    with pytest.raises(OSError):
+        j._rotate()
+    monkeypatch.undo()
+
+    assert not list(tmp_path.glob("j-*.log.gz"))
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(5)]

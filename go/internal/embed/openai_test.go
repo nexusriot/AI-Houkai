@@ -15,11 +15,11 @@ func fakeOpenAIServer(t *testing.T, wantAuth, wantModel string) *httptest.Server
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/embeddings" {
-			http.Error(w, "wrong path: "+r.URL.Path, 404)
+			http.Error(w, "wrong path: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
 		if got := r.Header.Get("Authorization"); got != wantAuth {
-			http.Error(w, "auth: "+got, 401)
+			http.Error(w, "auth: "+got, http.StatusUnauthorized)
 			return
 		}
 		body, _ := io.ReadAll(r.Body)

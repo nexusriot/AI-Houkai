@@ -54,11 +54,19 @@ type PathHop struct {
 }
 
 // TrashEntry is a soft-deleted memory parked in the trash file.
+// TrashEntry is a soft-deleted memory parked in the trash file.
+//
+// Collection scopes the entry: the trash file lives beside the store path and
+// is shared by every collection opened on it, so without the tag a restore
+// from collection B would materialize collection A's memory into B. Entries
+// written before the field existed have "" and stay visible from every
+// collection — hiding them retroactively would strand them.
 type TrashEntry struct {
-	MemoryID  string         `json:"memory_id"`
-	DeletedAt float64        `json:"deleted_at"`
-	Actor     string         `json:"actor"`
-	Memory    map[string]any `json:"memory"`
+	MemoryID   string         `json:"memory_id"`
+	DeletedAt  float64        `json:"deleted_at"`
+	Actor      string         `json:"actor"`
+	Memory     map[string]any `json:"memory"`
+	Collection string         `json:"collection"`
 }
 
 // Merge folds other into target and returns the updated target.
@@ -441,7 +449,7 @@ func (s *MemoryStore) Trash(ctx context.Context, memoryID string) (bool, error) 
 	}
 	entry := TrashEntry{
 		MemoryID: mem.ID, DeletedAt: nowFloat(), Actor: s.actor,
-		Memory: mem.ToDict(),
+		Memory: mem.ToDict(), Collection: s.cfg.Collection,
 	}
 	if err := s.appendTrash(entry); err != nil {
 		return false, err
@@ -454,8 +462,16 @@ func (s *MemoryStore) Trash(ctx context.Context, memoryID string) (bool, error) 
 	return true, nil
 }
 
-// TrashList returns everything currently in the trash, oldest first.
-func (s *MemoryStore) TrashList() ([]TrashEntry, error) {
+// trashVisible reports whether a trash entry belongs to this store's
+// collection. Legacy entries carry no collection tag and stay visible
+// everywhere — see TrashEntry.
+func (s *MemoryStore) trashVisible(e TrashEntry) bool {
+	return e.Collection == "" || e.Collection == s.cfg.Collection
+}
+
+// readTrash returns every entry in the shared trash file, all collections
+// included — mutation paths must write back what they do not own.
+func (s *MemoryStore) readTrash() ([]TrashEntry, error) {
 	f, err := os.Open(s.TrashPath())
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -484,28 +500,50 @@ func (s *MemoryStore) TrashList() ([]TrashEntry, error) {
 	return out, nil
 }
 
+// TrashList returns this collection's trash, oldest first.
+func (s *MemoryStore) TrashList() ([]TrashEntry, error) {
+	entries, err := s.readTrash()
+	if err != nil {
+		return nil, err
+	}
+	var out []TrashEntry
+	for _, e := range entries {
+		if s.trashVisible(e) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // TrashRestore brings a trashed memory back, or reports found=false.
 //
 // The row is re-added with its original id and metadata and re-embedded from
-// its text; the trash entry is then dropped.
+// its text; the restored entry is then dropped. found is false when the id is
+// not in this collection's trash — or when it is live again (an export/import
+// can resurrect a trashed id): restoring over a live row would clobber it, so
+// the entry is kept instead. With several entries for one id (trash → import
+// → trash), the newest snapshot is restored and older ones stay recoverable.
 func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory, bool, error) {
-	entries, err := s.TrashList()
+	entries, err := s.readTrash()
 	if err != nil {
 		return Memory{}, false, err
 	}
-	var found *TrashEntry
-	keep := make([]TrashEntry, 0, len(entries))
+	found := -1
 	for i := range entries {
-		if entries[i].MemoryID == memoryID && found == nil {
-			found = &entries[i]
+		if !s.trashVisible(entries[i]) || entries[i].MemoryID != memoryID {
 			continue
 		}
-		keep = append(keep, entries[i])
+		if found < 0 || entries[i].DeletedAt > entries[found].DeletedAt {
+			found = i
+		}
 	}
-	if found == nil {
+	if found < 0 {
 		return Memory{}, false, nil
 	}
-	mem := MemoryFromDict(found.Memory)
+	if _, err := s.GetByID(ctx, memoryID); err == nil {
+		return Memory{}, false, nil
+	}
+	mem := MemoryFromDict(entries[found].Memory)
 	if err := s.UpdateMemory(ctx, mem, true); err != nil {
 		return Memory{}, false, err
 	}
@@ -513,27 +551,28 @@ func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory
 	defer restore()
 	s.journalEntry("restore", mem.ID, nil, mem.ToDict(),
 		map[string]any{"from": "trash"})
+	keep := append(entries[:found:found], entries[found+1:]...)
 	if err := s.writeTrash(keep); err != nil {
 		return mem, true, err
 	}
 	return mem, true, nil
 }
 
-// TrashPurge permanently drops one trashed memory, or empties the trash when
-// memoryID is empty. Irreversible — the only trash operation that loses data.
+// TrashPurge permanently drops one trashed memory, or empties this
+// collection's trash when memoryID is empty. Irreversible — the only trash
+// operation that loses data. Other collections' entries in the shared trash
+// file are untouched.
 func (s *MemoryStore) TrashPurge(memoryID string) (int, error) {
-	entries, err := s.TrashList()
+	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err
 	}
-	if memoryID == "" {
-		return len(entries), s.writeTrash(nil)
-	}
 	keep := make([]TrashEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.MemoryID != memoryID {
-			keep = append(keep, e)
+		if s.trashVisible(e) && (memoryID == "" || e.MemoryID == memoryID) {
+			continue
 		}
+		keep = append(keep, e)
 	}
 	purged := len(entries) - len(keep)
 	if purged == 0 {
@@ -559,14 +598,14 @@ func (s *MemoryStore) TrashPurgeExpired(ttlDays float64, now float64) (int, erro
 	if now == 0 {
 		now = nowFloat()
 	}
-	entries, err := s.TrashList()
+	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err
 	}
 	cutoff := now - ttlDays*86400
 	keep := make([]TrashEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.DeletedAt >= cutoff {
+		if !(s.trashVisible(e) && e.DeletedAt < cutoff) {
 			keep = append(keep, e)
 		}
 	}

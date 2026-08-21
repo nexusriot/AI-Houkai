@@ -163,16 +163,34 @@ func (j *Journal) rotate() error {
 	stamp := time.Now().UTC().Format("20060102T150405")
 	stem := strings.TrimSuffix(filepath.Base(j.Path), filepath.Ext(j.Path))
 	dir := filepath.Dir(j.Path)
-	archive := filepath.Join(dir, fmt.Sprintf("%s-%s.log.gz", stem, stamp))
-	if _, err := os.Stat(archive); err == nil {
-		archive = filepath.Join(dir, fmt.Sprintf("%s-%s-%d.log.gz", stem, stamp, os.Getpid()))
+	base := fmt.Sprintf("%s-%s", stem, stamp)
+	rotated := filepath.Join(dir, base+".log")
+	archive := filepath.Join(dir, base+".log.gz")
+	_, rErr := os.Stat(rotated)
+	_, aErr := os.Stat(archive)
+	if rErr == nil || aErr == nil {
+		base = fmt.Sprintf("%s-%d", base, os.Getpid())
+		rotated = filepath.Join(dir, base+".log")
+		archive = filepath.Join(dir, base+".log.gz")
 	}
-	src, err := os.Open(j.Path)
+	// Rename first (atomic), then compress the renamed file. Appends open the
+	// path fresh on every call and so land in a new active file — the old
+	// compress-then-truncate order silently destroyed any entry appended by
+	// another process between the copy and the truncate. A crash
+	// mid-compression leaves the plain rotated file behind; Read still
+	// includes it, so no entries are lost either way. Compression goes
+	// through a temp name so a crash can never leave a *truncated* file
+	// under the archive name.
+	if err := os.Rename(j.Path, rotated); err != nil {
+		return err
+	}
+	src, err := os.Open(rotated)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	dst, err := os.Create(archive)
+	tmp := archive + ".tmp"
+	dst, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
@@ -189,19 +207,27 @@ func (j *Journal) rotate() error {
 	if err := dst.Close(); err != nil {
 		return err
 	}
-	// Truncate in place so any concurrent writer's fd remains valid.
-	return os.Truncate(j.Path, 0)
+	if err := os.Rename(tmp, archive); err != nil {
+		return err
+	}
+	return os.Remove(rotated)
 }
 
 func (j *Journal) pruneArchives() {
 	stem := strings.TrimSuffix(filepath.Base(j.Path), filepath.Ext(j.Path))
-	pattern := filepath.Join(filepath.Dir(j.Path), stem+"-*.log.gz")
-	matches, _ := filepath.Glob(pattern)
+	dir := filepath.Dir(j.Path)
 	cutoff := time.Now().Add(-time.Duration(j.KeepDays) * 24 * time.Hour)
-	for _, p := range matches {
-		st, err := os.Stat(p)
-		if err == nil && st.ModTime().Before(cutoff) {
-			_ = os.Remove(p)
+	// `-*.log` covers plain rotated files orphaned by a crash before
+	// compression finished, `-*.log.gz.tmp` half-written compressions.
+	for _, pattern := range []string{
+		stem + "-*.log.gz", stem + "-*.log", stem + "-*.log.gz.tmp",
+	} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		for _, p := range matches {
+			st, err := os.Stat(p)
+			if err == nil && st.ModTime().Before(cutoff) {
+				_ = os.Remove(p)
+			}
 		}
 	}
 }
@@ -222,10 +248,26 @@ func (j *Journal) Read(opts ReadOpts) ([]JournalEntry, error) {
 	var files []string
 	if opts.IncludeArchives {
 		stem := strings.TrimSuffix(filepath.Base(j.Path), filepath.Ext(j.Path))
-		pattern := filepath.Join(filepath.Dir(j.Path), stem+"-*.log.gz")
-		archives, _ := filepath.Glob(pattern)
-		sort.Strings(archives)
-		files = append(files, archives...)
+		dir := filepath.Dir(j.Path)
+		// Plain `-*.log` files are rotations orphaned by a crash before
+		// compression finished — their entries are still valid history.
+		// When both x.log and x.log.gz exist (older code could crash between
+		// compressing and unlinking), the plain file wins: it is complete by
+		// construction, while the archive may be truncated and would
+		// double-count whatever did decompress.
+		plain, _ := filepath.Glob(filepath.Join(dir, stem+"-*.log"))
+		plainSet := make(map[string]bool, len(plain))
+		for _, p := range plain {
+			plainSet[p] = true
+		}
+		gz, _ := filepath.Glob(filepath.Join(dir, stem+"-*.log.gz"))
+		for _, p := range gz {
+			if !plainSet[strings.TrimSuffix(p, ".gz")] {
+				files = append(files, p)
+			}
+		}
+		files = append(files, plain...)
+		sort.Strings(files)
 	}
 	if _, err := os.Stat(j.Path); err == nil {
 		files = append(files, j.Path)
@@ -238,17 +280,23 @@ func (j *Journal) Read(opts ReadOpts) ([]JournalEntry, error) {
 			continue
 		}
 		var r io.Reader = f
+		var gr *gzip.Reader
 		if strings.HasSuffix(fp, ".gz") {
-			gr, err := gzip.NewReader(f)
+			gr, err = gzip.NewReader(f)
 			if err != nil {
 				_ = f.Close()
 				continue
 			}
-			defer gr.Close()
 			r = gr
 		}
+		closeAll := func() {
+			if gr != nil {
+				_ = gr.Close()
+			}
+			_ = f.Close()
+		}
 		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		sc.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
 		for sc.Scan() {
 			line := strings.TrimSpace(sc.Text())
 			if line == "" {
@@ -275,11 +323,17 @@ func (j *Journal) Read(opts ReadOpts) ([]JournalEntry, error) {
 			}
 			out = append(out, e)
 			if opts.Limit > 0 && len(out) >= opts.Limit {
-				_ = f.Close()
+				closeAll()
 				return out, nil
 			}
 		}
-		_ = f.Close()
+		// A truncated archive (crash mid-compression) or an oversized line
+		// surfaces here, not per line — it must not silently end the scan of
+		// the remaining files.
+		if err := sc.Err(); err != nil {
+			log.Printf("ai-houkai journal read %s: %v", fp, err)
+		}
+		closeAll()
 	}
 	return out, nil
 }

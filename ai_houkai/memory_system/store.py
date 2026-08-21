@@ -12,10 +12,8 @@ New in this version:
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
-import logging
 import math
 import gzip
 import os
@@ -42,7 +40,7 @@ from ai_houkai.embed import (
 
 from .curation import CurationMixin
 from .journal import Journal, JournalEntry
-from .trust import TRUST_LEVELS, TrustLevel, trust_rank, worst_trust
+from .trust import TRUST_LEVELS, TrustLevel, trust_rank
 
 MemoryType = Literal["episodic", "semantic", "procedural", "feedback"]
 
@@ -1380,11 +1378,14 @@ class MemoryStore(CurationMixin):
         reranker = reranker if reranker is not None else self._reranker
 
         # The fast path (fetch exactly k) is only safe when NOTHING can drop or
-        # reorder rows after the query. Every post-query filter has to be listed
-        # here: one that is missing does not fail loudly, it silently returns
-        # fewer than k results, because the rows that would have replaced the
-        # dropped ones were never fetched. `min_trust` and the corpus-lexical
-        # union are both post-query and both belong in this guard.
+        # reorder rows after the query. Every optional post-query filter has to
+        # be listed here: one that is missing does not fail loudly, it silently
+        # returns fewer than k results, because the rows that would have
+        # replaced the dropped ones were never fetched. `min_trust` and the
+        # corpus-lexical union are both post-query and both belong in this
+        # guard. The validity filter cannot be listed — it is always on — so
+        # the fast path re-queries with overfetch on a shortfall below, which
+        # also catches any future filter this list misses.
         no_post_filter = (
             mode == "semantic" and include_superseded and include_expired
             and tag is None and not need_emb and min_cosine is None
@@ -1405,55 +1406,73 @@ class MemoryStore(CurationMixin):
         include = ["documents", "metadatas", "distances"]
         if need_emb:
             include = include + ["embeddings"]
-        res = self.collection.query(
-            query_texts=[query],
-            n_results=n_fetch,
-            where=where,
-            include=include,
-        )
-
-        # Full-corpus lexical recall — see _lexical_candidates.
-        if lexical_index == "corpus" and mode == "hybrid":
-            res = self._union_lexical(res, query, n_fetch, where, include)
-
         w = weights or self._hybrid_weights or HybridWeights()
-        expl: dict[str, dict] | None = {} if explain else None
-        if mode == "hybrid":
-            if fusion == "rrf":
-                scored = self._rrf_score(
-                    res, query, tag, pool_superseded, weights, min_cosine, expl)
+
+        while True:
+            res = self.collection.query(
+                query_texts=[query],
+                n_results=n_fetch,
+                where=where,
+                include=include,
+            )
+
+            # Full-corpus lexical recall — see _lexical_candidates.
+            if lexical_index == "corpus" and mode == "hybrid":
+                res = self._union_lexical(res, query, n_fetch, where, include)
+
+            expl: dict[str, dict] | None = {} if explain else None
+            if mode == "hybrid":
+                if fusion == "rrf":
+                    scored = self._rrf_score(
+                        res, query, tag, pool_superseded, weights, min_cosine,
+                        expl)
+                else:
+                    scored = self._hybrid_score(
+                        res, query, tag, pool_superseded, weights, min_cosine,
+                        expl)
             else:
-                scored = self._hybrid_score(
-                    res, query, tag, pool_superseded, weights, min_cosine, expl)
-        else:
-            scored = self._semantic_filter(
-                res, tag, pool_superseded, w.polarity_weight, min_cosine, expl)
+                scored = self._semantic_filter(
+                    res, tag, pool_superseded, w.polarity_weight, min_cosine,
+                    expl)
 
-        # Drop memories whose origin is trusted less than the caller demands.
-        # A post-filter for the same reason as expiry: old rows have no "trust"
-        # key, and a Chroma equality clause would silently exclude every one
-        # of them.
-        if min_trust is not None:
-            floor = TRUST_LEVELS.index(min_trust)
+            # Drop memories whose origin is trusted less than the caller
+            # demands. A post-filter for the same reason as expiry: old rows
+            # have no "trust" key, and a Chroma equality clause would silently
+            # exclude every one of them.
+            if min_trust is not None:
+                floor = TRUST_LEVELS.index(min_trust)
+                scored = [(mem, s_) for mem, s_ in scored
+                          if trust_rank(mem.trust) <= floor]
+
+            # Drop memories that were not true at the moment being asked
+            # about. Default (as_of=None) means "now", so closing a
+            # valid_until retires a fact from ordinary recall without deleting
+            # it. A post-filter for the same reason as trust and expiry: old
+            # rows carry no validity keys, and a Chroma clause would silently
+            # exclude every one of them.
+            validity_ts = time.time() if as_of is None else as_of
             scored = [(mem, s_) for mem, s_ in scored
-                      if trust_rank(mem.trust) <= floor]
+                      if _is_valid_at(mem, validity_ts)]
 
-        # Drop memories that were not true at the moment being asked about.
-        # Default (as_of=None) means "now", so closing a valid_until retires a
-        # fact from ordinary recall without deleting it. A post-filter for the
-        # same reason as trust and expiry: old rows carry no validity keys, and
-        # a Chroma clause would silently exclude every one of them.
-        validity_ts = time.time() if as_of is None else as_of
-        scored = [(mem, s_) for mem, s_ in scored
-                  if _is_valid_at(mem, validity_ts)]
+            # Drop expired memories (post-filter, not a Chroma where-clause,
+            # so old rows without the expires_at key are unaffected). Done
+            # before rerank / top-k so an expired candidate can never occupy
+            # a returned slot.
+            if not include_expired:
+                now_ts = time.time()
+                scored = [(mem, s) for mem, s in scored
+                          if not (mem.expires_at and mem.expires_at <= now_ts)]
 
-        # Drop expired memories (post-filter, not a Chroma where-clause, so old
-        # rows without the expires_at key are unaffected). Done before rerank /
-        # top-k so an expired candidate can never occupy a returned slot.
-        if not include_expired:
-            now_ts = time.time()
-            scored = [(mem, s) for mem, s in scored
-                      if not (mem.expires_at and mem.expires_at <= now_ts)]
+            # Fast-path shortfall: the always-on validity filter can drop rows
+            # the fetch-exactly-k guard cannot anticipate. When it does — and
+            # unfetched rows remain — fall back to one overfetched pass rather
+            # than silently returning fewer than k.
+            if no_post_filter and len(scored) < k and n_fetch < count:
+                no_post_filter = False
+                n_fetch = min(k * overfetch, count)
+                n_fetch = max(n_fetch, k)
+                continue
+            break
 
         # Second-stage rerank over the surviving pool, before the top-k cut.
         if reranker is not None and scored:
@@ -2636,6 +2655,8 @@ class MemoryStore(CurationMixin):
                     f"first: {head}", collisions=collisions,
                 )
 
+        renames: dict[str, str] = {}
+        written_ids: list[str] = []
         with self.as_actor("import"):
             for row in rows:
                 try:
@@ -2644,12 +2665,20 @@ class MemoryStore(CurationMixin):
                         use_vectors=use_vectors,
                         dry_run=dry_run, summary=summary,
                         collisions=collisions,
+                        renames=renames, written_ids=written_ids,
                     )
                 except _ImportConflict:
                     # Collected; raised below
                     pass
                 except Exception as e:    # pragma: no cover — defensive
                     summary.errors.append((row.get("id", "?"), str(e)))
+            # A renamed row changes its id, but the rest of the file still
+            # references the old one — which now resolves to the pre-existing
+            # memory that caused the collision. Left alone, every such link
+            # (and superseded_by) silently points at an unrelated row, so
+            # re-point them at the rename target.
+            if renames and not dry_run:
+                self._remap_imported_refs(written_ids, renames)
 
         if on_conflict == "error" and collisions:  # pragma: no cover — pre-scan
             head = collisions[:10]                 # above should catch these
@@ -2672,6 +2701,8 @@ class MemoryStore(CurationMixin):
         dry_run: bool,
         summary: "ImportSummary",
         collisions: list[tuple[str, str]],
+        renames: dict[str, str],
+        written_ids: list[str],
     ) -> None:
         meta = row.get("meta") or {}
         # The export wrote `meta` as Memory.to_dict(); rebuild a Memory.
@@ -2692,21 +2723,55 @@ class MemoryStore(CurationMixin):
                 summary.skipped += 1
                 return
             if on_conflict == "rename":
+                old_id = mem.id
                 mem.id = str(uuid.uuid4())
+                renames[old_id] = mem.id
                 if not dry_run:
                     self._add_imported(mem, vector)
+                    written_ids.append(mem.id)
                 summary.renamed += 1
                 return
             if on_conflict == "overwrite":
                 if not dry_run:
                     self.collection.delete(ids=[mem.id])
                     self._add_imported(mem, vector)
+                    written_ids.append(mem.id)
                 summary.overwritten += 1
                 return
 
         if not dry_run:
             self._add_imported(mem, vector)
+            written_ids.append(mem.id)
         summary.imported += 1
+
+    def _remap_imported_refs(
+        self, written_ids: list[str], renames: dict[str, str],
+    ) -> None:
+        """Re-point this import's links/superseded_by across renamed rows.
+
+        Journaled as edits so state reconstruction sees the corrected graph,
+        not the pre-remap ids the ``import`` entries recorded.
+        """
+        for mid in written_ids:
+            mem = self.get(mid)
+            if mem is None:
+                continue
+            before = mem.to_dict()
+            changed = False
+            new_links = []
+            for lnk in mem.links:
+                dst = renames.get(lnk.to, lnk.to)
+                changed = changed or dst != lnk.to
+                new_links.append(type(lnk)(to=dst, rel=lnk.rel))
+            if mem.superseded_by in renames:
+                mem.superseded_by = renames[mem.superseded_by]
+                changed = True
+            if not changed:
+                continue
+            mem.links = new_links
+            self.collection.update(ids=[mem.id], metadatas=[mem.to_metadata()])
+            self._journal("edit", mem.id, before=before, after=mem.to_dict(),
+                          meta={"import_remap": True})
 
     def _add_imported(self, mem: Memory, vector: list[float] | None) -> None:
         kwargs: dict[str, Any] = {

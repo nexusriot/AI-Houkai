@@ -235,3 +235,30 @@ class TestValidTimeIsNotTransactionTime:
         assert all(m.id != mem.id for m in store.state_at(JAN))
         # But it was true in February, and as_of says so.
         assert mem.id in _ids(store.recall("office february", k=10, as_of=FEB))
+
+
+class TestFastPathValidityShortfall:
+    def test_fetch_exactly_k_refetches_when_validity_drops_rows(
+            self, fake_store):
+        """The fetch-exactly-k fast path cannot anticipate the always-on
+        validity filter: a retired row in the top-k used to shrink the
+        result below k (or to zero) while live replacements were never
+        fetched."""
+        retired = fake_store.remember(
+            "quarterly revenue target details",
+            valid_from=1.0, valid_until=2.0)   # long since retired
+        live = fake_store.remember("quarterly revenue target")
+
+        hits = fake_store.recall(
+            "quarterly revenue target details", k=1, mode="semantic",
+            include_superseded=True, include_expired=True)
+        assert [m.id for m, _ in hits] == [live.id]
+        assert retired.id not in {m.id for m, _ in hits}
+
+    def test_all_rows_retired_returns_empty(self, fake_store):
+        fake_store.remember("solitary retired fact",
+                            valid_from=1.0, valid_until=2.0)
+        hits = fake_store.recall(
+            "solitary retired fact", k=1, mode="semantic",
+            include_superseded=True, include_expired=True)
+        assert hits == []

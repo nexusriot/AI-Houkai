@@ -9,6 +9,7 @@ silently strands every relationship that pointed at the absorbed memory.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import time
 
@@ -18,8 +19,9 @@ from typer.testing import CliRunner
 import ai_houkai.mcp_server.server as srv
 from ai_houkai.cli.main import app
 from ai_houkai.maintenance.scheduler import MaintenanceScheduler
-from ai_houkai.memory_system.curation import MergeError
+from ai_houkai.memory_system.curation import MergeError, TrashEntry
 from ai_houkai.memory_system.store import content_hash
+from ai_houkai.testing import make_store
 
 
 @pytest.fixture()
@@ -557,3 +559,132 @@ class TestTrashRetentionSurfaces:
         res = runner.invoke(app, base + ["trash", "purge", "abc123",
                                         "--older-than", "5", "-y"])
         assert res.exit_code == 1
+
+
+class TestTrashCollectionScoping:
+    """The trash file sits beside the store path and is shared by every
+    collection opened on it — entries must be scoped, or a restore from
+    collection B materializes collection A's memory into B."""
+
+    def test_other_collection_cannot_see_or_restore(self, tmp_path):
+        col_a = make_store(tmp_path / "chroma", collection="col_a")
+        col_b = make_store(tmp_path / "chroma", collection="col_b")
+        try:
+            m = col_a.remember("belongs to a")
+            col_a.trash(m.id)
+
+            assert col_b.trash_list() == []
+            assert col_b.trash_restore(m.id) is None
+            assert col_b.get(m.id) is None
+
+            restored = col_a.trash_restore(m.id)
+            assert restored is not None and restored.id == m.id
+        finally:
+            col_a.client.close()
+            col_b.client.close()
+
+    def test_purge_leaves_other_collections_entries(self, tmp_path):
+        col_a = make_store(tmp_path / "chroma", collection="col_a")
+        col_b = make_store(tmp_path / "chroma", collection="col_b")
+        try:
+            a = col_a.remember("a's trash")
+            b = col_b.remember("b's trash")
+            col_a.trash(a.id)
+            col_b.trash(b.id)
+
+            assert col_b.trash_purge() == 1          # empties only b's trash
+            assert [e.memory_id for e in col_a.trash_list()] == [a.id]
+            assert col_a.trash_restore(a.id) is not None
+        finally:
+            col_a.client.close()
+            col_b.client.close()
+
+    def test_purge_expired_is_scoped(self, tmp_path):
+        col_a = make_store(tmp_path / "chroma", collection="col_a")
+        col_b = make_store(tmp_path / "chroma", collection="col_b")
+        try:
+            a = col_a.remember("old in a")
+            b = col_b.remember("old in b")
+            col_a.trash(a.id)
+            col_b.trash(b.id)
+            entries = col_a._read_trash()
+            for e in entries:
+                object.__setattr__(e, "deleted_at", time.time() - 90 * 86_400)
+            col_a._write_trash(entries)
+
+            assert col_a.trash_purge_expired(30) == 1
+            assert [e.memory_id for e in col_b.trash_list()] == [b.id]
+        finally:
+            col_a.client.close()
+            col_b.client.close()
+
+    def test_legacy_untagged_entry_visible_everywhere(self, tmp_path):
+        """Entries written before the collection field existed have "" and
+        must stay recoverable from any collection."""
+        store = make_store(tmp_path / "chroma", collection="whatever")
+        try:
+            m = store.remember("template row")
+            legacy = TrashEntry(
+                memory_id="11111111-2222-3333-4444-555555555555",
+                deleted_at=time.time(), actor="lib",
+                memory={**m.to_dict(),
+                        "id": "11111111-2222-3333-4444-555555555555"},
+                collection="")
+            store._write_trash([legacy])
+            assert [e.memory_id for e in store.trash_list()] == [legacy.memory_id]
+            assert store.trash_restore(legacy.memory_id) is not None
+        finally:
+            store.client.close()
+
+
+class TestTrashRestoreSafety:
+    def test_restore_refuses_to_clobber_live_id(self, fake_store):
+        """An export→trash→import round-trip can resurrect a trashed id; the
+        pre-fix restore silently no-opped on the live row while destroying
+        the trash entry."""
+        m = fake_store.remember("original text", tags=["keep"])
+        exported = fake_store.export(fake_store.path + "/dump.ahkai")
+        fake_store.trash(m.id)
+        fake_store.import_(exported.path)
+        assert fake_store.get(m.id) is not None
+
+        assert fake_store.trash_restore(m.id) is None
+        # The snapshot must still be recoverable, not destroyed.
+        assert [e.memory_id for e in fake_store.trash_list()] == [m.id]
+
+    def test_duplicate_entries_restore_newest_and_keep_older(self, fake_store):
+        m = fake_store.remember("version ONE")
+        fake_store.trash(m.id)
+        entries = fake_store._read_trash()
+        newer = dataclasses.replace(
+            entries[0], deleted_at=entries[0].deleted_at + 10,
+            memory={**entries[0].memory, "text": "version TWO"})
+        fake_store._write_trash(entries + [newer])
+
+        restored = fake_store.trash_restore(m.id)
+        assert restored.text == "version TWO"
+        # The older snapshot stays parked, still recoverable after a forget.
+        assert len(fake_store.trash_list()) == 1
+        fake_store.forget(m.id)
+        assert fake_store.trash_restore(m.id).text == "version ONE"
+
+
+class TestTrashCorruption:
+    def test_truncated_gzip_member_keeps_earlier_entries(self, fake_store):
+        """A crash mid-append truncates the gzip member itself — EOFError,
+        not bad JSON — and must not make the whole trash unreadable."""
+        a = fake_store.remember("safe entry")
+        b = fake_store.remember("casualty entry")
+        fake_store.trash(a.id)
+        size_after_first = fake_store.trash_path.stat().st_size
+        fake_store.trash(b.id)
+
+        # Cut into the middle of the second gzip member — the shape a crash
+        # mid-append leaves behind.
+        raw = fake_store.trash_path.read_bytes()
+        cut = size_after_first + (len(raw) - size_after_first) // 2
+        fake_store.trash_path.write_bytes(raw[:cut])
+
+        assert [e.memory_id for e in fake_store.trash_list()] == [a.id]
+        assert fake_store.trash_restore(a.id) is not None
+        assert fake_store.trash_purge() >= 0

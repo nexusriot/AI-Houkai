@@ -232,18 +232,31 @@ def trash_restore_cmd(
 ) -> None:
     """Bring a trashed memory back with its id, tags and links intact."""
     store = ctx.obj["store"]
-    # Resolve against the trash, not the store — it is no longer in the store.
-    matches = [e.memory_id for e in store.trash_list()
-               if e.memory_id.startswith(id)]
+    resolved = _resolve_trash_id(store, id)
+    mem = store.trash_restore(resolved)
+    if mem is None:
+        typer.echo(
+            f"Error: {out.short_id(resolved)} could not be restored — a "
+            "memory with this id is live again; forget or trash it first",
+            err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Restored {out.short_id(mem.id)}.")
+
+
+def _resolve_trash_id(store, prefix: str) -> str:
+    """Resolve an id prefix against the trash, not the store — a trashed
+    memory is no longer in the store. Several entries may share one id
+    (trash → restore → trash), so dedupe before the ambiguity check."""
+    matches = sorted({e.memory_id for e in store.trash_list()
+                      if e.memory_id.startswith(prefix)})
     if not matches:
-        typer.echo(f"Error: {id!r} is not in the trash", err=True)
+        typer.echo(f"Error: {prefix!r} is not in the trash", err=True)
         raise typer.Exit(1)
     if len(matches) > 1:
-        typer.echo(f"Error: {id!r} is ambiguous ({len(matches)} matches)",
+        typer.echo(f"Error: {prefix!r} is ambiguous ({len(matches)} matches)",
                    err=True)
         raise typer.Exit(1)
-    mem = store.trash_restore(matches[0])
-    typer.echo(f"Restored {out.short_id(mem.id)}.")
+    return matches[0]
 
 
 def trash_purge_cmd(
@@ -264,6 +277,10 @@ def trash_purge_cmd(
             raise typer.Exit(1)
         what = f"everything trashed over {older_than} day(s) ago"
     else:
+        # Resolve before confirming: `trash list` shows 8-char ids, and an
+        # unresolved prefix would confirm destructively, then purge nothing.
+        if id is not None:
+            id = _resolve_trash_id(store, id)
         what = f"memory {id}" if id else "the ENTIRE trash"
     if not out.confirm(f"Permanently delete {what}? This cannot be undone.",
                        yes=yes):

@@ -28,6 +28,36 @@ def _resolve(store, id_or_prefix: str) -> str:
         raise typer.Exit(1)
 
 
+def _resolve_undo_id(prefix: str, entries) -> str:
+    """Resolve an id prefix against the journal, not the live store.
+
+    Undo only ever targets journaled entries, and the newest entry for a
+    memory is often the ``forget`` that removed it — exactly the change an
+    operator wants undone — so resolving against live memories would fail in
+    the primary scenario.
+    """
+    if len(prefix) == 36:
+        return prefix
+    ids = set()
+    for e in entries:
+        if e.id.startswith(prefix):
+            ids.add(e.id)
+        m = e.meta or {}
+        for key in ("dst_id", "new_id", "superseder_id"):
+            v = m.get(key)
+            if v and v.startswith(prefix):
+                ids.add(v)
+    if not ids:
+        typer.echo(f"Error: no journal entry for id prefix {prefix!r}",
+                   err=True)
+        raise typer.Exit(1)
+    if len(ids) > 1:
+        typer.echo(f"Error: {prefix!r} is ambiguous ({len(ids)} matches)",
+                   err=True)
+        raise typer.Exit(1)
+    return next(iter(ids))
+
+
 def _require_ts(raw: str) -> float:
     """Resolve a CLI timestamp argument, or exit with a readable error.
 
@@ -178,10 +208,10 @@ def journal_undo_last(
     change" shortcut, which is what an operator reaches for after a mistake.
     """
     store = ctx.obj["store"]
-    entries = [
-        e for e in store.journal.read()
-        if memory_id is None or store._entry_touches(e, _resolve(store, memory_id))
-    ]
+    entries = list(store.journal.read())
+    if memory_id is not None:
+        resolved = _resolve_undo_id(memory_id, entries)
+        entries = [e for e in entries if store._entry_touches(e, resolved)]
     if not entries:
         typer.echo("No journal entry to undo.", err=True)
         raise typer.Exit(1)

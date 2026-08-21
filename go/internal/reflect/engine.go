@@ -167,7 +167,9 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 	}
 
 	// Sort by importance descending so highest-importance seeds first.
-	sort.Slice(eps, func(i, j int) bool {
+	// Stable, so importance ties keep list order and seed the same clusters
+	// as the reference port's sorted().
+	sort.SliceStable(eps, func(i, j int) bool {
 		return eps[i].Importance > eps[j].Importance
 	})
 
@@ -183,6 +185,10 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 		}
 		assigned[i] = true
 		cluster := []memory.Memory{seed.Memory}
+		// The cluster's effective polarity is the first non-zero polarity it
+		// absorbs. Comparing against the seed alone would let a neutral seed
+		// bridge a +1 and a -1 into one summary.
+		polarity := seed.Polarity
 
 		for j, other := range eps {
 			if assigned[j] || len(other.embedding) == 0 {
@@ -191,13 +197,16 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 			// Never merge explicitly opposite polarities: a positive and a
 			// negative memory about the same event describe contradictory
 			// states and must not collapse into one summary.
-			if seed.Polarity != 0 && other.Polarity != 0 && seed.Polarity != other.Polarity {
+			if polarity != 0 && other.Polarity != 0 && polarity != other.Polarity {
 				continue
 			}
 			sim := vector.CosineSim(seed.embedding, other.embedding)
 			if sim >= e.SimilarityThreshold {
 				assigned[j] = true
 				cluster = append(cluster, other.Memory)
+				if polarity == 0 {
+					polarity = other.Polarity
+				}
 			}
 		}
 		if len(cluster) >= e.MinClusterSize {

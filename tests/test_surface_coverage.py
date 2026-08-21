@@ -258,3 +258,44 @@ class TestCliSurface:
         assert res.exit_code == 0 and "Undone." in res.stdout
         listing = self._run(tmp_path, "list", "--format", "json")
         assert json.loads(listing.stdout or "[]") == []
+
+
+class TestCliRegressionFixes:
+    """CLI defects found in the 2026-08 review: prefix resolution against
+    the wrong universe."""
+
+    def _run(self, tmp_path, *args):
+        return CliRunner().invoke(
+            app, ["--store", str(tmp_path / "chroma"), *args])
+
+    def test_trash_purge_resolves_displayed_prefix(self, tmp_path):
+        """`trash list` shows 8-char ids; purge used to exact-match, so the
+        displayed id confirmed destructively and then purged nothing."""
+        self._run(tmp_path, "remember", "purge prefix subject")
+        listing = self._run(tmp_path, "list", "--format", "json")
+        mid = json.loads(listing.stdout)[0]["id"]
+        self._run(tmp_path, "trash", "put", mid)
+
+        res = self._run(tmp_path, "trash", "purge", mid[:8], "-y")
+        assert res.exit_code == 0
+        assert "Purged 1 entries" in res.stdout
+
+    def test_trash_purge_unknown_prefix_fails_before_confirm(self, tmp_path):
+        self._run(tmp_path, "remember", "unrelated")
+        res = self._run(tmp_path, "trash", "purge", "deadbeef", "-y")
+        assert res.exit_code == 1
+        assert "not in the trash" in (res.stderr or res.stdout)
+
+    def test_undo_last_by_prefix_after_forget(self, tmp_path):
+        """--id used to resolve against live memories only, failing exactly
+        when the newest entry is the forget the operator wants undone."""
+        self._run(tmp_path, "remember", "deleted by mistake")
+        listing = self._run(tmp_path, "list", "--format", "json")
+        mid = json.loads(listing.stdout)[0]["id"]
+        assert self._run(tmp_path, "forget", mid, "-y").exit_code == 0
+
+        res = self._run(tmp_path, "journal", "undo-last",
+                        "--id", mid[:8], "-y")
+        assert res.exit_code == 0 and "Undone." in res.stdout
+        listing = self._run(tmp_path, "list", "--format", "json")
+        assert [m["id"] for m in json.loads(listing.stdout)] == [mid]

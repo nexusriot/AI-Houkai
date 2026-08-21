@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -19,8 +20,22 @@ import (
 
 // New wires up the MCP server with all 41 tools.
 func New(store *memory.MemoryStore, path, collection string) *server.MCPServer {
+	// mcp-go's stdio transport serves tools/call through a worker pool, so a
+	// client that pipelines tool calls executes handlers concurrently — over a
+	// MemoryStore with no store-level lock. Serialise every tool call, exactly
+	// as the HTTP server's storeMu does for its handlers: Recall's
+	// access-count bump, Link, and Supersede are read-modify-write, and
+	// concurrent handlers would clobber each other's metadata writes.
+	var storeMu sync.Mutex
 	s := server.NewMCPServer("ai-houkai", version.Version,
 		server.WithToolCapabilities(false),
+		server.WithToolHandlerMiddleware(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+			return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				storeMu.Lock()
+				defer storeMu.Unlock()
+				return next(ctx, req)
+			}
+		}),
 	)
 
 	addRemember(s, store)
@@ -204,6 +219,8 @@ func addRemember(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithBoolean("pinned", mcp.Description("Standing instruction: always offered to recall_pack(include_pinned), never pruned by decay")),
 		mcp.WithString("trust", mcp.Description("trusted (default) | reported | untrusted — how much the memory's ORIGIN is trusted. Use untrusted for anything read from content the agent did not author")),
 		mcp.WithBoolean("idempotent", mcp.Description("No-op if a live memory already has the same normalised text: bump its access count and return it unchanged")),
+		mcp.WithNumber("valid_from", mcp.Description("When the fact became true in the world (Unix timestamp; omit for 'always')")),
+		mcp.WithNumber("valid_until", mcp.Description("When the fact stops being true (Unix timestamp; omit for 'still true')")),
 	)
 	s.AddTool(tool, rememberHandler(store))
 }
@@ -232,6 +249,12 @@ func rememberHandler(store *memory.MemoryStore) func(context.Context, mcp.CallTo
 		}
 		if v, ok := args["ttl_seconds"].(float64); ok {
 			opts.TTLSeconds = &v
+		}
+		if v, ok := args["valid_from"].(float64); ok {
+			opts.ValidFrom = &v
+		}
+		if v, ok := args["valid_until"].(float64); ok {
+			opts.ValidUntil = &v
 		}
 		m, stored, conflicts, err := store.Remember(ctx, text, opts)
 		if err != nil {
@@ -639,6 +662,10 @@ func addEdit(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithNumber("polarity", mcp.Description("-1/0/+1")),
 		mcp.WithString("source", mcp.Description("Provenance label (empty string clears)")),
 		mcp.WithNumber("expires_at", mcp.Description("Set the TTL to this Unix timestamp; pass 0 to clear it")),
+		mcp.WithBoolean("pinned", mcp.Description("Pin (true) or unpin (false) the memory")),
+		mcp.WithString("trust", mcp.Description("trusted | reported | untrusted — re-label the origin's trust")),
+		mcp.WithNumber("valid_from", mcp.Description("Correct when the fact became true in the world (Unix timestamp; 0 reopens)")),
+		mcp.WithNumber("valid_until", mcp.Description("Correct when the fact stopped being true (Unix timestamp; 0 reopens)")),
 	)
 	s.AddTool(tool, editHandler(store))
 }
@@ -676,6 +703,22 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 		}
 		if v, ok := args["source"].(string); ok {
 			opts.Source = &v
+		}
+		// These four were write-only at creation over MCP: without them an
+		// MCP client had no way to pin/unpin a memory, re-label its trust,
+		// or correct its valid-time interval after the fact.
+		if v, ok := args["pinned"].(bool); ok {
+			opts.Pinned = &v
+		}
+		if v, ok := args["trust"].(string); ok && v != "" {
+			t := memory.TrustLevel(v)
+			opts.Trust = &t
+		}
+		if v, ok := args["valid_from"].(float64); ok {
+			opts.ValidFrom = &v
+		}
+		if v, ok := args["valid_until"].(float64); ok {
+			opts.ValidUntil = &v
 		}
 		m, err := store.Edit(ctx, id, opts)
 		if err != nil {
@@ -1326,12 +1369,21 @@ func addJournalTail(s *server.MCPServer, store *memory.MemoryStore) {
 		mcp.WithString("op", mcp.Description("Filter by op: remember|forget|supersede|link|...")),
 		mcp.WithNumber("since_seconds", mcp.Description("Only entries within last N seconds")),
 	)
-	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	s.AddTool(tool, journalTailHandler(store))
+}
+
+// journalTailHandler is exposed for tests.
+func journalTailHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		j := store.Journal()
 		if j == nil {
 			return jsonText([]any{}), nil
 		}
 		n := req.GetInt("n", 20)
+		if n <= 0 {
+			// A negative n would slice out of bounds; mirror Python's [] here.
+			return jsonText([]any{}), nil
+		}
 		op := req.GetString("op", "")
 		var since float64
 		if v := req.GetFloat("since_seconds", 0); v > 0 {
@@ -1353,7 +1405,7 @@ func addJournalTail(s *server.MCPServer, store *memory.MemoryStore) {
 			}
 		}
 		return jsonText(rev), nil
-	})
+	}
 }
 
 func addExport(s *server.MCPServer, store *memory.MemoryStore) {

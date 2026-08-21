@@ -146,8 +146,10 @@ def _as_float(value: Optional[str]) -> Optional[float]:
         raise HttpError(400, f"'{value}' is not a valid number") from exc
 
 
-def _as_bool(value: Optional[str]) -> bool:
-    return (value or "").lower() in ("1", "true", "yes", "on")
+def _as_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 # JSON-body coercers — the POST twins of _as_int/_as_float/_as_bool. A JSON
@@ -542,6 +544,9 @@ def _recall_params(q, b):
             "lexical_index": get("lexical_index") or "pool",
             "min_trust": get("min_trust"),
             "as_of": _body_float(b, "as_of"),
+            # touch=False lets eval/monitoring traffic recall without
+            # inflating access counters, which feed decay reinforcement.
+            "touch": _body_bool(b, "touch", True),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -560,9 +565,12 @@ def _recall_params(q, b):
         "include_superseded": _as_bool(_qs_one(q, "include_superseded")),
         "include_expired": _as_bool(_qs_one(q, "include_expired")),
         "explain": _as_bool(_qs_one(q, "explain")),
-        # A plain scalar, so unlike the nested tuning knobs it maps fine onto a
-        # query string and is offered on GET too.
+        # Plain scalars, so unlike the nested tuning knobs they map fine onto
+        # a query string and are offered on GET too.
         "as_of": _as_float(_qs_one(q, "as_of")),
+        "min_trust": _qs_one(q, "min_trust"),
+        "lexical_index": _qs_one(q, "lexical_index") or "pool",
+        "touch": _as_bool(_qs_one(q, "touch"), True),
     }
 
 

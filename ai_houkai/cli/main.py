@@ -42,7 +42,6 @@ from ai_houkai.cli.commands.journal import journal_app
 from ai_houkai.cli.commands.timetravel import (
     get_at,
     history,
-    journal_undo_last,
     metrics,
     state_at,
 )

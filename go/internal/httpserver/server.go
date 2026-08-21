@@ -278,9 +278,21 @@ func (s *Server) wrap(fn apiFunc) http.HandlerFunc {
 // callLocked runs a handler while holding storeMu, releasing it (even on panic,
 // via defer) before the caller writes the response — the response write must
 // not hold the lock. Mirrors Python's `with store_lock: fn(...)`.
-func (s *Server) callLocked(fn apiFunc, r *http.Request) (int, any, error) {
+func (s *Server) callLocked(fn apiFunc, r *http.Request) (status int, payload any, err error) {
 	s.storeMu.Lock()
 	defer s.storeMu.Unlock()
+	// The body/query coercers reject mistyped values by panicking with an
+	// *httpError — Go handler signatures give them no error channel of their
+	// own. Anything else keeps panicking.
+	defer func() {
+		if rec := recover(); rec != nil {
+			he, ok := rec.(*httpError)
+			if !ok {
+				panic(rec)
+			}
+			status, payload, err = 0, nil, he
+		}
+	}()
 	return fn(r)
 }
 
@@ -605,22 +617,30 @@ func (s *Server) edit(r *http.Request) (int, any, error) {
 		return 0, nil, errStatus(400, "empty edit: provide at least one field")
 	}
 	var opts memory.EditOpts
+	// These four count as editable fields too: `{"pinned": true}` or a
+	// validity correction alone is a legitimate edit, and dropping to the
+	// "no editable fields" 400 silently made pin/trust/valid-time edits
+	// impossible over HTTP.
+	fields := 0
 	if v, ok := b["pinned"].(bool); ok {
 		opts.Pinned = &v
+		fields++
 	}
 	if v, ok := b["trust"].(string); ok && v != "" {
 		t := memory.TrustLevel(v)
 		opts.Trust = &t
+		fields++
 	}
 	// Valid time: correct the interval during which the memory was true. 0 on
 	// an end reopens it.
 	if v, ok := b["valid_from"].(float64); ok {
 		opts.ValidFrom = &v
+		fields++
 	}
 	if v, ok := b["valid_until"].(float64); ok {
 		opts.ValidUntil = &v
+		fields++
 	}
-	fields := 0
 	if v, ok := b["text"].(string); ok {
 		opts.Text = &v
 		fields++
@@ -1079,14 +1099,14 @@ func (s *Server) export(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	var types []memory.MemoryType
-	for _, t := range bodyStrList(b, "types") {
+	for _, t := range bodyStrSlice(b, "types") {
 		types = append(types, memory.MemoryType(t))
 	}
 	summary, err := s.store.Export(r.Context(), path, memory.ExportOpts{
 		IncludeVectors:    bodyBoolDef(b, "include_vectors", true),
 		IncludeSuperseded: bodyBool(b, "include_superseded"),
 		Types:             types,
-		Tags:              bodyStrList(b, "tags"),
+		Tags:              bodyStrSlice(b, "tags"),
 		Since:             since,
 	})
 	if err != nil {
@@ -1113,27 +1133,18 @@ func (s *Server) importArchive(r *http.Request) (int, any, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil, errStatus(404, "archive not found: %s", path)
 		}
-		return 0, nil, err // validation / conflict → 400 via wrap
+		// Mirror Python's status mapping: id collisions are a conflict (409),
+		// any other import failure (bad format, model mismatch) is caller
+		// error (400) — neither is an internal fault.
+		var conflict *memory.ImportConflictError
+		if errors.As(err, &conflict) {
+			return 0, nil, errStatus(409, "%s", err.Error())
+		}
+		return 0, nil, errStatus(400, "%s", err.Error())
 	}
 	return 200, summary, nil
 }
 
-// bodyStrList coerces a body field that may be a single string or a list.
-func bodyStrList(b map[string]any, key string) []string {
-	switch v := b[key].(type) {
-	case string:
-		return []string{v}
-	case []any:
-		out := make([]string, 0, len(v))
-		for _, x := range v {
-			if s, ok := x.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	}
-	return nil
-}
 
 // recallParams pulls recall arguments from a JSON body (POST) or query (GET).
 func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, error) {
@@ -1158,7 +1169,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Since:             since,
 			Until:             until,
 			Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeSemantic))),
-			Overfetch:         4,
+			Overfetch:         int(bodyFloat(b, "overfetch", 4)),
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
 			IncludeExpired:    bodyBool(b, "include_expired"),
 			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
@@ -1194,11 +1205,14 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		Since:             since,
 		Until:             until,
 		Mode:              memory.RecallMode(qsStr(r, "mode", string(memory.ModeSemantic))),
-		Overfetch:         4,
+		Overfetch:         qsInt(r, "overfetch", 4),
 		IncludeSuperseded: qsBool(r, "include_superseded"),
 		IncludeExpired:    qsBool(r, "include_expired"),
 		Explain:           qsBool(r, "explain"),
-		// Plain scalars, so they map onto a query string too.
+		// Plain scalars, so they map onto a query string too. touch=false
+		// lets eval/monitoring traffic recall without inflating access
+		// counters, which feed decay reinforcement.
+		NoTouch:      !qsBoolDef(r, "touch", true),
 		MinTrust:     memory.TrustLevel(qsStr(r, "min_trust", "")),
 		LexicalIndex: memory.LexicalIndexMode(qsStr(r, "lexical_index", "")),
 		AsOf:         qsFloat(r, "as_of", 0),
@@ -1369,6 +1383,11 @@ func requireStr(b map[string]any, key string) (string, error) {
 	return s, nil
 }
 
+// The body coercers below reject mistyped present values by panicking with
+// an *httpError, recovered in callLocked into a 400 (mirrors Python's
+// coercers raising HttpError). Silent defaulting was destructive in the
+// worst case: `{"dry_run": "true"}` coerced to false and ran a real purge.
+
 func bodyStr(b map[string]any, key, def string) string {
 	if v, ok := b[key].(string); ok && v != "" {
 		return v
@@ -1378,31 +1397,56 @@ func bodyStr(b map[string]any, key, def string) string {
 
 func bodyFloat(b map[string]any, key string, def float64) float64 {
 	switch v := b[key].(type) {
+	case nil:
+		return def
+	case bool:
+		// bool would coerce to 0/1 — reject explicitly, like Python.
 	case float64:
 		return v
 	case json.Number:
 		f, _ := v.Float64()
 		return f
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
-	return def
+	panic(errStatus(400, "%s: not a valid number", key))
 }
 
 func bodyBool(b map[string]any, key string) bool {
-	v, _ := b[key].(bool)
-	return v
+	return bodyBoolDef(b, key, false)
 }
 
 // bodyBoolDef reads an optional bool defaulting to def when the key is absent.
 func bodyBoolDef(b map[string]any, key string, def bool) bool {
-	if v, ok := b[key].(bool); ok {
+	switch v := b[key].(type) {
+	case nil:
+		return def
+	case bool:
 		return v
+	case string:
+		// JSON string "false" must not be truthy (mirrors Python).
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+		return false
+	case float64:
+		return v != 0
+	case json.Number:
+		f, _ := v.Float64()
+		return f != 0
 	}
-	return def
+	panic(errStatus(400, "%s: not a valid boolean", key))
 }
 
 // bodyFloatPtr returns a *float32 for an optional numeric field (nil = absent).
 func bodyFloatPtr(b map[string]any, key string) *float32 {
 	switch v := b[key].(type) {
+	case nil:
+		return nil
+	case bool:
 	case float64:
 		x := float32(v)
 		return &x
@@ -1410,22 +1454,37 @@ func bodyFloatPtr(b map[string]any, key string) *float32 {
 		f, _ := v.Float64()
 		x := float32(f)
 		return &x
-	}
-	return nil
-}
-
-func bodyStrSlice(b map[string]any, key string) []string {
-	raw, ok := b[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, v := range raw {
-		if s, ok := v.(string); ok {
-			out = append(out, s)
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			x := float32(f)
+			return &x
 		}
 	}
-	return out
+	panic(errStatus(400, "%s: not a valid number", key))
+}
+
+// bodyStrSlice coerces a string-list field. A lone string becomes a
+// one-element list — passing it through raw would drop the value entirely.
+// Anything other than a string / list of strings is a 400 (mirrors Python's
+// _body_tags).
+func bodyStrSlice(b map[string]any, key string) []string {
+	switch v := b[key].(type) {
+	case nil:
+		return nil
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, x := range v {
+			s, ok := x.(string)
+			if !ok {
+				panic(errStatus(400, "%s: must be a string or a list of strings", key))
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+	panic(errStatus(400, "%s: must be a string or a list of strings", key))
 }
 
 // bodySinceUntil resolves the since/until time filters from a JSON body. They
@@ -1473,7 +1532,7 @@ func qsInt(r *http.Request, key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		panic(errStatus(400, "'%s' is not a valid integer", v))
 	}
 	return n
 }
@@ -1485,13 +1544,21 @@ func qsFloat(r *http.Request, key string, def float64) float64 {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return def
+		panic(errStatus(400, "'%s' is not a valid number", v))
 	}
 	return f
 }
 
 func qsBool(r *http.Request, key string) bool {
-	switch r.URL.Query().Get(key) {
+	return qsBoolDef(r, key, false)
+}
+
+func qsBoolDef(r *http.Request, key string, def bool) bool {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
 	case "1", "true", "yes", "on":
 		return true
 	}

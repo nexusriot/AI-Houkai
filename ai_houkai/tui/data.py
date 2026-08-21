@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from rich.markup import escape
+
 from ai_houkai.cli.output import fmt_age, short_id
 from ai_houkai.memory_system.store import Memory, MemoryStore
 
@@ -16,8 +18,13 @@ Row = tuple[str, str, str, str, str, str]
 
 
 def _snippet(text: str, width: int = 60) -> str:
+    # Escaped because rows land in a DataTable, which parses Rich markup:
+    # un-escaped memory text containing [/anything] crashes the renderer,
+    # and any [bracketed] token is silently eaten from the display.
     flat = " ".join(text.split())
-    return flat if len(flat) <= width else flat[: width - 1] + "…"
+    if len(flat) > width:
+        flat = flat[: width - 1] + "…"
+    return escape(flat)
 
 
 def mem_row(mem: Memory, *, extra: str = "") -> Row:
@@ -56,7 +63,7 @@ def search_view(store: MemoryStore, query: str, k: int = 50) -> View:
     results = store.recall(query, k=k, touch=False)
     return View(
         kind="search",
-        title=f"Search: {query!r} ({len(results)})",
+        title=f"Search: {escape(repr(query))} ({len(results)})",
         rows=[mem_row(m, extra=f"{score:.3f}") for m, score in results],
         memories={short_id(m.id): m for m, _ in results},
     )
@@ -88,18 +95,19 @@ def detail_markup(mem: Memory) -> str:
         f"imp [yellow]{mem.importance:.2f}[/]  {fmt_age(mem.created_at)} old",
     ]
     if mem.tags:
-        lines.append("tags: " + " ".join(f"[green]#{t}[/]" for t in mem.tags))
+        lines.append("tags: " + " ".join(
+            f"[green]#{escape(t)}[/]" for t in mem.tags))
     if mem.source:
-        lines.append(f"source: [dim]{mem.source}[/]")
+        lines.append(f"source: [dim]{escape(mem.source)}[/]")
     if mem.superseded_by:
         lines.append(f"[red]superseded by {short_id(mem.superseded_by)}[/]")
     lines.append("")
-    lines.append(mem.text)
+    lines.append(escape(mem.text))
     if mem.links:
         lines.append("")
         lines.append("[bold]Links[/] (press n to walk):")
         for lnk in mem.links:
-            lines.append(f"  --{lnk.rel}--> [cyan]{short_id(lnk.to)}[/]")
+            lines.append(f"  --{escape(lnk.rel)}--> [cyan]{short_id(lnk.to)}[/]")
     return "\n".join(lines)
 
 

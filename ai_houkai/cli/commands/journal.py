@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json as json
+import json
 from datetime import datetime
 from typing import Optional
 

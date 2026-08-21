@@ -716,3 +716,46 @@ class TestTrashPurgeHonoursRetention:
         status, body = _req(server, "POST", "/trash/purge", {})
         assert status == 200, body
         assert body["purged"] == 2
+
+
+class TestRecallScalarKnobs:
+    """POST `touch` and GET `min_trust`/`lexical_index` used to be silently
+    dropped — a read-only recall still bumped access stats, and a GET client
+    that set a provenance floor got untrusted rows anyway."""
+
+    def test_post_touch_false_leaves_access_stats(self, server, store):
+        m = store.remember("untouchable fact")
+        status, body = _req(server, "POST", "/recall",
+                            {"query": "untouchable fact", "k": 1,
+                             "touch": False})
+        assert status == 200 and body["results"]
+        assert store.get(m.id).access_count == 0
+
+    def test_post_touch_defaults_on(self, server, store):
+        m = store.remember("touchable fact")
+        _req(server, "POST", "/recall", {"query": "touchable fact", "k": 1})
+        assert store.get(m.id).access_count == 1
+
+    def test_get_touch_false(self, server, store):
+        m = store.remember("get untouchable")
+        status, body = _req(server, "GET",
+                            "/recall?query=get+untouchable&k=1&touch=false")
+        assert status == 200 and body["results"]
+        assert store.get(m.id).access_count == 0
+
+    def test_get_min_trust_filters(self, server, store):
+        store.remember("provenance fact", trust="untrusted")
+        status, body = _req(
+            server, "GET", "/recall?query=provenance+fact&min_trust=trusted")
+        assert status == 200
+        assert body["results"] == []
+        status, body = _req(server, "GET", "/recall?query=provenance+fact")
+        assert status == 200 and body["results"]
+
+    def test_get_lexical_index_accepted(self, server, store):
+        store.remember("corpus lexical subject")
+        status, body = _req(
+            server, "GET",
+            "/recall?query=corpus+lexical+subject&mode=hybrid"
+            "&lexical_index=corpus")
+        assert status == 200 and body["results"]

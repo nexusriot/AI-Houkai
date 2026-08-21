@@ -961,8 +961,10 @@ class ClaudeCodeInstaller:
 - **Atomic writes**: direct config edits go through write-to-temp +
   `os.replace` (`common.write_json`) so a crash can never truncate the
   user's client config.
-- **Unparseable config**: by default replaces a corrupted JSON file
-  rather than aborting (toggle with `overwrite_unparseable=False`).
+- **Unparseable config**: refuses and reports by default — treating garbage
+  as `{}` would replace the user's whole client config with just our server
+  block. `overwrite_unparseable=True` opts into replacing it, after parking
+  a `.bak` copy of the original.
 - **No import side effects**: the MCP server module creates its store
   lazily (`get_store()`, on first tool use), so importing the installers —
   or `ai_houkai.mcp_server.server` itself — never materialises a stray
@@ -1886,6 +1888,11 @@ One compact JSON object per line:
 - **Size-based rotation** — file size is checked every 256 appends;
   beyond `rotate_mb` (64 MB) the log is gzipped to a timestamped archive,
   and archives older than `keep_days` (90) are pruned.
+- **Crash-safe rotation** — the active file is renamed first (atomic), then
+  compressed through a temp name: a crash can never destroy entries appended
+  mid-rotation or leave a truncated file under the archive name. Reads prefer
+  a plain rotated `.log` over a same-stem `.log.gz` (no double-count) and
+  tolerate truncated archives instead of failing the whole scan.
 
 ### Undo
 
@@ -1956,6 +1963,10 @@ options) followed by one memory per line.
 
 - **Conflict policies** on id collision: `skip` (default) ·
   `overwrite` · `rename` (new UUID) · `error`.
+- **Rename re-points references**: after a rename, every other imported
+  row's `links` / `superseded_by` that named the old id is rewritten to the
+  new UUID (journalled as edits) — left alone they would silently point at
+  the unrelated pre-existing memory that caused the collision.
 - **Model safety**: if the archive's embedding model differs from the
   importing store's, the import raises unless
   `regenerate_vectors=True`, which re-embeds text on the way in.
@@ -2335,7 +2346,18 @@ Entries are **appended** one gzip member at a time rather than rewritten, so
 binning N memories costs O(N) — the read-all-rewrite-all version made a
 400-memory prune take 2.16 s against 0.12 s. Both ports' readers (and Python's
 `gzip` module) consume concatenated members transparently, so a file written by
-either is readable by the other.
+either is readable by the other. A member truncated by a crash mid-append is
+skipped on read (it surfaces at the gzip layer, not as bad JSON), keeping the
+rest of the trash recoverable.
+
+Entries are **scoped by collection**: the trash file sits beside the store
+path and is shared by every collection opened on it, so each entry records its
+collection and `trash_list` / `trash_restore` / `trash_purge*` only see their
+own (entries written before the field existed stay visible everywhere).
+`trash_restore` also refuses an id that is live again (an export→import can
+resurrect one — restoring over it would be silently ignored by the backend
+while the snapshot was destroyed), and with several entries for one id it
+restores the newest snapshot, leaving older ones recoverable.
 
 `trash_purge_expired(ttl_days)` supplies retention, and the maintenance
 scheduler drives it on the same tick as the TTL purge (`trash_ttl_days`,

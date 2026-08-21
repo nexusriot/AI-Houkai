@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .journal import JournalEntry
 from .trust import worst_trust
 
 __all__ = [
@@ -69,16 +68,25 @@ class TagRename:
 
 @dataclass(frozen=True)
 class TrashEntry:
-    """A soft-deleted memory parked in the trash file."""
+    """A soft-deleted memory parked in the trash file.
+
+    ``collection`` scopes the entry: the trash file lives beside the store
+    path and is shared by every collection opened on it, so without the tag
+    a restore from collection B would materialize collection A's memory into
+    B. Entries written before the field existed have ``""`` and stay visible
+    from every collection — hiding them retroactively would strand them.
+    """
     memory_id: str
     deleted_at: float
     actor: str
     memory: dict[str, Any]
+    collection: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "memory_id": self.memory_id, "deleted_at": self.deleted_at,
             "actor": self.actor, "memory": self.memory,
+            "collection": self.collection,
         }
 
 
@@ -354,7 +362,8 @@ class CurationMixin:
         if mem is None:
             return False
         entry = TrashEntry(memory_id=mem.id, deleted_at=time.time(),
-                           actor=self._actor, memory=mem.to_dict())
+                           actor=self._actor, memory=mem.to_dict(),
+                           collection=self.collection_name)
         self.trash_path.parent.mkdir(parents=True, exist_ok=True)
         with gzip.open(self.trash_path, "at", encoding="utf-8") as f:
             f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
@@ -362,21 +371,37 @@ class CurationMixin:
             self.forget(mem.id)
         return True
 
+    def _trash_visible(self, entry: TrashEntry) -> bool:
+        """Whether a trash entry belongs to this store's collection.
+
+        Legacy entries carry no collection tag and stay visible everywhere —
+        see :class:`TrashEntry`.
+        """
+        return entry.collection in ("", self.collection_name)
+
     def trash_list(self) -> list[TrashEntry]:
-        """Everything currently in the trash, oldest first."""
-        return [e for e in self._read_trash()]
+        """This collection's trash, oldest first."""
+        return [e for e in self._read_trash() if self._trash_visible(e)]
 
     def trash_restore(self, memory_id: str) -> "Any":
-        """Bring a trashed memory back, or None when it is not in the trash.
+        """Bring a trashed memory back, or None when it cannot be restored.
 
         The row is re-added with its original id and metadata and re-embedded
-        from its text; the trash entry is then dropped.
+        from its text; the restored trash entry is then dropped. Returns None
+        when the id is not in this collection's trash — or when it is live
+        again (an export/import can resurrect a trashed id): restoring over a
+        live row would be silently ignored by the collection while the trash
+        entry was destroyed, so the entry is kept instead. With several
+        entries for one id (trash → import → trash), the newest snapshot is
+        restored and older ones stay recoverable.
         """
         entries = self._read_trash()
-        keep = [e for e in entries if e.memory_id != memory_id]
-        if len(keep) == len(entries):
+        mine = [e for e in entries
+                if self._trash_visible(e) and e.memory_id == memory_id]
+        if not mine or self.get(memory_id) is not None:
             return None
-        restored = next(e for e in entries if e.memory_id == memory_id)
+        restored = max(mine, key=lambda e: e.deleted_at)
+        entries.remove(restored)
 
         # Rehydrated through the store rather than by importing Memory here:
         # store.py imports this module for the mixin, so a module-level import
@@ -387,20 +412,23 @@ class CurationMixin:
         with self.as_actor("trash"):
             self._journal("restore", mem.id, after=mem.to_dict(),
                           meta={"from": "trash"})
-        self._write_trash(keep)
+        self._write_trash(entries)
         return mem
 
     def trash_purge(self, memory_id: str | None = None) -> int:
-        """Permanently drop one trashed memory, or empty the trash.
+        """Permanently drop one trashed memory, or empty this collection's trash.
 
         Irreversible — this is the only operation in the trash path that loses
-        data, which is why it is separate from ``trash``.
+        data, which is why it is separate from ``trash``. Other collections'
+        entries in the shared trash file are untouched.
         """
         entries = self._read_trash()
         if memory_id is None:
-            self._write_trash([])
-            return len(entries)
-        keep = [e for e in entries if e.memory_id != memory_id]
+            keep = [e for e in entries if not self._trash_visible(e)]
+        else:
+            keep = [e for e in entries
+                    if not (self._trash_visible(e)
+                            and e.memory_id == memory_id)]
         purged = len(entries) - len(keep)
         if purged:
             self._write_trash(keep)
@@ -422,7 +450,8 @@ class CurationMixin:
             return 0
         cutoff = (now if now is not None else time.time()) - ttl_days * 86_400
         entries = self._read_trash()
-        keep = [e for e in entries if e.deleted_at >= cutoff]
+        keep = [e for e in entries
+                if not (self._trash_visible(e) and e.deleted_at < cutoff)]
         purged = len(entries) - len(keep)
         if purged:
             self._write_trash(keep)
@@ -433,7 +462,16 @@ class CurationMixin:
             return []
         out: list[TrashEntry] = []
         with gzip.open(self.trash_path, "rt", encoding="utf-8") as f:
-            for line in f:
+            while True:
+                try:
+                    line = f.readline()
+                except (EOFError, OSError):
+                    # A gzip member truncated by a crash mid-append raises
+                    # here, before any JSON is seen — it must not make the
+                    # whole trash unreadable. Keep what parsed so far.
+                    break
+                if not line:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -448,6 +486,7 @@ class CurationMixin:
                     deleted_at=float(d.get("deleted_at", 0.0)),
                     actor=d.get("actor", ""),
                     memory=d.get("memory") or {},
+                    collection=str(d.get("collection") or ""),
                 ))
         return out
 
@@ -465,12 +504,3 @@ def _validate_tag(tag: str) -> None:
         raise ValueError("tag must not be empty")
     if "," in tag:
         raise ValueError(f"tags must not contain commas — got {tag!r}")
-
-
-def timeline_entry_to_dict(e: JournalEntry) -> dict[str, Any]:
-    """Render a journal entry for the timeline surfaces."""
-    return {
-        "ts": e.ts, "op": e.op, "actor": e.actor, "id": e.id,
-        "before": e.before, "after": e.after, "meta": e.meta,
-        "summary": e.summary(),
-    }
