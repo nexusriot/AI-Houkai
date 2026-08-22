@@ -283,3 +283,59 @@ def test_vectorless_import_same_model_reports_regenerated(
         assert res.vectors_regenerated is True  # rows carried no vectors
     finally:
         target.client.close()
+
+
+def test_rename_repoints_links_between_imported_rows(
+        store: MemoryStore, tmp_path: Path) -> None:
+    """on_conflict="rename" gives a colliding row a fresh id — but the rest
+    of the file still references the old one, which now resolves to the
+    unrelated pre-existing memory. Those references must follow the rename."""
+    src = _new_store(tmp_path, "src")
+    tgt = _new_store(tmp_path, "tgt")
+
+    hub = src.remember(text="the hub")
+    spoke = src.remember(text="the spoke")
+    src.link(spoke.id, hub.id, rel="refines")
+    out = tmp_path / "linked.ahkai"
+    src.export(out)
+
+    # Squat the hub's id in the target with an unrelated memory.
+    squatter = tgt.remember(text="unrelated squatter")
+    tgt.collection.delete(ids=[squatter.id])
+    tgt.collection.add(ids=[hub.id], documents=["unrelated squatter"],
+                       metadatas=[{**squatter.to_metadata()}])
+
+    summary = tgt.import_(out, on_conflict="rename")
+    assert summary.renamed == 1 and summary.imported == 1
+
+    imported_spoke = tgt.get(spoke.id)
+    (link,) = imported_spoke.links
+    assert link.to != hub.id, "link must not point at the squatter"
+    renamed_hub = tgt.get(link.to)
+    assert renamed_hub is not None and renamed_hub.text == "the hub"
+    src.client.close()
+    tgt.client.close()
+
+
+def test_rename_repoints_superseded_by(store: MemoryStore,
+                                       tmp_path: Path) -> None:
+    src = _new_store(tmp_path, "src2")
+    tgt = _new_store(tmp_path, "tgt2")
+
+    old = src.remember(text="old belief")
+    new = src.remember(text="new belief")
+    src.supersede(old.id, new.id)
+    out = tmp_path / "superseded.ahkai"
+    src.export(out, include_superseded=True)
+
+    squatter = tgt.remember(text="squats the new id")
+    tgt.collection.delete(ids=[squatter.id])
+    tgt.collection.add(ids=[new.id], documents=["squats the new id"],
+                       metadatas=[{**squatter.to_metadata()}])
+
+    tgt.import_(out, on_conflict="rename")
+    imported_old = tgt.get(old.id)
+    assert imported_old.superseded_by != new.id
+    assert tgt.get(imported_old.superseded_by).text == "new belief"
+    src.client.close()
+    tgt.client.close()

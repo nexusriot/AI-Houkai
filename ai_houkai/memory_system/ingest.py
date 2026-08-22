@@ -8,8 +8,9 @@ into memory-sized chunks:
    stored memory keeps its context ("## Deploy\\nUse make release").
 3. Paragraphs longer than ``max_chars`` are re-split on sentence
    boundaries and greedily re-packed up to ``max_chars``.
-4. Chunks shorter than ``min_chars`` are dropped (separators, stray
-   list bullets, noise).
+4. Blocks shorter than ``min_chars`` are dropped (separators, stray
+   list bullets, noise). A short *fragment* of a split paragraph is folded
+   into a neighbour instead, because it is content rather than noise.
 
 Deterministic and dependency-free; embedding and storage happen at the
 caller (one ``remember()`` per chunk).
@@ -23,8 +24,16 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 _HEADING = re.compile(r"^#{1,6}\s+\S")
 
 
-def _split_long(paragraph: str, max_chars: int) -> list[str]:
-    """Greedily pack sentences into chunks of at most max_chars."""
+def _split_long(paragraph: str, max_chars: int, min_chars: int) -> list[str]:
+    """Greedily pack sentences into chunks of at most max_chars.
+
+    Fragments below *min_chars* are folded into a neighbour rather than left for
+    the caller's noise filter to delete. Greedy packing leaves a short fragment
+    whenever the next sentence will not fit, and that fragment is the tail (or
+    head) of a real paragraph — content, not a separator. ``max_chars`` is
+    already a soft target, since a single over-long sentence is kept whole, so
+    growing a chunk is the lesser evil against silently losing text.
+    """
     sentences = _SENTENCE_SPLIT.split(paragraph)
     chunks: list[str] = []
     current = ""
@@ -40,9 +49,23 @@ def _split_long(paragraph: str, max_chars: int) -> list[str]:
             current = sent
     if current:
         chunks.append(current)
+
     # A single sentence longer than max_chars is kept whole — splitting
     # mid-sentence would destroy the embedding's meaning.
-    return chunks
+    if min_chars <= 0 or len(chunks) < 2:
+        return chunks
+
+    folded: list[str] = []
+    for chunk in chunks:
+        if folded and len(chunk) < min_chars:
+            folded[-1] = f"{folded[-1]} {chunk}"
+        else:
+            folded.append(chunk)
+    # A runt in first position has no predecessor to join, so fold it forward.
+    if len(folded) > 1 and len(folded[0]) < min_chars:
+        folded[1] = f"{folded[0]} {folded[1]}"
+        folded.pop(0)
+    return folded
 
 
 def chunk_text(
@@ -77,6 +100,6 @@ def chunk_text(
         if len(block) <= max_chars:
             chunks.append(block)
         else:
-            chunks.extend(_split_long(block, max_chars))
+            chunks.extend(_split_long(block, max_chars, min_chars))
 
     return [c for c in chunks if len(c) >= min_chars]

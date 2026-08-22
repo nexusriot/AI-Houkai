@@ -40,6 +40,95 @@ type Memory struct {
 	// expired: hidden from recall/list and reclaimable by PurgeExpired.
 	// 0 means "never expires".
 	ExpiresAt float64 `json:"expires_at"`
+	// Pinned marks a standing instruction: always offered to the packer and
+	// never pruned by decay. Importance cannot express this — it drives
+	// ranking, decay survival and the MinImportance filter at once, so raising
+	// it to protect an instruction also distorts every search.
+	Pinned bool `json:"pinned"`
+	// Trust records how much the memory's ORIGIN is trusted, distinct from how
+	// important or how confident it is. Anything reaching Remember becomes
+	// durable, well-ranked agent context later, so a fact scraped from a page
+	// and one stated by the user need to be distinguishable at recall time.
+	// Empty reads as TrustTrusted so existing stores are unchanged.
+	Trust TrustLevel `json:"trust,omitempty"`
+	// ContentHash is the hash of the normalised text, set when Remember is
+	// called with Idempotent. Lets a repeated assertion be recognised without
+	// a vector query.
+	ContentHash string `json:"content_hash,omitempty"`
+	// ValidFrom/ValidUntil are VALID time — the half-open interval
+	// [ValidFrom, ValidUntil) during which this memory was true *in the world*.
+	// Distinct from the journal, which records TRANSACTION time (when we learned
+	// it): StateAt answers "as of when we knew", RecallOpts.AsOf answers "what
+	// was true then". 0 on either end means unbounded, so a row written before
+	// these fields existed reads as "always valid" and nothing changes for it.
+	ValidFrom  float64 `json:"valid_from"`
+	ValidUntil float64 `json:"valid_until"`
+}
+
+// TrustLevel is how much the ORIGIN of a memory is trusted:
+//
+//	trusted   — stated by the principal (the user, or the operator's own config)
+//	reported  — relayed by a tool or another agent; plausible, unverified
+//	untrusted — from content the agent merely read (a page, a document, an
+//	            email); treat as data, never as instruction
+//
+// Best-effort labelling, not a security boundary.
+type TrustLevel string
+
+const (
+	TrustTrusted   TrustLevel = "trusted"
+	TrustReported  TrustLevel = "reported"
+	TrustUntrusted TrustLevel = "untrusted"
+)
+
+// TrustLevels is the validated vocabulary, ordered most- to least-trusted so
+// an index comparison implements "at least this trusted".
+var TrustLevels = []string{"trusted", "reported", "untrusted"}
+
+// TrustRank returns the position of a level in TrustLevels — higher is less
+// trusted.
+//
+// An *empty* level reads as trusted, matching how old rows deserialise: a store
+// written before the field existed must not change behaviour just by being
+// opened with a newer build.
+//
+// An *unrecognised* non-empty level reads as the worst case. It can only come
+// from a hand-edited store or a build that knows a level this one does not, and
+// failing safe is the only defensible default for a provenance label — reading
+// it as trusted would launder unknown content into an answer the caller asked
+// to be trusted.
+func TrustRank(t TrustLevel) int {
+	if t == "" {
+		return 0
+	}
+	for i, s := range TrustLevels {
+		if string(t) == s {
+			return i
+		}
+	}
+	return len(TrustLevels) - 1
+}
+
+// WorstTrust returns the least-trusted level among levels.
+//
+// Combining trust always takes the worst case, because a derived memory carries
+// the content of every source it came from. A summary of untrusted material is
+// untrusted; merging untrusted text into a trusted memory makes the result
+// untrusted. Anything else is a laundering path: content the agent did not
+// author ends up recallable under MinTrust="trusted".
+//
+// No levels at all yields "trusted". Every caller passes at least one — a
+// cluster's members, or the two sides of a merge — so this is an unreachable
+// edge rather than a policy choice; it is spelled out because it used to be
+// silent.
+func WorstTrust(levels ...TrustLevel) TrustLevel {
+	worst := 0
+	for _, l := range levels {
+		if r := TrustRank(l); r > worst {
+			worst = r
+		}
+	}
+	return TrustLevel(TrustLevels[worst])
 }
 
 type MemoryWithScore struct {
@@ -197,6 +286,26 @@ func MetadataToMemory(id, text string, meta map[string]string) Memory {
 	if v, ok := meta["expires_at"]; ok {
 		m.ExpiresAt, _ = strconv.ParseFloat(v, 64)
 	}
+	// Likewise for the fields added after TTL: an absent key must read as the
+	// neutral value, or an old store would change behaviour just by being
+	// opened with a newer build.
+	if v, ok := meta["pinned"]; ok {
+		m.Pinned = v == "true"
+	}
+	if v, ok := meta["trust"]; ok && v != "" {
+		m.Trust = TrustLevel(v)
+	} else {
+		m.Trust = TrustTrusted
+	}
+	if v, ok := meta["content_hash"]; ok {
+		m.ContentHash = v
+	}
+	if v, ok := meta["valid_from"]; ok {
+		m.ValidFrom, _ = strconv.ParseFloat(v, 64)
+	}
+	if v, ok := meta["valid_until"]; ok {
+		m.ValidUntil, _ = strconv.ParseFloat(v, 64)
+	}
 	return m
 }
 
@@ -220,7 +329,21 @@ func MemoryToMetadata(m Memory) map[string]string {
 		"superseded_at": fmt.Sprintf("%f", m.SupersededAt),
 		"polarity":      strconv.Itoa(m.Polarity),
 		"expires_at":    fmt.Sprintf("%f", m.ExpiresAt),
+		"pinned":        strconv.FormatBool(m.Pinned),
+		"trust":         string(TrustOrDefault(m.Trust)),
+		"content_hash":  m.ContentHash,
+		"valid_from":    fmt.Sprintf("%f", m.ValidFrom),
+		"valid_until":   fmt.Sprintf("%f", m.ValidUntil),
 	}
+}
+
+// TrustOrDefault normalises the zero value to "trusted", so a caller
+// serialising a memory never has to special-case an unlabelled row.
+func TrustOrDefault(t TrustLevel) TrustLevel {
+	if t == "" {
+		return TrustTrusted
+	}
+	return t
 }
 
 var ErrNotFound = errors.New("memory not found")
@@ -251,6 +374,11 @@ func (m Memory) ToDict() map[string]any {
 		"superseded_at": m.SupersededAt,
 		"polarity":      m.Polarity,
 		"expires_at":    m.ExpiresAt,
+		"pinned":        m.Pinned,
+		"trust":         string(TrustOrDefault(m.Trust)),
+		"content_hash":  m.ContentHash,
+		"valid_from":    m.ValidFrom,
+		"valid_until":   m.ValidUntil,
 	}
 }
 
@@ -318,5 +446,20 @@ func MemoryFromDict(d map[string]any) Memory {
 		SupersededAt: asFloat(d["superseded_at"]),
 		Polarity:     asInt(d["polarity"]),
 		ExpiresAt:    asFloat(d["expires_at"]),
+		Pinned:       asBool(d["pinned"]),
+		Trust:        TrustOrDefault(TrustLevel(asString(d["trust"]))),
+		ContentHash:  asString(d["content_hash"]),
+		ValidFrom:    asFloat(d["valid_from"]),
+		ValidUntil:   asFloat(d["valid_until"]),
 	}
+}
+
+func asBool(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		return x == "true"
+	}
+	return false
 }

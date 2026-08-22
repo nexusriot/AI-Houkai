@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,53 @@ type Engine struct {
 	SimilarityThreshold float32
 	MinClusterSize      int
 	Summarizer          Summarizer
+	// Types selects which memory types to cluster. Historically hard-coded to
+	// episodic, which meant semantic memories — including reflections
+	// themselves — never consolidated, so a long-lived store accumulated
+	// summaries without bound, and feedback/procedural never benefited at all.
+	// Empty = {episodic}.
+	Types []memory.MemoryType
+	// MaxLevel caps how many tiers of reflection-of-reflections are allowed.
+	// Each summary is tagged level:N; a memory already at MaxLevel is not
+	// eligible for clustering. 1 (default) reproduces the old behaviour —
+	// summaries are produced but never re-summarised. The cap is what stops
+	// runaway re-summarisation from eating the store.
+	MaxLevel int
+}
+
+// LevelOf returns the reflection tier of a memory: 0 for a raw one, N for a
+// "level:N" tag. Encoded as a tag rather than a metadata field so it
+// round-trips through export/import and old archives read as level 0.
+func LevelOf(m memory.Memory) int {
+	for _, t := range m.Tags {
+		if !strings.HasPrefix(t, "level:") {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(t, "level:")); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// eligibleType reports whether the engine should cluster this type.
+func (e *Engine) eligibleType(t memory.MemoryType) bool {
+	if len(e.Types) == 0 {
+		return t == memory.Episodic
+	}
+	for _, want := range e.Types {
+		if t == want {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) maxLevel() int {
+	if e.MaxLevel < 1 {
+		return 1
+	}
+	return e.MaxLevel
 }
 
 // Storable is the subset of MemoryStore the Engine needs.
@@ -94,16 +142,34 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 		embedding []float32
 	}
 
+	now := float64(time.Now().UnixNano()) / 1e9
 	var eps []episodicItem
 	for _, it := range items {
 		m := memory.MetadataToMemory(it.ID, it.Content, it.Metadata)
-		if m.Type == memory.Episodic && m.SupersededBy == "" {
-			eps = append(eps, episodicItem{Memory: m, embedding: it.Embedding})
+		if !e.eligibleType(m.Type) || m.SupersededBy != "" {
+			continue
 		}
+		// An expired memory is on its way out — hidden from recall/list and
+		// waiting for PurgeExpired to reclaim it. Folding it in would copy its
+		// text into a fresh summary that has no TTL of its own, so a deliberate
+		// lifetime would be laundered into a permanent row. Same rule as the
+		// trust inheritance below: a summary must not grant its sources more
+		// reach than they had.
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		// A memory already at the deepest allowed tier must not be folded into
+		// yet another summary — that is the runaway case MaxLevel prevents.
+		if LevelOf(m) >= e.maxLevel() {
+			continue
+		}
+		eps = append(eps, episodicItem{Memory: m, embedding: it.Embedding})
 	}
 
 	// Sort by importance descending so highest-importance seeds first.
-	sort.Slice(eps, func(i, j int) bool {
+	// Stable, so importance ties keep list order and seed the same clusters
+	// as the reference port's sorted().
+	sort.SliceStable(eps, func(i, j int) bool {
 		return eps[i].Importance > eps[j].Importance
 	})
 
@@ -119,6 +185,10 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 		}
 		assigned[i] = true
 		cluster := []memory.Memory{seed.Memory}
+		// The cluster's effective polarity is the first non-zero polarity it
+		// absorbs. Comparing against the seed alone would let a neutral seed
+		// bridge a +1 and a -1 into one summary.
+		polarity := seed.Polarity
 
 		for j, other := range eps {
 			if assigned[j] || len(other.embedding) == 0 {
@@ -127,13 +197,16 @@ func (e *Engine) Clusters(ctx context.Context) ([][]memory.Memory, error) {
 			// Never merge explicitly opposite polarities: a positive and a
 			// negative memory about the same event describe contradictory
 			// states and must not collapse into one summary.
-			if seed.Polarity != 0 && other.Polarity != 0 && seed.Polarity != other.Polarity {
+			if polarity != 0 && other.Polarity != 0 && polarity != other.Polarity {
 				continue
 			}
 			sim := vector.CosineSim(seed.embedding, other.embedding)
 			if sim >= e.SimilarityThreshold {
 				assigned[j] = true
 				cluster = append(cluster, other.Memory)
+				if polarity == 0 {
+					polarity = other.Polarity
+				}
 			}
 		}
 		if len(cluster) >= e.MinClusterSize {
@@ -174,21 +247,58 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 
 		// Aggregate tags (reflection first, then first-seen order) and mean
 		// importance rounded to 3 decimals, matching Python.
-		tags := []string{"reflection"}
-		seen := map[string]bool{"reflection": true}
+		// The new summary sits one tier above its deepest member, so a
+		// hierarchy can be walked (and re-reflected) by level.
+		level := 0
+		for _, m := range cluster {
+			if l := LevelOf(m); l > level {
+				level = l
+			}
+		}
+		levelTag := "level:" + strconv.Itoa(level+1)
+		tags := []string{"reflection", levelTag}
+		seen := map[string]bool{"reflection": true, levelTag: true}
 		var totalImp float64
 		for _, m := range cluster {
 			for _, t := range m.Tags {
-				if !seen[t] {
-					seen[t] = true
-					tags = append(tags, t)
+				// Do not inherit the members' level tags: the summary has its
+				// own tier.
+				if strings.HasPrefix(t, "level:") || seen[t] {
+					continue
 				}
+				seen[t] = true
+				tags = append(tags, t)
 			}
 			totalImp += float64(m.Importance)
 		}
 		// float64 accumulation + round-half-to-even to 3 decimals, matching
 		// Python's round(sum/len, 3).
 		avgImp := float32(math.RoundToEven(totalImp/float64(len(cluster))*1000) / 1000)
+
+		// A summary is only as trustworthy as its least trustworthy source.
+		// Without this, reflecting over content the agent did not author
+		// launders it into a "trusted" memory. Mirrors the polarity rule in
+		// clustering, which refuses to blend contradictory members.
+		trust := memory.TrustLevel(memory.TrustLevels[0])
+		for _, m := range cluster {
+			trust = memory.WorstTrust(trust, m.Trust)
+		}
+
+		// A consolidated summary takes over its sources' standing-instruction
+		// slot: soft consolidate supersedes them (and a superseded row leaves
+		// the working set), hard consolidate deletes them outright — either way
+		// the pin would be lost. Without consolidation the sources stay live
+		// and pinned, so pinning the summary too would put two rows in the
+		// working set for one instruction.
+		pinned := false
+		if consolidate == ConsolidateSoft || consolidate == ConsolidateHard {
+			for _, m := range cluster {
+				if m.Pinned {
+					pinned = true
+					break
+				}
+			}
+		}
 
 		if dryRun {
 			created = append(created, memory.Memory{
@@ -197,6 +307,8 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 				Tags:       tags,
 				Importance: avgImp,
 				Source:     "reflection/dry-run",
+				Trust:      trust,
+				Pinned:     pinned,
 				CreatedAt:  float64(time.Now().Unix()),
 			})
 			continue
@@ -207,6 +319,8 @@ func (e *Engine) Reflect(ctx context.Context, dryRun bool, consolidate Consolida
 			Tags:       tags,
 			Importance: memory.Float32Ptr(avgImp),
 			Source:     "reflection",
+			Trust:      trust,
+			Pinned:     pinned,
 		})
 		if err != nil {
 			return created, err

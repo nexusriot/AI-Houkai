@@ -16,6 +16,7 @@ from ai_houkai.cli.main import app
 from ai_houkai.http_server import make_server
 from ai_houkai.memory_system import (
     CONFLICT_POLICIES,
+    LEXICAL_INDEXES,
     LINK_RELS,
     MemoryStore,
     RECALL_MODES,
@@ -27,6 +28,20 @@ class TestStoreValidation:
         store.remember("something")
         with pytest.raises(ValueError, match="mode must be one of"):
             store.recall("q", mode="hybird")
+
+    def test_recall_rejects_lexical_index_typo(self, store: MemoryStore):
+        """"corpus" replaced an earlier "fts" spelling. Unvalidated, that name is
+        silently read as "pool", so a caller carrying it forward loses
+        full-corpus recall without being told.
+        """
+        store.remember("something")
+        with pytest.raises(ValueError, match="lexical_index must be one of"):
+            store.recall("q", mode="hybrid", lexical_index="fts")
+
+    def test_recall_pack_rejects_lexical_index_typo(self, store: MemoryStore):
+        store.remember("something")
+        with pytest.raises(ValueError, match="lexical_index must be one of"):
+            store.recall_pack("q", mode="hybrid", lexical_index="fts")
 
     def test_recall_rejects_fusion_typo(self, store: MemoryStore):
         store.remember("something")
@@ -100,6 +115,8 @@ class TestStoreValidation:
         assert "hybrid" in RECALL_MODES
         assert "supersedes" in LINK_RELS
         assert "raise" in CONFLICT_POLICIES
+        assert "corpus" in LEXICAL_INDEXES and "pool" in LEXICAL_INDEXES
+        assert "fts" not in LEXICAL_INDEXES
 
 
 @pytest.fixture()
@@ -285,6 +302,7 @@ class TestCliValidation:
         assert res.exit_code == 1
         assert "on_conflict must be one of" in res.output
 
+    @pytest.mark.needs_model
     def test_remember_conflict_raise_is_clean_outcome(self, cli_store):
         store, path = cli_store
         store.remember("the sky is blue today", tags=["sky"])

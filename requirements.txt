@@ -4,9 +4,13 @@
 # core
 chromadb>=0.5.0
 sentence-transformers>=2.7.0
+# tomllib backport: stdlib from 3.11, so only 3.10 needs the wheel.
+tomli>=2.0.1; python_version < "3.11"
 
 # MCP server
-mcp>=1.2.0
+# <2: mcp 2.0.0 removed mcp.server.fastmcp; >=1.28.1 is the tested floor
+# (see pyproject for the full note).
+mcp>=1.28.1,<2
 
 # Claude agent example + anthropic: summarizer
 anthropic>=0.40.0

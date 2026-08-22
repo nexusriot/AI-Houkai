@@ -58,5 +58,6 @@ def list_memories(
 
     if not memories:
         typer.echo("No memories found.", err=True)
-        return
+        if not out.is_machine_format(fmt):
+            return
     out.print_memories_table(memories, show_score=False, fmt=fmt)

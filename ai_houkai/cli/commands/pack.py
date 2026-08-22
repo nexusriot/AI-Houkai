@@ -23,6 +23,12 @@ def pack(
     max_items: int = typer.Option(50, "--max-items", help="Ranked candidates to consider"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
     header: str = typer.Option("## Relevant memory", "--header", help="Block header (empty string to omit)"),
+    include_pinned: bool = typer.Option(
+        False, "--include-pinned",
+        help="Prepend pinned memories whether or not they match the query"),
+    min_trust: Optional[str] = typer.Option(
+        None, "--min-trust",
+        help="trusted|reported|untrusted — keep only memories at least this trusted"),
     fmt: str = typer.Option("text", "--format", "-f", help="text|json"),
 ) -> None:
     """Assemble the most relevant memories into a token-budgeted context block.
@@ -41,6 +47,8 @@ def pack(
         result = store.recall_pack(
             query=query,
             token_budget=budget,
+            include_pinned=include_pinned,
+            min_trust=min_trust,
             type=type,
             tag=tag,
             min_importance=min_importance,

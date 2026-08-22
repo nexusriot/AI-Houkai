@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from ai_houkai.memory_system import Conflict, ConflictError, MemoryStore
@@ -38,6 +40,7 @@ class TestFindConflicts:
         store.remember("Use pytest for testing", type="procedural")
         assert store.find_conflicts() == []
 
+    @pytest.mark.needs_model
     def test_near_duplicate_detected(self, store: MemoryStore):
         store.remember("Use ruff to lint Python code", type="procedural",
                        tags=["linting"])
@@ -47,6 +50,7 @@ class TestFindConflicts:
         assert len(conflicts) >= 1
         assert all(c.kind == "duplicate" for c in conflicts)
 
+    @pytest.mark.needs_model
     def test_contradiction_detected(self, store: MemoryStore):
         store.remember("Always use ruff for linting", type="procedural",
                        tags=["linting"])
@@ -88,6 +92,7 @@ class TestFindConflicts:
             assert c.kind in ("duplicate", "contradiction")
             assert c.reason in ("negation_diff", "custom_fn", "similarity")
 
+    @pytest.mark.needs_model
     def test_custom_contradiction_fn(self, store: MemoryStore):
         def always_contradicts(a, b):
             return True
@@ -116,12 +121,14 @@ class TestRememberConflict:
                              on_conflict="ignore")
         assert mem.id  # stored normally
 
+    @pytest.mark.needs_model
     def test_on_conflict_warn_emits_warning(self, store: MemoryStore):
         store.remember("Always use ruff", type="procedural", tags=["lint"])
         with pytest.warns(UserWarning, match="conflict"):
             store.remember("Never use ruff", type="procedural", tags=["lint"],
                            on_conflict="warn")
 
+    @pytest.mark.needs_model
     def test_on_conflict_raise_raises(self, store: MemoryStore):
         store.remember("Always use ruff", type="procedural", tags=["lint"])
         with pytest.raises(ConflictError) as exc_info:
@@ -239,6 +246,7 @@ class TestPolarityConflict:
         assert any(c.kind == "contradiction" and c.reason == "polarity_diff"
                    for c in conflicts)
 
+    @pytest.mark.needs_model
     def test_polarity_diff_takes_priority_over_negation(self, store: MemoryStore):
         # Even with negation words, polarity_diff should be the reason
         store.remember("Always use ruff", type="procedural",
@@ -274,3 +282,63 @@ class TestPolarityConflict:
                        tags=["design"], polarity=-1)
         conflicts = store.find_conflicts(memory_id=pos.id, threshold=0.90)
         assert any(c.reason == "polarity_diff" for c in conflicts)
+
+
+class TestExpiredCandidatesAreNotConflicts:
+    """A lapsed memory must not block or supersede a new write.
+
+    Expired rows are hidden from recall, list and stats, and
+    `_find_by_content_hash` documents skipping them so a re-assertion creates a
+    fresh memory rather than resurrecting a dead one. Conflict detection read
+    the same collection without that filter, so an invisible row could reject a
+    legitimate write under `on_conflict="raise"` — a conflict the caller cannot
+    inspect, resolve, or even see.
+    """
+
+    @staticmethod
+    def _one_vector_embedder():
+        """Collapses every text onto one vector, so similarity is guaranteed and
+        the test is only about which candidates are *eligible*."""
+        def emb(texts):
+            return [[1.0, 0.0] for _ in texts]
+        return emb
+
+    def _store(self, tmp_path, name):
+        return MemoryStore(path=str(tmp_path / "chroma"), collection=name,
+                           embedding_function=self._one_vector_embedder())
+
+    def test_raise_policy_ignores_an_expired_clash(self, tmp_path):
+        store = self._store(tmp_path, "conflict_expired")
+        try:
+            store.remember("the api key rotates monthly", type="semantic",
+                           expires_at=time.time() - 1)
+            # Must succeed: the only clashing row has lapsed.
+            fresh = store.remember("the api key rotates weekly",
+                                   type="semantic", on_conflict="raise")
+            assert fresh.id
+        finally:
+            store.client.close()
+
+    def test_supersede_policy_leaves_an_expired_row_alone(self, tmp_path):
+        store = self._store(tmp_path, "conflict_expired_sup")
+        try:
+            dead = store.remember("stale fact", type="semantic",
+                                  expires_at=time.time() - 1)
+            store.remember("replacement fact", type="semantic",
+                           on_conflict="supersede")
+            # The lapsed row is purge_expired's to reclaim, not something a new
+            # write should re-label as "replaced by X".
+            assert store.get(dead.id).superseded_by == ""
+        finally:
+            store.client.close()
+
+    def test_a_live_clash_is_still_detected(self, tmp_path):
+        """The filter must not blunt the feature."""
+        store = self._store(tmp_path, "conflict_live")
+        try:
+            store.remember("the api key rotates monthly", type="semantic")
+            with pytest.raises(ConflictError):
+                store.remember("the api key rotates weekly", type="semantic",
+                               on_conflict="raise")
+        finally:
+            store.client.close()

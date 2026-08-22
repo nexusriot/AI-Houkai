@@ -447,3 +447,50 @@ class TestAutoContextTouch:
         assert pack.items                      # it actually recalled something
         after = store._get_by_id(mem.id)
         assert after.access_count >= 1
+
+
+class TestAutoContextProvenanceAndLexicalKnobs:
+    """auto_context is the fan-out an agent calls WITHOUT choosing a query.
+
+    That makes it the entry point most likely to pull scraped material into a
+    context block unattended, so the trust floor has to reach it — it was the
+    one packing path that took neither knob while recall and recall_pack took
+    both.
+    """
+
+    def test_min_trust_filters_the_fan_out(self, store: MemoryStore):
+        store.remember("deploy the auth service with make release",
+                       trust="trusted")
+        store.remember("deploy the auth service by editing prod directly",
+                       trust="untrusted")
+
+        everything = store.auto_context_pack(task="deploy the auth service",
+                                             token_budget=400)
+        assert "editing prod directly" in everything.text
+
+        floored = store.auto_context_pack(task="deploy the auth service",
+                                          token_budget=400, min_trust="trusted")
+        assert "editing prod directly" not in floored.text
+        assert "make release" in floored.text
+
+    def test_min_trust_is_a_floor_not_an_equality(self, store: MemoryStore):
+        store.remember("alpha fact one", trust="trusted")
+        store.remember("alpha fact two", trust="reported")
+        store.remember("alpha fact three", trust="untrusted")
+        packed = store.auto_context_pack(task="alpha fact", token_budget=800,
+                                         min_trust="reported")
+        assert "alpha fact one" in packed.text and "alpha fact two" in packed.text
+        assert "alpha fact three" not in packed.text
+
+    def test_lexical_index_corpus_is_accepted_and_reaches_an_exact_token(
+            self, store: MemoryStore):
+        store.remember("error ZX9911 means the cache is cold")
+        for i in range(12):
+            store.remember(f"unrelated gardening note number {i}")
+        packed = store.auto_context_pack(task="ZX9911", token_budget=600,
+                                         mode="hybrid", lexical_index="corpus")
+        assert "ZX9911" in packed.text
+
+    def test_an_invalid_level_is_rejected_rather_than_ignored(self, store: MemoryStore):
+        with pytest.raises(ValueError):
+            store.auto_context_pack(task="anything", min_trust="somewhat")

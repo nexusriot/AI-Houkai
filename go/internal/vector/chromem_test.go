@@ -169,3 +169,27 @@ func TestCollectionManagement(t *testing.T) {
 		t.Error("expected error for missing src collection")
 	}
 }
+
+// A zero dim is a misconfiguration (embed_dim = 0 in config.toml, which
+// toml.Unmarshal happily merges over the default), but it must surface as an
+// empty result or an error — not as a panic that takes the server down. Both
+// content-scan helpers build a probe vector and write to probe[0].
+func TestContentScansSurviveAZeroDim(t *testing.T) {
+	b, err := NewChromem(t.TempDir(), "zero_dim", 0)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	if err := b.Add(context.Background(), []Item{
+		{ID: "a", Content: "hello world", Embedding: []float32{1}},
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if _, err := b.SearchDocuments(context.Background(), "hello", 5); err != nil {
+		t.Errorf("SearchDocuments: unexpected error %v", err)
+	}
+	if _, err := b.SearchMetadata(context.Background(),
+		map[string]string{"type": "semantic"}, 5); err != nil {
+		t.Errorf("SearchMetadata: unexpected error %v", err)
+	}
+}

@@ -20,9 +20,9 @@ import (
 // Config controls a maintenance tick (used by the CLI tick/run commands and
 // the MCP maintenance_tick tool).
 type Config struct {
-	Interval    time.Duration // cadence of the foreground `maintenance run` loop
-	DecayRate   float32
-	MinScore    float32
+	Interval  time.Duration // cadence of the foreground `maintenance run` loop
+	DecayRate float32
+	MinScore  float32
 	// ProtectTypes are never pruned by the decay job. Without this the tick
 	// defaulted to decay's built-in ["procedural"], silently ignoring the
 	// user's configured protect_types and deleting memories they meant to keep.
@@ -39,6 +39,13 @@ type Config struct {
 	ReflectEvery float64
 	// PurgeEvery gates the TTL-purge job on the same schedule semantics.
 	PurgeEvery float64
+
+	// TrashTTLDays drops trashed memories deleted more than this many days ago,
+	// on the same tick as the TTL purge. Without it a "recoverable delete" is
+	// really a permanent archive and the trash file grows forever — decay
+	// pruning routes there too. 0 disables retention, and is not read as
+	// "purge everything".
+	TrashTTLDays float64
 
 	// FrequencyWeight > 0 makes frequently-recalled memories resist decay
 	// (forwarded to decay.Engine; 0 = recency-only, the default).
@@ -59,6 +66,8 @@ type State struct {
 	TotalDecayed   int     `json:"total_decayed"`
 	TotalReflected int     `json:"total_reflected"`
 	TotalPurged    int     `json:"total_purged"`
+	// TotalTrashPurged is cumulative trashed memories dropped past retention.
+	TotalTrashPurged int `json:"total_trash_purged"`
 }
 
 // LoadState reads the state file (a zero State if it is missing/unreadable).
@@ -90,7 +99,9 @@ type TickResult struct {
 	Pruned     int
 	Reflected  int
 	Purged     int
-	Err        error
+	// TrashPurged counts trashed memories dropped past TrashTTLDays.
+	TrashPurged int
+	Err         error
 }
 
 // lockState takes an exclusive cross-process flock guarding the
@@ -203,6 +214,15 @@ func tickLocked(ctx context.Context, store decay.Storable, reflStore reflectpkg.
 			res.Purged = len(purged)
 			st.LastPurgeAt = nowUnix
 			st.TotalPurged += res.Purged
+			if tb, ok := store.(trashRetainer); ok && cfg.TrashTTLDays > 0 {
+				dropped, terr := tb.TrashPurgeExpired(cfg.TrashTTLDays, nowUnix)
+				if terr != nil {
+					res.Err = errors.Join(res.Err, terr)
+				} else {
+					res.TrashPurged = dropped
+					st.TotalTrashPurged += dropped
+				}
+			}
 		}
 	}
 
@@ -216,6 +236,12 @@ func tickLocked(ctx context.Context, store decay.Storable, reflStore reflectpkg.
 // *memory.MemoryStore satisfies it, while a bare decay.Storable fake does not.
 type expirable interface {
 	PurgeExpired(ctx context.Context, now float64, dryRun bool) ([]memory.Memory, error)
+}
+
+// trashRetainer is the trash-retention capability the purge job needs; same
+// optional-capability treatment as expirable.
+type trashRetainer interface {
+	TrashPurgeExpired(ttlDays float64, now float64) (int, error)
 }
 
 // ReadPid returns the pid recorded in path (0 if absent/unparseable).

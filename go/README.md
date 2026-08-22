@@ -695,7 +695,7 @@ Version is derived from `git describe --tags --always --dirty` and injected at
 link time. Override with `VERSION=1.2.3 make build`. A `go build` without
 `-ldflags` falls back to the in-source default in
 [`internal/version/version.go`](internal/version/version.go) (currently
-`0.5.0`).
+`0.7.0`).
 
 ---
 
@@ -707,20 +707,26 @@ ChromaDB SQLite store, the Go version uses
 Use `houkai export` / `import` to migrate between them — the `.ahkai` format
 (gzipped JSONL with a header line) is identical on both sides.
 
-The Go port exposes **23 MCP tools** — `remember`, `remember_many`, `recall`,
-`recall_pack`, `auto_context`, `forget`, `purge_expired`, `edit`, `list_recent`, `stats`,
-`metrics`, `history`, `state_at`, `get_at`, `link`, `unlink`, `neighbors`,
-`find_conflicts`, `supersede`, `maintenance_tick`, `journal_tail`, `export`,
-`import`. This matches the Python reference port, including the advanced
-retrieval knobs on `recall`/`recall_pack` (`fusion=rrf`, diversity/MMR,
-`dedup_threshold`, `min_cosine`, `touch`, `explain`, and `recall_pack`
-compression), the `auto_context` fan-out tool, and the recent additions —
-pluggable **reranking** (a store-config Go `func`, not a request param),
-**TTL/expiry** (`ttl_seconds`/`expires_at` on `remember`/`edit`,
-`include_expired` on `recall`/`list_recent`, `purge_expired` + a maintenance
-purge job), **point-in-time** `history`/`state_at`/`get_at`, and runtime
-`metrics`. The tools keep the same names and behaviour, so existing clients
-keep working.
+The Go port exposes **41 MCP tools and 41 HTTP routes**, identical to the
+Python reference port. Parity is asserted rather than claimed: the repo-root
+[`parity.json`](../parity.json) is the single source of truth, and
+[`internal/parity`](internal/parity) checks this port's `tools/list` output,
+route table and recall knobs against it — so a tool added on only one side fails
+this build. `tools/list` on a running server is the authoritative inventory.
+
+Included in that surface: the full advanced-retrieval knob set on
+`recall`/`recall_pack` (`fusion=rrf`, diversity/MMR, `dedup_threshold`,
+`min_cosine`, `graph`, `touch`, `explain`, `header`, and the flat `expand_*`
+graph-walk parameters), the curation set (`merge`, `versions`, tag
+rename/merge/delete, `find_path`), `trash`/`trash_list`/`trash_restore`/
+`trash_purge`, `subgraph`, `undo`, guarded `nuke`, `ready`, and the read-only
+`eval_recall` harness (`internal/eval`, metric-for-metric with Python and
+reading the same JSONL gold-set format).
+
+`lexical_index` is the one recall knob not yet ported: Python backs
+`"corpus"` with Chroma's `where_document` filter, and chromem-go has no
+equivalent document-content predicate. Everything else in the manifest is
+matched on both sides.
 
 Two ranking features from the latest cycle live at the **library level** in both
 ports — not (yet) on the MCP/CLI/HTTP surface: **graph-proximity fusion**

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json as json
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ai_houkai.cli import output as out
+from ai_houkai.cli.commands.timetravel import journal_undo_last
 
 
 def tail(
@@ -85,3 +86,4 @@ journal_app = typer.Typer(help="Inspect the audit journal.", no_args_is_help=Tru
 journal_app.command("tail")(tail)
 journal_app.command("show")(show)
 journal_app.command("undo")(undo)
+journal_app.command("undo-last")(journal_undo_last)

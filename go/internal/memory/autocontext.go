@@ -56,15 +56,24 @@ func ExtractKeyPhrases(task string, maxPhrases int) []string {
 
 // AutoContextOpts holds optional AutoContextPack parameters.
 type AutoContextOpts struct {
-	TokenBudget       int              // default 800
-	MaxPhrases        int              // default 3
-	Mode              RecallMode       // default hybrid
-	MinCosine         *float32         // absolute relevance floor per fan-out query
-	Header            *string          // nil → "## Relevant memory"; "" → no header
-	TokenCounter      func(string) int // default EstimateTokens
+	TokenBudget  int              // default 800
+	MaxPhrases   int              // default 3
+	Mode         RecallMode       // default hybrid
+	MinCosine    *float32         // absolute relevance floor per fan-out query
+	Header       *string          // nil → "## Relevant memory"; "" → no header
+	TokenCounter func(string) int // default EstimateTokens
+	// NoTouch skips the access-count / last_accessed bump on every fan-out
+	// recall, making the whole call read-only.
+	NoTouch           bool
 	Compress          bool
 	CompressThreshold float32
 	CompressMinGroup  int
+	// LexicalIndex and MinTrust apply to every fan-out query, exactly as they do
+	// in RecallPack. The trust floor matters more here than anywhere else: this
+	// is the entry point an agent calls *without* choosing a query, so it is the
+	// one most likely to pull scraped material into a context block unattended.
+	LexicalIndex LexicalIndexMode
+	MinTrust     TrustLevel
 }
 
 // AutoContextPack fans out recall over the task plus its extracted key phrases,
@@ -100,7 +109,10 @@ func (s *MemoryStore) AutoContextPack(ctx context.Context, task string, opts Aut
 	best := map[string]MemoryWithScore{}
 	var order []string // first-seen order, for deterministic stable sorting
 	for _, q := range queries {
-		res, err := s.Recall(ctx, q, 10, RecallOpts{Mode: opts.Mode, MinCosine: opts.MinCosine})
+		res, err := s.Recall(ctx, q, 10, RecallOpts{
+			Mode: opts.Mode, MinCosine: opts.MinCosine, NoTouch: opts.NoTouch,
+			LexicalIndex: opts.LexicalIndex, MinTrust: opts.MinTrust,
+		})
 		if err != nil {
 			return PackResult{}, err
 		}

@@ -489,7 +489,9 @@ def test_cli_store_option_expands_tilde(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_store(*, path, collection, actor):
+    def fake_store(*, path, collection, actor, **kwargs):
+        # **kwargs so the double survives new constructor options (index=…)
+        # without pretending to care about them.
         captured["path"] = path
         raise RuntimeError("stop before touching chroma")
 
@@ -661,3 +663,42 @@ def test_purge_nothing_to_do(tmp_path):
     r = _invoke(["purge"], store_path)
     assert r.exit_code == 0
     assert "Nothing to purge" in r.output
+
+
+class TestEmptyResultsStayMachineReadable:
+    """`--format json|tsv` is for pipes; an empty result must still be parseable.
+
+    `list` and `recall` bailed out with a human message on stderr and printed
+    nothing at all, so `houkai list -f json | jq .` failed on a fresh store —
+    exactly the case a script hits first.
+    """
+
+    def test_list_json_emits_an_empty_array(self, tmp_path):
+        result = _invoke(["list", "--format", "json"], str(tmp_path / "chroma"))
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == []
+
+    def test_recall_json_emits_an_empty_array(self, tmp_path):
+        result = _invoke(["recall", "nothing here", "--format", "json"],
+                         str(tmp_path / "chroma"))
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout) == []
+
+    def test_list_tsv_still_emits_its_header(self, tmp_path):
+        """A header-only TSV is what `column -t` and pandas expect."""
+        result = _invoke(["list", "--format", "tsv"], str(tmp_path / "chroma"))
+        assert result.exit_code == 0, result.output
+        assert result.stdout.splitlines()[0].split("\t")[:2] == ["id", "type"]
+
+    def test_the_human_note_stays_on_stderr(self, tmp_path):
+        """So it never lands in the piped payload."""
+        result = _invoke(["list", "--format", "json"], str(tmp_path / "chroma"))
+        assert "No memories found" in result.stderr
+        assert "No memories found" not in result.stdout
+
+    def test_rich_format_keeps_the_human_message(self, tmp_path):
+        """Interactive use should not get a bare `[]`."""
+        result = _invoke(["list", "--format", "rich"], str(tmp_path / "chroma"))
+        assert result.exit_code == 0, result.output
+        assert result.stdout.strip() == ""
+        assert "No memories found" in result.stderr

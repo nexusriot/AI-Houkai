@@ -1,7 +1,8 @@
 """Reflection engine — cluster episodic memories and synthesise semantic ones.
 
 Algorithm
-1. Fetch all episodic memories together with their stored HNSW embeddings.
+1. Fetch all candidate memories (``types``, default episodic) with their
+   stored HNSW embeddings.
 2. Compute pairwise cosine similarity.
 3. Greedy single-linkage clustering: seed on the highest-importance memory,
    absorb neighbours above `similarity_threshold`, repeat until exhausted.
@@ -37,12 +38,14 @@ Usage
 from __future__ import annotations
 
 import math
+import time
 import uuid
 from typing import Callable, Literal
 
 from contextlib import nullcontext
 
 from .store import Memory, MemoryStore
+from .trust import worst_trust
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -50,6 +53,21 @@ def _cosine(a: list[float], b: list[float]) -> float:
     na  = math.sqrt(sum(x * x for x in a))
     nb  = math.sqrt(sum(y * y for y in b))
     return dot / (na * nb) if na and nb else 0.0
+
+
+def _level_of(mem: "Memory") -> int:
+    """Reflection tier of a memory: 0 for a raw one, N for a ``level:N`` tag.
+
+    Encoded as a tag rather than a metadata field so it round-trips through
+    export/import and old archives read as level 0.
+    """
+    for tag in mem.tags:
+        if tag.startswith("level:"):
+            try:
+                return int(tag.split(":", 1)[1])
+            except ValueError:
+                continue
+    return 0
 
 
 def _default_summarizer(memories: "list[Memory]") -> str:
@@ -69,11 +87,30 @@ class ReflectionEngine:
         similarity_threshold: float = 0.75,
         min_cluster_size: int = 2,
         summarizer: Callable[["list[Memory]"], str] | None = None,
+        types: tuple[str, ...] = ("episodic",),
+        max_level: int = 1,
     ) -> None:
+        """
+        types
+            Which memory types to cluster. Historically hard-coded to
+            ``("episodic",)``, which meant semantic memories — including
+            reflections themselves — never consolidated, so a long-lived store
+            accumulated summaries without bound, and ``feedback`` /
+            ``procedural`` never benefited at all.
+        max_level
+            How many tiers of reflection-of-reflections to allow. Each summary
+            is tagged ``level:N``; a cluster whose members are already at
+            ``max_level`` is skipped. 1 (default) reproduces the old behaviour
+            — summaries are produced but never re-summarised. Raise it to build
+            a hierarchy; the cap is what stops runaway re-summarisation from
+            eating the store.
+        """
         self.store = store
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
         self.summarizer = summarizer or _default_summarizer
+        self.types = tuple(types)
+        self.max_level = max(1, max_level)
 
     def reflect(
         self,
@@ -96,7 +133,7 @@ class ReflectionEngine:
         Returns
         Newly created (or candidate) semantic Memory objects, one per cluster.
         """
-        mems, embeddings = self._fetch_episodic()
+        mems, embeddings = self._fetch_candidates()
         if len(mems) < self.min_cluster_size:
             return []
 
@@ -109,17 +146,41 @@ class ReflectionEngine:
                 group = [mems[i] for i in idx_list]
                 text  = self.summarizer(group)
 
-                all_tags: list[str] = ["reflection"]
-                seen: set[str] = {"reflection"}
+                # The new summary sits one tier above its deepest member, so a
+                # hierarchy can be walked (and re-reflected) by level.
+                level = max((_level_of(m) for m in group), default=0) + 1
+                level_tag = f"level:{level}"
+                all_tags: list[str] = ["reflection", level_tag]
+                seen: set[str] = {"reflection", level_tag}
                 for m in group:
                     for tag in m.tags:
-                        if tag not in seen:
-                            all_tags.append(tag)
-                            seen.add(tag)
+                        # Do not inherit the members' level tags: the summary
+                        # has its own tier.
+                        if tag.startswith("level:") or tag in seen:
+                            continue
+                        all_tags.append(tag)
+                        seen.add(tag)
 
                 importance = round(
                     sum(m.importance for m in group) / len(group), 3
                 )
+
+                # A summary is only as trustworthy as its least trustworthy
+                # source. Without this, reflecting over content the agent did
+                # not author launders it into a "trusted" memory that
+                # min_trust="trusted" will happily return — the exact hole the
+                # trust tier exists to close. Mirrors the polarity rule in
+                # _cluster, which refuses to blend contradictory members.
+                trust = worst_trust(m.trust for m in group)
+
+                # A consolidated summary takes over its sources' standing-
+                # instruction slot: soft consolidate supersedes them (and a
+                # superseded row leaves the working set), hard consolidate
+                # deletes them outright — either way the pin would be lost.
+                # Without consolidation the sources stay live and pinned, so
+                # pinning the summary too would put two rows in the working set
+                # for one instruction.
+                pinned = bool(consolidate) and any(m.pinned for m in group)
 
                 if dry_run:
                     candidate = Memory(
@@ -129,6 +190,8 @@ class ReflectionEngine:
                         tags=all_tags,
                         importance=importance,
                         source="reflection/dry-run",
+                        trust=trust,
+                        pinned=pinned,
                     )
                     created.append(candidate)
                 else:
@@ -138,6 +201,8 @@ class ReflectionEngine:
                         tags=all_tags,
                         importance=importance,
                         source="reflection",
+                        trust=trust,
+                        pinned=pinned,
                     )
                     created.append(new_mem)
 
@@ -158,7 +223,7 @@ class ReflectionEngine:
 
     def clusters(self) -> "list[list[Memory]]":
         """Return detected clusters without writing anything (for inspection)."""
-        mems, embeddings = self._fetch_episodic()
+        mems, embeddings = self._fetch_candidates()
         if len(mems) < self.min_cluster_size:
             return []
         return [
@@ -166,12 +231,15 @@ class ReflectionEngine:
             for idx_list in self._cluster(mems, embeddings)
         ]
 
-    def _fetch_episodic(
+    def _fetch_candidates(
         self,
     ) -> "tuple[list[Memory], list[list[float]]]":
-
+        # A single-element $in is rejected by some Chroma versions, and the
+        # common case is one type, so build the narrowest clause that works.
+        where: dict = ({"type": self.types[0]} if len(self.types) == 1
+                       else {"type": {"$in": list(self.types)}})
         res = self.store.collection.get(
-            where={"type": "episodic"},
+            where=where,
             include=["embeddings", "documents", "metadatas"],
         )
         ids   = res.get("ids") or []
@@ -184,11 +252,25 @@ class ReflectionEngine:
         # earlier reflection). Otherwise every run re-clusters the same
         # sources: with consolidate=False it emits duplicate summaries, and
         # with consolidate=soft it re-supersedes them under a fresh summary.
+        now = time.time()
         mems: list[Memory] = []
         kept_embs: list[list[float]] = []
         for i, d, m, e in zip(ids, docs, metas, embs):
             mem = Memory.from_record(i, d, m)
             if mem.superseded_by:
+                continue
+            # An expired memory is on its way out — hidden from recall/list and
+            # waiting for purge_expired to reclaim it. Folding it in would copy
+            # its text into a fresh summary that has no TTL of its own, so a
+            # deliberate lifetime would be laundered into a permanent row. Same
+            # rule as the trust inheritance below: a summary must not grant its
+            # sources more reach than they had.
+            if mem.expires_at and mem.expires_at <= now:
+                continue
+            # A memory already at the deepest allowed tier must not be folded
+            # into yet another summary — that is the runaway case max_level
+            # exists to stop.
+            if _level_of(mem) >= self.max_level:
                 continue
             mems.append(mem)
             kept_embs.append(list(e))

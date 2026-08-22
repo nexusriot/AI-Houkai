@@ -8,8 +8,9 @@
 //     stored memory keeps its context ("## Deploy\nUse make release").
 //  3. Paragraphs longer than maxChars are re-split on sentence boundaries
 //     and greedily re-packed up to maxChars.
-//  4. Chunks shorter than minChars are dropped (separators, stray list
-//     bullets, noise).
+//  4. Blocks shorter than minChars are dropped (separators, stray list
+//     bullets, noise). A short *fragment* of a split paragraph is folded
+//     into a neighbour instead, because it is content rather than noise.
 //
 // Deterministic and dependency-free; embedding and storage happen at the
 // caller (one Remember per chunk).
@@ -43,7 +44,14 @@ func splitSentences(paragraph string) []string {
 }
 
 // splitLong greedily packs sentences into chunks of at most maxChars.
-func splitLong(paragraph string, maxChars int) []string {
+//
+// Fragments below minChars are folded into a neighbour rather than left for the
+// caller's noise filter to delete. Greedy packing leaves a short fragment
+// whenever the next sentence will not fit, and that fragment is the tail (or
+// head) of a real paragraph — content, not a separator. maxChars is already a
+// soft target, since a single over-long sentence is kept whole, so growing a
+// chunk is the lesser evil against silently losing text.
+func splitLong(paragraph string, maxChars, minChars int) []string {
 	var chunks []string
 	current := ""
 	for _, sent := range splitSentences(paragraph) {
@@ -65,9 +73,27 @@ func splitLong(paragraph string, maxChars int) []string {
 	if current != "" {
 		chunks = append(chunks, current)
 	}
+
 	// A single sentence longer than maxChars is kept whole — splitting
 	// mid-sentence would destroy the embedding's meaning.
-	return chunks
+	if minChars <= 0 || len(chunks) < 2 {
+		return chunks
+	}
+
+	var folded []string
+	for _, chunk := range chunks {
+		if len(folded) > 0 && len(chunk) < minChars {
+			folded[len(folded)-1] += " " + chunk
+		} else {
+			folded = append(folded, chunk)
+		}
+	}
+	// A runt in first position has no predecessor to join, so fold it forward.
+	if len(folded) > 1 && len(folded[0]) < minChars {
+		folded[1] = folded[0] + " " + folded[1]
+		folded = folded[1:]
+	}
+	return folded
 }
 
 // ChunkText splits text into memory-sized chunks (see package doc).
@@ -114,7 +140,7 @@ func ChunkText(text string, maxChars, minChars int) []string {
 		if len(block) <= maxChars {
 			chunks = append(chunks, block)
 		} else {
-			chunks = append(chunks, splitLong(block, maxChars)...)
+			chunks = append(chunks, splitLong(block, maxChars, minChars)...)
 		}
 	}
 

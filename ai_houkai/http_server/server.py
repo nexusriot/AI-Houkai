@@ -9,6 +9,7 @@ Routes (all JSON in / JSON out):
     GET    /memories?limit=&include_superseded=&include_expired=
                                            recent memories (list_recent)
     POST   /memories                       store a memory (remember; ttl_seconds/expires_at)
+    POST   /memories/batch                 bulk store with batched embedding (remember_many; idempotent?)
     GET    /memories/{id}                  fetch one memory
     PATCH  /memories/{id}                  edit fields in place (journaled; expires_at)
     DELETE /memories/{id}                  forget one memory
@@ -25,11 +26,31 @@ Routes (all JSON in / JSON out):
     POST   /links        {src_id,dst_id,rel?}      add a directed link
     POST   /unlink       {src_id,dst_id,rel?}      remove link(s)
     POST   /supersede    {old_id,new_id}           soft-delete + supersede link
+    POST   /restore      {memory_id}               clear a supersede (un-soft-delete)
     POST   /conflicts    {memory_id?,threshold?}   duplicate / contradiction scan
+    POST   /subgraph     {memory_ids,depth?}       link graph reachable from ids
+    POST   /undo         {ts?,memory_id?}          reverse a journaled mutation
+    POST   /nuke         {confirm}                 delete every memory (guarded)
+    GET    /journal?n=&op=&since=                  audit-journal tail
+    POST   /export       {path,…}                  write a .ahkai archive (server-side path)
+    POST   /import       {path,on_conflict?,…}     read a .ahkai archive (server-side path)
+    POST   /merge        {target_id,other_id,…}    fold one memory into another
+    GET    /memories/{id}/versions                 past text states from the journal
+    GET    /tags?include_superseded=               tag usage counts
+    POST   /tags/rename  {old,new}                 rename a tag collection-wide
+    POST   /tags/merge   {sources,into}            fold several tags into one
+    DELETE /tags/{tag}                             strip a tag from every memory
+    POST   /find_path    {from_id,to_id,max_depth?} shortest undirected link path
+    POST   /trash        {memory_id}               soft-delete (recoverable)
+    GET    /trash                                  list soft-deleted memories
+    POST   /trash/restore {memory_id}              bring one back
+    POST   /trash/purge  {memory_id?, older_than_days?}  permanently drop (irreversible)
 
 Optional bearer-token auth: pass ``auth_token`` (or set ``AI_HOUKAI_HTTP_TOKEN``)
 and every request must carry ``Authorization: Bearer <token>``.  ``/health`` and
 ``/ready`` stay reachable so liveness/readiness probes work without the secret.
+``/export`` and ``/import`` (which read/write server-side paths) additionally
+require a token to be configured at all; a tokenless server refuses them.
 
 The handler is intentionally framework-free: a single regex routing table maps
 ``(method, path)`` to small functions taking ``(store, match, query, body)``.
@@ -42,13 +63,19 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from ai_houkai.memory_system import ExpandSpec, HybridWeights, MemoryStore, RememberItem
-from ai_houkai.memory_system.store import ConflictError, extract_key_phrases
+from ai_houkai.memory_system.curation import MergeError
+from ai_houkai.memory_system.store import (
+    ConflictError,
+    ImportConflictError,
+    extract_key_phrases,
+)
 from ai_houkai.timeparse import parse_timestamp
 
 
@@ -77,6 +104,15 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         "superseded_by": mem.superseded_by or None,
         "superseded_at": mem.superseded_at or None,
         "expires_at": mem.expires_at or None,
+        # Always present, never elided to null: a REST client can set these on
+        # a write, so it has to be able to read them back — and "absent" would
+        # be indistinguishable from "not pinned" / "unlabelled".
+        "pinned": mem.pinned,
+        "trust": mem.trust,
+        # Valid time — when the memory was true, as opposed to when we learned
+        # it. 0 on either end means unbounded.
+        "valid_from": mem.valid_from,
+        "valid_until": mem.valid_until,
     }
 
 
@@ -112,8 +148,10 @@ def _as_float(value: Optional[str]) -> Optional[float]:
         raise HttpError(400, f"'{value}' is not a valid number") from exc
 
 
-def _as_bool(value: Optional[str]) -> bool:
-    return (value or "").lower() in ("1", "true", "yes", "on")
+def _as_bool(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
 
 
 # JSON-body coercers — the POST twins of _as_int/_as_float/_as_bool. A JSON
@@ -264,7 +302,7 @@ def _history(store: MemoryStore, m, q, b):
     mid = m.group("id")
     entries = store.history(mid)
     # Distinguish an unknown id from a live memory with no journal history.
-    if not entries and store._get_by_id(mid) is None:
+    if not entries and store.get(mid) is None:
         raise HttpError(404, "memory not found")
     return 200, {"id": mid,
                  "history": [_journal_entry_dict(e) for e in entries]}
@@ -291,6 +329,12 @@ def _get_at(store: MemoryStore, m, q, b):
 
 def _remember(store: MemoryStore, m, q, b):
     text = _require(b, "text")
+    # Asked before the write, because remember() returns the existing row on a
+    # dedupe hit and there is otherwise no way to tell it from a fresh one.
+    # 201/stored:true has to mean "I created something": a client replaying a
+    # batch every session was told it wrote N new rows when it wrote none.
+    deduped = (_body_bool(b, "idempotent")
+               and store.find_by_content_hash(text) is not None)
     try:
         mem = store.remember(
             text=text,
@@ -303,6 +347,11 @@ def _remember(store: MemoryStore, m, q, b):
             polarity=_body_int(b, "polarity", 0),
             expires_at=_body_float(b, "expires_at"),
             ttl_seconds=_body_float(b, "ttl_seconds"),
+            pinned=_body_bool(b, "pinned"),
+            trust=b.get("trust") or "trusted",
+            idempotent=_body_bool(b, "idempotent"),
+            valid_from=_body_float(b, "valid_from"),
+            valid_until=_body_float(b, "valid_until"),
             on_conflict=b.get("on_conflict"),
         )
     except ConflictError as e:
@@ -314,6 +363,8 @@ def _remember(store: MemoryStore, m, q, b):
                 for c in e.conflicts
             ],
         }
+    if deduped:
+        return 200, {"stored": False, **_mem_dict(mem)}
     return 201, {"stored": True, **_mem_dict(mem)}
 
 
@@ -342,20 +393,29 @@ def _remember_many(store: MemoryStore, m, q, b):
             expires_at=_body_float(it, "expires_at"),
             ttl_seconds=_body_float(it, "ttl_seconds"),
         ))
+    started = time.time()
     try:
         mems = store.remember_many(
             items,
             batch_size=_body_int(b, "batch_size", 128),
             on_conflict=b.get("on_conflict"),
+            idempotent=_body_bool(b, "idempotent"),
         )
     except ValueError as e:
         # bad type/tag/policy (incl. on_conflict='raise') → 400, not 500
         raise HttpError(400, str(e))
-    return 201, {"stored": len(mems), "memories": [_mem_dict(x) for x in mems]}
+    # `stored` is how many rows the batch CREATED. An idempotent replay returns
+    # the pre-existing rows, and reporting len(mems) told the client it had
+    # written N rows when it had written none. Counting distinct new ids also
+    # collapses intra-batch duplicates, which map to one row.
+    created = {x.id for x in mems if x.created_at >= started}
+    status = 201 if created else 200
+    return status, {"stored": len(created),
+                    "memories": [_mem_dict(x) for x in mems]}
 
 
 def _get_one(store: MemoryStore, m, q, b):
-    mem = store._get_by_id(m.group("id"))
+    mem = store.get(m.group("id"))
     if mem is None:
         raise HttpError(404, "memory not found")
     return 200, _mem_dict(mem)
@@ -385,6 +445,14 @@ def _edit(store: MemoryStore, m, q, b):
         kwargs["importance"] = _body_float(b, "importance")
     if b.get("polarity") is not None:
         kwargs["polarity"] = _body_int(b, "polarity", 0)
+    if b.get("pinned") is not None:
+        kwargs["pinned"] = _body_bool(b, "pinned")
+    if b.get("trust") is not None:
+        kwargs["trust"] = b["trust"]
+    if b.get("valid_from") is not None:
+        kwargs["valid_from"] = _body_float(b, "valid_from")
+    if b.get("valid_until") is not None:
+        kwargs["valid_until"] = _body_float(b, "valid_until")
     if b.get("expires_at") is not None:
         # null = unchanged; an explicit 0 clears the TTL.
         kwargs["expires_at"] = _body_float(b, "expires_at")
@@ -402,7 +470,7 @@ def _edit(store: MemoryStore, m, q, b):
 def _neighbors(store: MemoryStore, m, q, b):
     # neighbors() can't distinguish "no links" from "no such memory" — check
     # existence first so a typo'd id is a 404, consistent with GET /memories/{id}.
-    if store._get_by_id(m.group("id")) is None:
+    if store.get(m.group("id")) is None:
         raise HttpError(404, "memory not found")
     hits = store.neighbors(
         m.group("id"),
@@ -475,6 +543,12 @@ def _recall_params(q, b):
             "min_cosine": _body_float(b, "min_cosine"),
             "weights": _weights_from_body(b),
             "expand": _expand_from_body(b),
+            "lexical_index": get("lexical_index") or "pool",
+            "min_trust": get("min_trust"),
+            "as_of": _body_float(b, "as_of"),
+            # touch=False lets eval/monitoring traffic recall without
+            # inflating access counters, which feed decay reinforcement.
+            "touch": _body_bool(b, "touch", True),
         }
     query = _qs_one(q, "query")
     if not query:
@@ -493,6 +567,12 @@ def _recall_params(q, b):
         "include_superseded": _as_bool(_qs_one(q, "include_superseded")),
         "include_expired": _as_bool(_qs_one(q, "include_expired")),
         "explain": _as_bool(_qs_one(q, "explain")),
+        # Plain scalars, so unlike the nested tuning knobs they map fine onto
+        # a query string and are offered on GET too.
+        "as_of": _as_float(_qs_one(q, "as_of")),
+        "min_trust": _qs_one(q, "min_trust"),
+        "lexical_index": _qs_one(q, "lexical_index") or "pool",
+        "touch": _as_bool(_qs_one(q, "touch"), True),
     }
 
 
@@ -551,6 +631,10 @@ def _recall_pack(store: MemoryStore, m, q, b):
         dedup_threshold=_body_float(b, "dedup_threshold"),
         min_cosine=_body_float(b, "min_cosine"),
         expand=_expand_from_body(b),
+        lexical_index=b.get("lexical_index") or "pool",
+        min_trust=b.get("min_trust"),
+        as_of=_body_float(b, "as_of"),
+        include_pinned=_body_bool(b, "include_pinned"),
         max_items=_body_int(b, "max_items", 50),
         include_superseded=_body_bool(b, "include_superseded"),
         header=b.get("header", "## Relevant memory"),
@@ -573,6 +657,8 @@ def _auto_context(store: MemoryStore, m, q, b):
         compress=_body_bool(b, "compress"),
         compress_threshold=_compress_threshold(b),
         compress_min_group=_body_int(b, "compress_min_group", 2),
+        lexical_index=b.get("lexical_index") or "pool",
+        min_trust=b.get("min_trust") or None,
     )
     payload = _pack_payload(res)
     payload["queries"] = [task] + extract_key_phrases(
@@ -618,6 +704,237 @@ def _conflicts(store: MemoryStore, m, q, b):
     ]}
 
 
+def _restore(store: MemoryStore, m, q, b):
+    mid = _require(b, "memory_id")
+    if store.get(mid) is None:
+        raise HttpError(404, "memory not found")
+    return 200, {"restored": store.restore(mid), "id": mid}
+
+
+def _subgraph(store: MemoryStore, m, q, b):
+    ids = b.get("memory_ids")
+    if isinstance(ids, str):
+        ids = [ids]
+    if not isinstance(ids, list) or not ids:
+        raise HttpError(400, "missing required field: memory_ids")
+    graph = store.subgraph([str(i) for i in ids], depth=_body_int(b, "depth", 1))
+    return 200, {
+        "nodes": [_mem_dict(x) for x in graph.nodes.values()],
+        "edges": [{"src": s, "dst": d, "rel": r} for s, d, r in graph.edges],
+    }
+
+
+def _undo(store: MemoryStore, m, q, b):
+    """Reverse a journaled mutation: the newest, one by exact ts, or the newest
+    touching a given memory."""
+    ts = _body_float(b, "ts")
+    mid = b.get("memory_id")
+    if ts is not None:
+        entry = store.journal.find_by_ts(ts)
+        if entry is None:
+            raise HttpError(404, f"no journal entry at ts={ts}")
+    else:
+        candidates = [e for e in store.journal.read()
+                      if mid is None or store._entry_touches(e, str(mid))]
+        if not candidates:
+            raise HttpError(404, "no journal entry to undo")
+        entry = candidates[-1]
+    ok = store.undo(entry)
+    return 200, {"ok": ok, "op": entry.op, "id": entry.id, "ts": entry.ts,
+                 "actor": entry.actor}
+
+
+def _nuke(store: MemoryStore, m, q, b):
+    """Delete every memory. Guarded by an explicit confirm string so a stray
+    DELETE can't empty the store."""
+    if b.get("confirm") != "DELETE ALL":
+        raise HttpError(400, 'refusing to nuke: pass {"confirm": "DELETE ALL"}')
+    return 200, {"ok": True, "deleted": store.nuke()}
+
+
+def _journal(store: MemoryStore, m, q, b):
+    entries = list(store.journal.read(
+        op=_qs_one(q, "op"),
+        since=_time(_qs_one(q, "since")),
+    ))
+    n = _as_int(_qs_one(q, "n"), 20)
+    if n > 0:
+        entries = entries[-n:]
+    return 200, {"count": len(entries),
+                 "entries": [_journal_entry_dict(e) for e in entries]}
+
+
+def _str_list(b: dict[str, Any], key: str) -> "list[str] | None":
+    """Coerce a body field that may be a single string or a list of strings."""
+    v = b.get(key)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    raise HttpError(400, f"{key}: expected a string or list of strings")
+
+
+_ARCHIVE_DENIED = (
+    "archive routes read/write server-side paths and require a configured "
+    "auth token; use the `houkai export` / `houkai import` CLI commands for "
+    "tokenless local use"
+)
+
+
+def _archive_route_allowed(path: str, auth_token: str | None) -> bool:
+    """Whether /export & /import may run for this caller.
+
+    These two routes reach past the store onto the server's filesystem
+    (arbitrary read into the store / arbitrary .gz write), so unlike the
+    store-scoped routes they are never offered without a configured token.
+    A peer-address check is not a substitute: the stdlib handler accepts any
+    Content-Type, so even a loopback bind is reachable by a drive-by
+    cross-origin POST from a browser, and localhost proxies forward remote
+    callers with a loopback peer address. Local tokenless workflows use the
+    CLI, which talks to the store directly. An EMPTY token counts as
+    unconfigured — its "Bearer " header carries no secret.
+    """
+    return path not in ("/export", "/import") or bool(auth_token)
+
+
+def _export(store: MemoryStore, m, q, b):
+    """Write a .ahkai archive to a server-side path. The path is resolved on
+    the server; these routes require a configured auth token (see
+    _archive_route_allowed)."""
+    summary = store.export(
+        _require(b, "path"),
+        include_vectors=_body_bool(b, "include_vectors", True),
+        include_superseded=_body_bool(b, "include_superseded"),
+        types=_str_list(b, "types"),
+        tags=_str_list(b, "tags"),
+        since=_time(b.get("since")),
+    )
+    return 200, {"path": str(summary.path), "count": summary.count,
+                 "bytes": summary.bytes, "elapsed": round(summary.elapsed, 4)}
+
+
+def _import(store: MemoryStore, m, q, b):
+    try:
+        summary = store.import_(
+            _require(b, "path"),
+            on_conflict=b.get("on_conflict", "skip"),
+            regenerate_vectors=_body_bool(b, "regenerate_vectors"),
+            dry_run=_body_bool(b, "dry_run"),
+        )
+    except FileNotFoundError as e:
+        raise HttpError(404, f"archive not found: {e}")
+    except ImportConflictError as e:
+        raise HttpError(409, str(e))
+    except ImportError as e:
+        raise HttpError(400, str(e))
+    return 200, {
+        "imported": summary.imported, "skipped": summary.skipped,
+        "overwritten": summary.overwritten, "renamed": summary.renamed,
+        "vectors_regenerated": summary.vectors_regenerated,
+        "errors": [{"id": i, "error": msg} for i, msg in summary.errors],
+    }
+
+
+def _merge(store: MemoryStore, m, q, b):
+    try:
+        mem = store.merge(_require(b, "target_id"), _require(b, "other_id"),
+                          separator=b.get("separator", "\n\n"))
+    except MergeError as e:
+        raise HttpError(404 if e.not_found else 400, str(e))
+    return 200, _mem_dict(mem)
+
+
+def _versions(store: MemoryStore, m, q, b):
+    mid = m.group("id")
+    if store.get(mid) is None:
+        raise HttpError(404, "memory not found")
+    return 200, {"id": mid, "versions": [
+        {"ts": v.ts, "text": v.text, "tags": v.tags,
+         "importance": v.importance, "source": v.source, "type": v.type}
+        for v in store.versions(mid)
+    ]}
+
+
+def _tags(store: MemoryStore, m, q, b):
+    include = _as_bool(_qs_one(q, "include_superseded"))
+    return 200, {"tags": [{"tag": t, "count": n} for t, n
+                          in store.list_tags(include_superseded=include)]}
+
+
+def _rename_tag(store: MemoryStore, m, q, b):
+    res = store.rename_tag(_require(b, "old"), _require(b, "new"))
+    return 200, {"changed": res.changed, "tag": res.tag}
+
+
+def _merge_tags(store: MemoryStore, m, q, b):
+    sources = b.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise HttpError(400, "missing required field: sources")
+    res = store.merge_tags([str(s) for s in sources], _require(b, "into"))
+    return 200, {"changed": res.changed, "tag": res.tag}
+
+
+def _delete_tag(store: MemoryStore, m, q, b):
+    res = store.delete_tag(m.group("tag"))
+    return 200, {"changed": res.changed, "tag": res.tag}
+
+
+def _find_path(store: MemoryStore, m, q, b):
+    hops = store.find_path(_require(b, "from_id"), _require(b, "to_id"),
+                           max_depth=_body_int(b, "max_depth", 6))
+    path = []
+    for mid, rel in hops:
+        mem = store.get(mid)
+        path.append({"id": mid, "rel": rel,
+                     "text": (mem.text[:120] if mem else None)})
+    return 200, {"found": bool(hops), "length": max(0, len(hops) - 1),
+                 "path": path}
+
+
+def _trash(store: MemoryStore, m, q, b):
+    mid = _require(b, "memory_id")
+    trashed = store.trash(mid)
+    if not trashed:
+        raise HttpError(404, "memory not found")
+    return 200, {"trashed": True, "id": mid}
+
+
+def _trash_list(store: MemoryStore, m, q, b):
+    return 200, {"entries": [
+        {"memory_id": e.memory_id, "deleted_at": e.deleted_at,
+         "actor": e.actor, "text": (e.memory.get("text") or "")[:200]}
+        for e in store.trash_list()
+    ]}
+
+
+def _trash_restore(store: MemoryStore, m, q, b):
+    mem = store.trash_restore(_require(b, "memory_id"))
+    if mem is None:
+        raise HttpError(404, "not in the trash")
+    return 200, _mem_dict(mem)
+
+
+def _trash_purge(store: MemoryStore, m, q, b):
+    """Drop one entry, apply a retention cutoff, or empty the trash.
+
+    ``older_than_days`` is honoured here rather than ignored: read as a plain
+    "no memory_id" request it would fall through to emptying the *whole* trash,
+    so a client asking to reclaim month-old entries would irreversibly destroy
+    every recoverable memory instead. The Go port and the MCP tool both take
+    the two arguments, and both refuse them together.
+    """
+    memory_id = b.get("memory_id") or None
+    older_than = _body_float(b, "older_than_days")
+    if memory_id is not None and older_than is not None:
+        raise HttpError(400,
+                        "pass either memory_id or older_than_days, not both")
+    if older_than is not None:
+        return 200, {"purged": store.trash_purge_expired(older_than)}
+    return 200, {"purged": store.trash_purge(memory_id)}
+
+
 Route = tuple[str, "re.Pattern[str]", Callable, bool]  # method, pat, fn, needs_body
 
 _ROUTES: list[Route] = [
@@ -643,7 +960,25 @@ _ROUTES: list[Route] = [
     ("POST",   re.compile(r"^/links$"),                          _link,        True),
     ("POST",   re.compile(r"^/unlink$"),                         _unlink,      True),
     ("POST",   re.compile(r"^/supersede$"),                      _supersede,   True),
+    ("POST",   re.compile(r"^/restore$"),                        _restore,     True),
     ("POST",   re.compile(r"^/conflicts$"),                      _conflicts,   True),
+    ("POST",   re.compile(r"^/subgraph$"),                       _subgraph,    True),
+    ("POST",   re.compile(r"^/undo$"),                           _undo,        True),
+    ("POST",   re.compile(r"^/nuke$"),                           _nuke,        True),
+    ("GET",    re.compile(r"^/journal$"),                        _journal,     False),
+    ("POST",   re.compile(r"^/export$"),                         _export,      True),
+    ("POST",   re.compile(r"^/import$"),                         _import,      True),
+    ("POST",   re.compile(r"^/merge$"),                          _merge,       True),
+    ("GET",    re.compile(r"^/memories/(?P<id>[^/]+)/versions$"), _versions,   False),
+    ("GET",    re.compile(r"^/tags$"),                           _tags,        False),
+    ("POST",   re.compile(r"^/tags/rename$"),                    _rename_tag,  True),
+    ("POST",   re.compile(r"^/tags/merge$"),                     _merge_tags,  True),
+    ("DELETE", re.compile(r"^/tags/(?P<tag>[^/]+)$"),            _delete_tag,  False),
+    ("POST",   re.compile(r"^/find_path$"),                      _find_path,   True),
+    ("POST",   re.compile(r"^/trash$"),                          _trash,       True),
+    ("GET",    re.compile(r"^/trash$"),                          _trash_list,  False),
+    ("POST",   re.compile(r"^/trash/restore$"),                  _trash_restore, True),
+    ("POST",   re.compile(r"^/trash/purge$"),                    _trash_purge, True),
 ]
 
 _MAX_BODY = 4 * 1024 * 1024  # 4 MiB cap on request bodies
@@ -655,6 +990,10 @@ def build_handler(
     auth_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request-handler class bound to *store* and an optional token."""
+    # An empty token is a misconfiguration, not a credential: it would make
+    # every route "protected" by a forgeable bare "Bearer " header (and count
+    # as configured for the archive gate). Normalize it to no-auth.
+    auth_token = auth_token or None
 
     # ThreadingHTTPServer dispatches each request on its own thread, but
     # MemoryStore mutations (link/unlink/supersede and the access-count bump in
@@ -746,6 +1085,10 @@ def build_handler(
 
             if not self._authorized(path):
                 self._send(401, {"error": "unauthorized"})
+                return
+
+            if not _archive_route_allowed(path, auth_token):
+                self._send(403, {"error": _ARCHIVE_DENIED})
                 return
 
             # HEAD is GET without a body (_send suppresses it) — without this

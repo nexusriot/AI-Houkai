@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name            = "ai-houkai"
-version         = "0.16.0"
+version         = "0.21.0"
 description     = "Long-term memory system for AI agents — vector search, decay & reflection"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -22,20 +22,38 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-# Core deps — no LLM provider required for the memory layer itself
+# Core deps — no LLM provider and no torch required for the memory layer.
+# The default embedder is local sentence-transformers, but it lives in the
+# [local] extra: it pulls torch (~2 GB), which is too much to force on an
+# install that will point at a hosted embedder (ai_houkai.embed) or inject its
+# own embedding_function. `pip install "ai-houkai[local]"` for the batteries.
 dependencies = [
     "chromadb>=0.5.0",
-    "sentence-transformers>=2.7.0",
-    "mcp>=1.2.0",
+    # Upper-bounded deliberately: mcp 2.0.0 deleted `mcp.server.fastmcp` (the
+    # FastMCP server was renamed to `mcp.server.mcpserver`), so an unbounded
+    # floor makes every fresh install resolve to a version this code cannot
+    # import. Lift the cap in the same change that ports
+    # ai_houkai/mcp_server/server.py to the 2.x API. The floor is the version
+    # the suite actually runs against — FastMCP's API churned considerably
+    # across 1.x, and older floors claimed compatibility nobody verified.
+    "mcp>=1.28.1,<2",
+    # config.toml parsing. tomllib landed in the 3.11 stdlib; on 3.10 the
+    # config loader falls back to its backport, and the loader is reached from
+    # the MCP server as well as the CLI, so this belongs in the core deps.
+    "tomli>=2.0.1; python_version < '3.11'",
 ]
 
 
 [project.optional-dependencies]
+# pip install "ai-houkai[local]"  — local sentence-transformers embeddings
+local = ["sentence-transformers>=2.7.0"]
+
 # pip install "ai-houkai[claude]"
 claude = ["anthropic>=0.40.0"]
 
 # pip install "ai-houkai[openai]"
-# Also covers Ollama (uses the same openai client via the /v1 compat endpoint)
+# Only needed for the OpenAI *summarizer*; the OpenAI-compatible embedder in
+# ai_houkai.embed is stdlib-only and needs no SDK.
 openai = ["openai>=1.50.0"]
 
 # pip install "ai-houkai[cli]"
@@ -45,12 +63,31 @@ cli = ["typer>=0.12", "rich>=13.7"]
 tui = ["typer>=0.12", "rich>=13.7", "textual>=0.50"]
 
 # pip install "ai-houkai[all]"
-all = ["anthropic>=0.40.0", "openai>=1.50.0", "typer>=0.12", "rich>=13.7", "textual>=0.50"]
-
-# pip install "ai-houkai[dev]"
-dev = [
+all = [
+    "sentence-transformers>=2.7.0",
     "anthropic>=0.40.0",
     "openai>=1.50.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.50",
+]
+
+# pip install "ai-houkai[dev]"  — everything, including the local model
+dev = [
+    "sentence-transformers>=2.7.0",
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24",
+    "typer>=0.12",
+    "rich>=13.7",
+    "textual>=0.50",
+]
+
+# pip install "ai-houkai[test]"  — the FAST suite: no torch, no model download.
+# ai_houkai.testing.FakeEmbedder replaces the local model, so this is what CI
+# installs (see .github/workflows/ci.yml).
+test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24",
     "typer>=0.12",

@@ -1,11 +1,11 @@
 package memory
 
-// Standard relation vocabulary.
+// Standard relation vocabulary (the full validated set lives in
+// validate.go's LinkRels; only the rels the code writes get constants).
 const (
 	RelSupersedes  = "supersedes"
 	RelRefines     = "refines"
 	RelDerivedFrom = "derived_from"
-	RelExampleOf   = "example_of"
 	RelContradicts = "contradicts"
 	RelRelated     = "related"
 )

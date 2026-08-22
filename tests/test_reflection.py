@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from ai_houkai.memory_system import Memory, MemoryStore, ReflectionEngine
@@ -15,6 +17,7 @@ def _ep(store: MemoryStore, text: str, tags: list[str] | None = None,
 
 
 class TestClusters:
+    @pytest.mark.needs_model
     def test_similar_memories_cluster_together(self, store: MemoryStore):
         # These three are semantically very close
         _ep(store, "Deployed API v2.1 to production on Monday.")
@@ -69,6 +72,7 @@ class TestReflect:
         _ep(store, "Released API v2.3 to production environment.",
             tags=["deploy", "api"], importance=0.75)
 
+    @pytest.mark.needs_model
     def test_creates_semantic_memory(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         engine = ReflectionEngine(store, similarity_threshold=0.70,
@@ -104,6 +108,7 @@ class TestReflect:
         if created:
             assert created[0].importance == pytest.approx(0.7, abs=0.05)
 
+    @pytest.mark.needs_model
     def test_dry_run_does_not_write(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         count_before = store.count()
@@ -121,6 +126,7 @@ class TestReflect:
         for m in candidates:
             assert "dry-run" in (m.source or "")
 
+    @pytest.mark.needs_model
     def test_consolidate_soft_deletes_sources(self, store: MemoryStore):
         """consolidate=True soft-deletes sources (supersedes them, keeps in DB)."""
         self._seed_deployment_cluster(store)
@@ -142,6 +148,7 @@ class TestReflect:
         assert len(episodic_all) >= 1
         assert all(m.superseded_by != "" for m in episodic_all)
 
+    @pytest.mark.needs_model
     def test_second_reflect_skips_superseded_sources(self, store: MemoryStore):
         """A second consolidating reflect must not re-cluster sources that an
         earlier reflection already superseded — doing so would emit a duplicate
@@ -166,6 +173,7 @@ class TestReflect:
                      if "reflection" in m.tags]
         assert len(summaries) == 1, "a second reflect must not duplicate the summary"
 
+    @pytest.mark.needs_model
     def test_consolidate_hard_removes_sources(self, store: MemoryStore):
         """consolidate='hard' hard-deletes sources (old behaviour)."""
         self._seed_deployment_cluster(store)
@@ -188,6 +196,7 @@ class TestReflect:
             assert "reflection" in tags
             assert "deploy" in tags
 
+    @pytest.mark.needs_model
     def test_custom_summarizer_called(self, store: MemoryStore):
         self._seed_deployment_cluster(store)
         called_with: list[list[Memory]] = []
@@ -306,3 +315,77 @@ class TestPolarityClusterSeparation:
             assert not {-1, 1} <= polarities, (
                 "cluster merged explicitly opposite polarities"
             )
+
+
+class TestExpiredSourcesAreNotConsolidated:
+    """An expired memory must not be folded into a summary.
+
+    A TTL means the content stops being available: recall, list and stats all
+    hide it, and `purge_expired` eventually reclaims it. Reflection reads the
+    collection directly, so without an expiry filter it clusters expired rows
+    and writes their text into a **fresh, non-expiring** semantic memory —
+    resurrecting permanently what the caller asked to have a lifetime. Same
+    laundering shape as the trust rule: a summary must not grant its sources
+    more reach than they had.
+    """
+
+    @staticmethod
+    def _constant_embedder():
+        """Every text lands on one vector, so anything fetched clusters.
+
+        That isolates what this is about — which rows are *eligible* — from
+        embedding similarity, and keeps the test off the real model.
+        """
+        def emb(texts):
+            return [[1.0, 0.0] for _ in texts]
+        return emb
+
+    def _store(self, tmp_path, name):
+        return MemoryStore(path=str(tmp_path / "chroma"), collection=name,
+                           embedding_function=self._constant_embedder())
+
+    def test_an_expired_source_is_not_clustered(self, tmp_path):
+        store = self._store(tmp_path, "reflect_expiry")
+        try:
+            _ep(store, "the deploy runbook lives in ops")
+            store.remember("quarterly figures, embargoed", type="episodic",
+                           expires_at=time.time() - 1)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            # Only one live candidate remains, which is below min_cluster_size,
+            # so there is nothing to summarise at all.
+            assert engine.clusters() == []
+            assert engine.reflect() == []
+        finally:
+            store.client.close()
+
+    def test_expired_text_never_reaches_a_summary(self, tmp_path):
+        store = self._store(tmp_path, "reflect_expiry_text")
+        try:
+            for i in range(3):
+                _ep(store, f"live note number {i}")
+            store.remember("EMBARGOED do not resurrect", type="episodic",
+                           expires_at=time.time() - 1)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            created = engine.reflect()
+            assert created, "the three live notes should still summarise"
+            assert not any("EMBARGOED" in m.text for m in created)
+        finally:
+            store.client.close()
+
+    def test_a_live_ttl_is_still_eligible(self, tmp_path):
+        """Only *lapsed* rows are excluded — a future deadline is still live."""
+        store = self._store(tmp_path, "reflect_ttl_live")
+        try:
+            _ep(store, "first live note")
+            store.remember("second note, expires much later", type="episodic",
+                           expires_at=time.time() + 3600)
+
+            engine = ReflectionEngine(store, similarity_threshold=0.5,
+                                      min_cluster_size=2)
+            assert len(engine.clusters()) == 1
+        finally:
+            store.client.close()

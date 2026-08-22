@@ -11,10 +11,8 @@
 # This file is marked as a conffile in the Debian package: dpkg will not
 # silently overwrite local edits on upgrade.
 
-# ---------------------------------------------------------------------------
-# Storage
-# ---------------------------------------------------------------------------
-
+# Storage.
+#
 # store_path is intentionally left commented out so each user's data lives
 # under their own home directory ($HOME/.ai_houkai/.chroma). Uncomment to
 # force a single shared location for all users on this host.
@@ -23,9 +21,7 @@
 
 collection         = "ai_houkai"
 
-# ---------------------------------------------------------------------------
-# Defaults applied when callers omit the field
-# ---------------------------------------------------------------------------
+# Defaults applied when callers omit the field.
 
 default_type       = "episodic"
 
@@ -35,10 +31,8 @@ default_type       = "episodic"
 # AI_HOUKAI_AUTO_IMPORTANCE=1.
 default_importance = 0.5
 
-# ---------------------------------------------------------------------------
-# Reflection summarizer
-# ---------------------------------------------------------------------------
-
+# Reflection summarizer.
+#
 # How `houkai reflect` / maintenance condense a memory cluster into one
 # summary. Empty = built-in extractive (no LLM). Or "provider:model":
 #   summarizer = "ollama:llama3.1"             local, honours OLLAMA_BASE_URL
@@ -48,10 +42,8 @@ default_importance = 0.5
 # Env override: AI_HOUKAI_SUMMARIZER.
 # summarizer = ""
 
-# ---------------------------------------------------------------------------
-# Embedding backend
-# ---------------------------------------------------------------------------
-
+# Embedding backend.
+#
 # Provider: "ollama" (local, default), "openai" (cloud), or "digitalocean"
 # (cloud, DO Gradient Serverless Inference — wire-compatible with OpenAI).
 embed_provider = "ollama"
@@ -63,23 +55,21 @@ embed_provider = "ollama"
 #   qwen3-embedding-0.6b    → 1024
 embed_dim      = 384
 
-# --- Ollama (used when embed_provider = "ollama") --------------------------
+# Ollama (used when embed_provider = "ollama").
 ollama_url   = "http://localhost:11434"
 ollama_model = "all-minilm"
 
-# --- OpenAI (used when embed_provider = "openai") --------------------------
+# OpenAI (used when embed_provider = "openai").
 # Prefer OPENAI_API_KEY env var; uncomment to hard-code (not recommended).
 # openai_api_key = ""
 openai_model     = "text-embedding-3-small"
 
-# --- DigitalOcean (used when embed_provider = "digitalocean") --------------
+# DigitalOcean (used when embed_provider = "digitalocean").
 # Prefer DIGITALOCEAN_TOKEN env var; uncomment to hard-code (not recommended).
 # do_api_key = ""
 do_model = "qwen3-embedding-0.6b"
 
-# ---------------------------------------------------------------------------
-# CLI behaviour
-# ---------------------------------------------------------------------------
-
+# CLI behaviour.
+#
 # Editor used by `houkai edit`. Empty = honour $EDITOR, then fall back to nano.
 editor = ""

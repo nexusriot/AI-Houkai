@@ -14,7 +14,8 @@ func newPackCmd() *cobra.Command {
 	var budget, maxItems, compressMinGroup int
 	var memType, tag, mode, header, format, source, since, until string
 	var minImp, compressThreshold float32
-	var inclSup, compress bool
+	var inclSup, compress, includePinned bool
+	var minTrust string
 
 	cmd := &cobra.Command{
 		Use:   "pack <query>",
@@ -43,6 +44,8 @@ prompt); a one-line summary goes to stderr.`,
 				Mode:              memory.RecallMode(mode),
 				MaxItems:          maxItems,
 				IncludeSuperseded: inclSup,
+				IncludePinned:     includePinned,
+				MinTrust:          memory.TrustLevel(minTrust),
 				Header:            &header,
 				Source:            source,
 				Since:             sinceTS,
@@ -125,6 +128,10 @@ prompt); a one-line summary goes to stderr.`,
 	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
 	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
 	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
+	cmd.Flags().BoolVar(&includePinned, "include-pinned", false,
+		"Prepend pinned memories whether or not they match the query")
+	cmd.Flags().StringVar(&minTrust, "min-trust", "",
+		"trusted|reported|untrusted — keep only memories at least this trusted")
 	cmd.Flags().BoolVar(&compress, "compress", false, "Fold budget-dropped, similar memories into compressed summary lines")
 	cmd.Flags().Float32Var(&compressThreshold, "compress-threshold", 0.30, "Jaccard similarity for compression clustering")
 	cmd.Flags().IntVar(&compressMinGroup, "compress-min-group", 2, "Minimum cluster size to compress")

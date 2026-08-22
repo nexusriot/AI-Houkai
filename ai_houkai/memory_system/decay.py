@@ -110,6 +110,13 @@ class DecayEngine:
         """
         Remove memories whose score has dropped below min_score.
 
+        Pruned memories go to the **trash**, not to ``forget``: decay is a
+        heuristic driven by tunable constants, and a mis-set ``min_score`` used
+        to destroy data with no way back. They leave the live store either way —
+        recall, list and stats stop seeing them — but stay restorable until the
+        trash retention window closes (see
+        :meth:`MemoryStore.trash_purge_expired`).
+
         Parameters
         dry_run
             If True, return candidates without deleting anything.
@@ -127,9 +134,19 @@ class DecayEngine:
             for mem, score in self.score_all(t):
                 if mem.type in self.protect_types:
                     continue
+                # A pinned memory is a standing instruction: decay must not
+                # reach it however stale it looks. Without this the only way to
+                # protect one is to inflate its importance, which distorts
+                # every search it appears in.
+                if mem.pinned:
+                    continue
                 if score < self.min_score:
-                    if not dry_run:
-                        self.store.forget(mem.id)
+                    # Only report what actually left. A row can vanish between
+                    # score_all and here, and the return value is both the
+                    # caller's audit trail and what the scheduler adds to its
+                    # cumulative total.
+                    if not dry_run and not self.store.trash(mem.id):
+                        continue
                     pruned.append(mem)
 
         return pruned

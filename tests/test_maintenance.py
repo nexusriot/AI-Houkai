@@ -438,6 +438,7 @@ class TestReflectScheduleGating:
             store.remember(f"Python is great number {i}",
                            type="episodic", importance=0.5)
 
+    @pytest.mark.needs_model
     def test_dry_run_advances_schedule(self, store, tmp_path):
         self._add_cluster(store)
         sched = self._sched(store, tmp_path, reflect_apply=False)
@@ -460,6 +461,7 @@ class TestReflectScheduleGating:
         self._sched(store, tmp_path, reflect_apply=False).tick()
         assert store.count() == before
 
+    @pytest.mark.needs_model
     def test_apply_counts_totals(self, store, tmp_path):
         self._add_cluster(store)
         result = self._sched(store, tmp_path, reflect_apply=True).tick()
@@ -579,6 +581,7 @@ class TestSchedulerConsolidate:
     def test_default_is_soft_consolidation(self, store, tmp_path):
         assert self._sched(store, tmp_path).reflect_consolidate is True
 
+    @pytest.mark.needs_model
     def test_scheduled_apply_does_not_duplicate_summaries(self, store, tmp_path):
         for day in ("Monday", "Tuesday", "Wednesday"):
             store.remember(f"Deployed the billing service to production on {day}.",

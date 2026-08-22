@@ -118,13 +118,10 @@ def stats(
         print(json.dumps(data, indent=2))
         return
 
-    try:
-        console = Console()
-        _render_basic(console, data, store_path, active, superseded, type_counts, tag_counts, store_size)
-        if health:
-            _render_health(console, data["health"])
-    except ImportError:
-        print(json.dumps(data, indent=2))
+    console = Console()
+    _render_basic(console, data, store_path, active, superseded, type_counts, tag_counts, store_size)
+    if health:
+        _render_health(console, data["health"])
 
 
 def _compute_health(

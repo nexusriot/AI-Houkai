@@ -1,9 +1,11 @@
 # AI-Houkai — Architecture & Design
 
 > This document covers the **Python** implementation (`ai_houkai/`). The Go
-> port under `go/` has the same feature surface (23 MCP tools, identical
-> `.ahkai` format and journal line format) but its own internals — see
-> [go/DESIGN.md](../go/DESIGN.md).
+> port under `go/` has the same remote surface (41 MCP tools, 41 HTTP routes,
+> identical `.ahkai` format and journal line format) but its own internals — see
+> [go/DESIGN.md](../go/DESIGN.md). Parity is not a claim, it is asserted:
+> [`parity.json`](../parity.json) is the single source of truth and both ports
+> check themselves against it (§23).
 
 ## Table of Contents
 
@@ -29,6 +31,12 @@
 20. [HTTP / REST API](#20-http--rest-api)
 21. [Memory Expiry (TTL)](#21-memory-expiry-ttl)
 22. [Runtime Metrics](#22-runtime-metrics)
+23. [Port Parity](#23-port-parity)
+24. [Pluggable Embedding Backends](#24-pluggable-embedding-backends)
+25. [Full-Corpus Lexical Recall](#25-full-corpus-lexical-recall)
+26. [Curation & Trash](#26-curation--trash)
+27. [Working Set: Pinned, Trust, Idempotent](#27-working-set-pinned-trust-idempotent)
+28. [Retrieval Evaluation](#28-retrieval-evaluation)
 
 ---
 
@@ -132,7 +140,7 @@ ai_houkai/                        pip package name: ai-houkai
 │   └── daemon.py                 PID file helpers + spawn_detached
 ├── mcp_server/
 │   ├── __init__.py
-│   └── server.py                 FastMCP server — 23 tools
+│   └── server.py                 FastMCP server — 41 tools
 ├── http_server/
 │   ├── __init__.py
 │   └── server.py                 stdlib JSON HTTP/REST server (houkai serve)
@@ -571,7 +579,7 @@ semantic "summary" memory.
 ### Algorithm
 
 ```
-1. Fetch all episodic memories from ChromaDB (with stored embeddings).
+1. Fetch candidates of the configured types from ChromaDB (with embeddings).
 2. Sort by importance descending — highest importance seeds first.
 3. Greedy single-linkage clustering:
       for each unseeded memory (highest importance first):
@@ -579,13 +587,48 @@ semantic "summary" memory.
           absorb every other unseeded memory whose cosine
           similarity to the seed ≥ similarity_threshold
 4. Discard clusters with fewer than min_cluster_size members.
-5. For each qualifying cluster:
+5. Skip any cluster whose members are already at max_level.
+6. For each qualifying cluster:
       text       = summarizer(cluster_members)
-      tags       = ["reflection"] + union of all source tags
+      tags       = ["reflection", "level:N"] + union of source tags
       importance = mean(source importances)
+      trust      = worst trust among the sources
       store new semantic memory  →  MemoryStore.remember()
-6. If consolidate=True: delete all source episodic memories.
+7. consolidate: none = leave sources; soft = supersede them;
+   hard = delete them.
 ```
+
+### What gets clustered, and how deep
+
+`types` was hard-coded to `("episodic",)`, which had two consequences. Semantic
+memories — **including reflections themselves** — never consolidated, so a
+long-lived store accumulated summaries without bound; and `feedback` /
+`procedural` never benefited at all. It is now a parameter, defaulting to
+`("episodic",)` so existing behaviour is unchanged.
+
+Letting reflections re-cluster raises the opposite risk: a summary of summaries
+of summaries, eating the store. Each summary is tagged `level:N` and a cluster
+whose members already sit at `max_level` is skipped. `max_level=1` (the default)
+reproduces the old behaviour — summaries are produced but never re-summarised —
+and raising it builds a deliberate tier hierarchy.
+
+A summary inherits the **worst** trust among its sources: reflecting over
+content the agent did not author would otherwise launder it into a `trusted`
+memory that `min_trust="trusted"` happily returns (§27). It is born `pinned`
+only when `consolidate` removes the sources from the working set — see §27.
+
+Candidates are filtered before clustering, and the reasons rhyme. A
+**superseded** row was already consolidated, so re-clustering it would emit a
+duplicate summary every run. A **lapsed** row (§21) is hidden from recall and
+waiting for `purge_expired`; folding it in would copy its text into a fresh
+summary carrying no TTL of its own, turning a deliberate lifetime into a
+permanent row. In both cases a summary must not grant its sources more reach
+than they had — the same rule as the trust inheritance above.
+
+**Known limitation.** `_cluster` is O(n²) over a pure-Python `_cosine`: fine at
+a thousand memories, painful at twenty thousand. The cheap mitigation, if it
+ever bites, is to cluster within a vector-index candidate pool rather than the
+full cross-product.
 
 ### Clustering properties
 
@@ -669,12 +712,15 @@ from ai_houkai.memory_system import MemoryStore, ReflectionEngine
 engine = ReflectionEngine(store,
                           similarity_threshold=0.75,
                           min_cluster_size=2,
-                          summarizer=None)
+                          summarizer=None,
+                          types=("episodic",),   # what to cluster
+                          max_level=1)           # tiers of reflection-of-reflection
 
 clusters = engine.clusters()              # list[list[Memory]], no writes
 previews = engine.reflect(dry_run=True)   # list[Memory], not persisted
-created  = engine.reflect()               # persist semantic memories
-created  = engine.reflect(consolidate=True)  # + delete source episodics
+created  = engine.reflect()               # persist summaries, sources untouched
+created  = engine.reflect(consolidate=True)   # + supersede the sources
+created  = engine.reflect(consolidate="hard") # + delete the sources
 ```
 
 ### ChromaDB numpy array guard
@@ -729,7 +775,7 @@ embs = [] if raw is None else raw   # safe for numpy arrays
 
 | Tool | Key parameters | Returns |
 |---|---|---|
-| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, ran_purge, decayed, reflected, purged, reflect_applied, decay_error, reflect_error, purge_error}` |
+| `maintenance_tick` | `reflect_apply?` (omit → config `[maintenance.reflect] apply`) | `{summary, ran_decay, ran_reflect, ran_purge, decayed, reflected, purged, trash_purged, reflect_applied, decay_error, reflect_error, purge_error}` |
 | `journal_tail` | `n?`, `op?`, `since_seconds?` | `list[{ts,op,actor,id,summary,meta}]` (newest first) |
 | `history` | `memory_id` | `list[{ts,op,actor,id,before,after,meta,summary}]` — full timeline, oldest first (§18) |
 | `state_at` | `ts` | `{ts, count, memories:[…]}` — store reconstructed as of `ts` (§18) |
@@ -915,8 +961,10 @@ class ClaudeCodeInstaller:
 - **Atomic writes**: direct config edits go through write-to-temp +
   `os.replace` (`common.write_json`) so a crash can never truncate the
   user's client config.
-- **Unparseable config**: by default replaces a corrupted JSON file
-  rather than aborting (toggle with `overwrite_unparseable=False`).
+- **Unparseable config**: refuses and reports by default — treating garbage
+  as `{}` would replace the user's whole client config with just our server
+  block. `overwrite_unparseable=True` opts into replacing it, after parking
+  a `.bak` copy of the original.
 - **No import side effects**: the MCP server module creates its store
   lazily (`get_store()`, on first tool use), so importing the installers —
   or `ai_houkai.mcp_server.server` itself — never materialises a stray
@@ -1010,7 +1058,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 831 tests across 34 files
+### 1232 tests across 45 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -1019,19 +1067,19 @@ LLM API  ──►  assistant reply to user
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
 | `test_pack.py` | 54 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
-| `test_validation.py` | 44 | Shared validation layer: store enum vocabularies, dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
+| `test_validation.py` | 46 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
-| `test_conflicts.py` | 36 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic |
+| `test_conflicts.py` | 39 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic, and that a **lapsed** candidate never clashes with a new write |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
-| `test_reflection.py` | 24 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded sources, polarity-cluster separation |
-| `test_async_store.py` | 24 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose |
+| `test_reflection.py` | 27 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded **and lapsed** sources, polarity-cluster separation |
+| `test_async_store.py` | 51 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose, plus a mechanical signature check — walking the MRO, so the twelve curation methods inherited from `CurationMixin` are covered too — so a wrapper cannot quietly drop a parameter the sync method gained |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
 | `test_journal.py` | 22 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
-| `test_ingest.py` | 22 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips |
+| `test_ingest.py` | 26 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips, and that splitting a long paragraph never loses a short fragment to the noise filter |
 | `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
 | `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
-| `test_decay.py` | 20 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store), recall reinforcement (`frequency_weight`) |
+| `test_decay.py` | 26 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store, routing to the trash, and not counting a row whose removal failed), recall reinforcement (`frequency_weight`) |
 | `test_remember_many.py` | 20 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
 | `test_mcp_server.py` | 22 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
@@ -1040,6 +1088,7 @@ LLM API  ──►  assistant reply to user
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
 | `test_installers.py` | 14 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
 | `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
+| `test_trust.py` | 13 | **Provenance trust** rules: `worst_trust` takes the worst case (so a derived memory cannot launder its sources), `trust_rank` separates an *absent* level — old rows, which read as trusted — from an *unrecognised* one, which fails safe as least-trusted so a hand-edited or future-version row is filtered out rather than crashing a `min_trust` recall (ranked pool and the `include_pinned` lane alike) |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_doctor.py` | 11 | **Diagnostics**: `probe_embedding`/`readiness` (incl. embedder-failure, cache TTL, no-cache-on-failure), `GET /ready` (200/503, auth-exempt, sanitized body), `houkai doctor` CLI (text + `--json`) |
 | `test_history.py` | 10 | **History / point-in-time**: `history()` timeline (incl. link/supersede counterparts), `state_at` / `get_at` replay, nuke reset, link-delta replay |
@@ -1047,7 +1096,37 @@ LLM API  ──►  assistant reply to user
 | `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 | `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
 | `test_metrics.py` | 7 | **Runtime metrics**: op counters (incl. link/unlink/restore/purge mutators), recall-latency recording + p50/p95/p99 percentiles, empty-recall counting, backend count |
+| `test_curation.py` | 49 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
+| `test_corpus_lexical.py` | 17 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, the merged pool keeping its embeddings so MMR/dedup still apply, and the Chroma-native `purge_expired` range query |
+| `test_working_set.py` | 36 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
+| `test_mcp_retrieval_knobs.py` | 35 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour |
+| `test_embed.py` | 31 | **Pluggable embedder**: OpenAI-compatible + Ollama backends against a stub server (auth, batching, out-of-order reindexing, count mismatch, wrapped errors), `build_embedder` spec grammar, credentials never from the spec, the store seam + env var + precedence, `FakeEmbedder` determinism/normalisation, and a full store round-trip with no model |
+| `test_eval_wiring.py` | 23 | Gold-set parsing (comments, malformed lines, id-prefix resolution, unresolvable id is an error not a zero score), `houkai eval` scores + recorded config + read-only guarantee, the `eval_recall` MCP tool |
+| `test_surface_coverage.py` | 23 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands |
+| `test_code_style.py` | 31 | House rules enforced mechanically: no banner comments (trailing rules **and** dash-bookended labels, across .py/.go/.sh/.yml/.toml/Makefile/Dockerfile), no import below module top, plus the detectors' own discrimination cases |
+| `test_public_get.py` | 9 | `MemoryStore.get()` as public API: plain read (no touch, no journal), returns superseded/expired, async wrapper, deprecated `_get_by_id` alias, MCP `get` tool |
+| `test_parity.py` | 8 | The Python surface matches `parity.json` — MCP tool list, HTTP routes, recall knobs — and every tool/route appears in its module docstring |
 | `test_fd_hygiene.py` | 1 | ChromaDB file-descriptor reclamation across many store open/close cycles |
+
+### The embedder seam and the fast suite
+
+Most of the suite runs against `ai_houkai.testing.FakeEmbedder`, which hashes
+text into a deterministic unit vector. An autouse `conftest.py` fixture patches
+`local_embedder` — the single place the store resolves its default — so *every*
+store built during a test inherits it: the MCP server's lazy store, CLI runs
+under `CliRunner`, the HTTP fixtures, and direct constructions alike.
+
+Exactly **29 tests** are marked `needs_model` and opt back into real
+sentence-transformers, because their assertions depend on genuine semantic
+similarity: conflict thresholds, reflection clustering, and ranking quality.
+Everything else is testing plumbing, where hash vectors are indistinguishable
+from real ones. Re-derive the marker set with
+`AI_HOUKAI_TEST_REAL_EMBEDDER=1 pytest tests/ -q` — whatever fails needs the
+marker.
+
+This is what makes CI viable: the fast job installs the `[test]` extra, which
+deliberately omits `sentence-transformers`, and asserts the module is absent so
+the promise cannot rot.
 
 ### Test isolation strategy
 
@@ -1144,6 +1223,8 @@ Pass `include_superseded=True` to see them.
 ```
 candidates(a) = recall(a.text, n=12)
 for b in candidates:
+    if b.superseded_by             → skip
+    if b has lapsed (expires_at)   → skip
     if b.type != a.type            → skip
     if sim(a,b) < threshold        → skip   (default 0.80)
     if both have tags & disjoint   → skip   (an untagged side never triggers
@@ -1157,6 +1238,12 @@ for b in candidates:
 
 `negation_diff`: strips apostrophes, tokenises, counts negation words
 (`not`, `never`, `no`, `dont`, …), returns True if parity differs.
+
+Superseded and **lapsed** candidates are skipped for the same reason
+`find_by_content_hash` skips them: they are hidden from recall, list and stats,
+so letting one clash with a new write would reject it under
+`on_conflict="raise"` with a conflict the caller cannot see or resolve — and
+under `"supersede"` would re-label a row that is already on its way out.
 
 ### on_conflict policies
 
@@ -1240,9 +1327,12 @@ when the pool has no internal edges.
 
 > **Scope.** Like the other `HybridWeights` terms, `graph` only takes effect in
 > `mode="hybrid"` — a default `semantic` recall ignores custom weights. And both
-> `graph` and `ExpandSpec.rerank` are currently reachable only through the
-> `recall(weights=…, expand=…)` **library API** (Python and Go), not the CLI,
-> HTTP, or MCP surface — exposing the knobs there is a Roadmap follow-up.
+> `graph` and `ExpandSpec.rerank` are reachable from every surface: the
+> library, `POST /recall` / `POST /recall_pack` (a `graph` field and a nested
+> `expand` object), and the MCP `recall` / `recall_pack` tools (a `graph`
+> number plus flat `expand_*` parameters — MCP tool schemas are flat, so the
+> nested object is spelled one parameter per field). `parity.json` asserts the
+> full knob list against both ports (§23).
 
 #### Gated graph expansion (`ExpandSpec.rerank`)
 
@@ -1333,6 +1423,8 @@ store.recall(query, k, reranker=my_cross_encoder)        # second-stage rerank
 store.recall(query, k, include_expired=True)             # keep TTL-expired hits
 store.recall(query, k, mode="hybrid",
              weights=HybridWeights(graph=0.15))          # graph-proximity fusion
+store.recall(query, k, mode="hybrid", lexical_index="corpus") # full-corpus lexical (§25)
+store.recall(query, k, min_trust="trusted")              # provenance floor (§27)
 
 # Graph-walk expansion after scoring (multi-hop BFS)
 store.recall(query, k,
@@ -1560,10 +1652,10 @@ friendly install hint if the extras are absent.
 
 ```
 houkai (bin)
-  └── ai_houkai/cli/main.py          Typer app; registers 30 commands plus
-                                     three sub-command groups (maintenance,
-                                     journal, collections); shared
-                                     --store / --collection flags
+  └── ai_houkai/cli/main.py          Typer app; registers 39 commands plus
+                                     five sub-command groups (maintenance,
+                                     journal, collections, tags, trash);
+                                     shared --store / --collection flags
         ├── config.py                Config resolution chain:
         │                             1. --store / --collection CLI flags
         │                             2. AI_HOUKAI_PATH / AI_HOUKAI_COLLECTION env
@@ -1720,6 +1812,14 @@ files load unchanged). It is safe to run always-on: expired memories are a new
 concept, so an existing store has none, and the job only ever deletes memories
 whose TTL has already passed.
 
+**Trash retention rides the same job**: after a successful purge the tick calls
+`trash_purge_expired(trash_ttl_days)` (§26, default 30; `<= 0` disables it) and
+accumulates `total_trash_purged`. This matters more now that decay pruning
+routes into the trash — without retention the file would grow with every prune.
+Both ports report the sweep as `trash_purged` on the tick result and in the
+one-line summary; the Go port reads it from `trash_ttl_days` in
+`[maintenance]`.
+
 **Concurrent tickers serialise.** The whole load→run→save cycle holds an
 exclusive `flock` on `<state file>.lock`, so the daemon loop, a cron tick,
 and the MCP tool can share one state file without double-running a job or
@@ -1788,6 +1888,11 @@ One compact JSON object per line:
 - **Size-based rotation** — file size is checked every 256 appends;
   beyond `rotate_mb` (64 MB) the log is gzipped to a timestamped archive,
   and archives older than `keep_days` (90) are pruned.
+- **Crash-safe rotation** — the active file is renamed first (atomic), then
+  compressed through a temp name: a crash can never destroy entries appended
+  mid-rotation or leave a truncated file under the archive name. Reads prefer
+  a plain rotated `.log` over a same-stem `.log.gz` (no double-count) and
+  tolerate truncated archives instead of failing the whole scan.
 
 ### Undo
 
@@ -1858,6 +1963,10 @@ options) followed by one memory per line.
 
 - **Conflict policies** on id collision: `skip` (default) ·
   `overwrite` · `rename` (new UUID) · `error`.
+- **Rename re-points references**: after a rename, every other imported
+  row's `links` / `superseded_by` that named the old id is rewritten to the
+  new UUID (journalled as edits) — left alone they would silently point at
+  the unrelated pre-existing memory that caused the collision.
 - **Model safety**: if the archive's embedding model differs from the
   importing store's, the import raises unless
   `regenerate_vectors=True`, which re-embeds text on the way in.
@@ -2047,3 +2156,328 @@ long-running server, not a durable analytics store. In the Go port it is
 guarded by a mutex since handlers run concurrently; in Python the HTTP server's
 `store_lock` already serialises access. Exposed as the `metrics` MCP tool and
 `GET /metrics`.
+
+---
+
+## 23. Port Parity
+
+The Python and Go ports are expected to expose the same remote surface. That
+was previously an aspiration checked by hand, and it drifted: the Python MCP
+`recall` silently fell five ranking knobs behind the Go one (`fusion`,
+`diversity`, `dedup_threshold`, `min_cosine`, `touch`) and nothing noticed,
+because nothing compared them.
+
+[`parity.json`](../parity.json) at the repo root is now the single source of
+truth for the MCP tool list, the HTTP routes and the recall knobs. Each port
+asserts against it **in its own suite**:
+
+| Port | Assertion |
+|---|---|
+| Python | `tests/test_parity.py` — introspects `mcp.list_tools()` and the `_ROUTES` table |
+| Go | `go/internal/parity/` — calls `tools/list` over the real JSON-RPC handler, and probes each route through `httptest` |
+
+Neither CI job needs the other toolchain, so a surface added to one side fails
+that side's build. The manifest lists are kept sorted and unique (itself
+asserted), which keeps diffs readable and duplicates impossible.
+
+The Python test additionally checks that every tool and route appears in its
+module's docstring inventory — the docstring is the thing agents and readers
+actually see, and it had already drifted (`POST /memories/batch` was missing).
+
+**CLI commands are deliberately not asserted.** The two CLIs legitimately
+differ — Python ships installers as console scripts, Go has `houkai install`
+and `houkai config` — so an equality assertion there would encode a false
+claim. Parity is asserted exactly where it is real.
+
+---
+
+## 24. Pluggable Embedding Backends
+
+`MemoryStore` previously hard-wired `SentenceTransformerEmbeddingFunction` with
+no override, which made `sentence-transformers` (and therefore torch, ~2 GB
+installed) a mandatory dependency. That cost more than disk: no hosted
+embedder was reachable from Python at all, and every test had to load a real
+model — the Go port's suite ran in under a second because its embedder was
+injectable, while Python's took nearly six minutes.
+
+Resolution order, most explicit first:
+
+```
+1. embedding_function=          an injected callable
+2. AI_HOUKAI_EMBEDDER=          "provider:model" from the environment
+3. embedding_model=             the local sentence-transformers default
+```
+
+`ai_houkai/embed.py` supplies stdlib-only backends — `OpenAICompatibleEmbedder`
+(OpenAI, DigitalOcean, vLLM, llama.cpp's compat server, Ollama's `/v1`) and
+`OllamaEmbedder` (the native `/api/embed`) — using `urllib`, so no SDK is
+required. `local_embedder()` moved here from `store.py`; `_get_embed_fn`
+remains as an alias.
+
+### The Chroma adapter
+
+Chroma's collection API needs more than a callable: the query path calls
+`embed_query`, and the config serialiser reads `name()` (**as a staticmethod**)
+plus `is_legacy`/`get_config`. Rather than force every caller to subclass
+Chroma's Protocol, `as_chroma_embedding_function()` wraps anything that does not
+already satisfy it, so `embedding_function=lambda texts: …` just works.
+
+The provider classes deliberately do **not** subclass Chroma's
+`EmbeddingFunction`: its `__init_subclass__` rewrites `__call__` to normalise
+and validate into numpy arrays, which changes their return type and rejects an
+empty batch. They stay plain callables; the adapter provides the protocol at
+the boundary. `store._embed_fn` holds the *unwrapped* callable so diagnostics
+see plain lists, and `store.embedder_name` reports the backend actually in use
+— reading a stale `embedding_model` off a healthy-looking `doctor` is exactly
+how an embedder swap goes unnoticed until rankings degrade.
+
+### Packaging consequence
+
+`sentence-transformers` moved from the core dependencies into a `[local]`
+extra. `pip install ai-houkai` no longer provides an embedder; `[local]`,
+`[all]` and `[dev]` do, and the new `[test]` extra deliberately omits it so the
+fast suite cannot silently regain a torch dependency (CI asserts the module is
+absent).
+
+---
+
+## 25. Full-Corpus Lexical Recall
+
+`_bm25_score_pool` scores lexical relevance only over the vector over-fetch
+pool. The pool is selected by embedding distance alone, so a memory carrying the
+query's exact tokens but embedding weakly never enters it — and therefore can
+never be surfaced by the BM25 term, at any corpus size.
+
+`recall(lexical_index="corpus")` closes that gap with Chroma's own
+`where_document={"$contains": token}` filter, which scans the collection
+server-side and works on the ranked query path. `_lexical_candidates` probes the
+four longest query tokens (longest = most selective, and each probe is a scan),
+skips tokens under three characters, and unions the resulting ids into the pool
+before scoring.
+
+Unioned candidates get their **real** cosine distance, computed against a
+freshly embedded query vector (Chroma does not return the vector it used).
+Fabricating one is wrong in both directions: a neutral value invents vector
+evidence the candidate never earned, and a worst-case value (−1 similarity ×
+the 0.55 cosine weight) buries it below anything the 0.20 lexical weight could
+recover, making the channel decorative. Metadata filters are applied during
+candidate selection, so a lexical hit obeys `type`/`source`/`importance`/date
+filters exactly as a vector hit does.
+
+Off by default (`"pool"`), because the scan is real: ~4.5 ms at 25k memories,
+growing linearly.
+
+### Why there is no second index
+
+Full-corpus lexical recall could instead be served by a SQLite metadata + FTS5
+index beside `.chroma`, promising five payoffs: full-corpus BM25, cursor
+pagination, O(1) reverse links, tag counts, and an indexed expiry sweep.
+Measurement ruled it out:
+
+| Operation | 3k rows | 25k rows |
+|---|---|---|
+| SQLite FTS lookup | 0.03 ms | 0.03 ms (flat — a real inverted index) |
+| Chroma `$contains` | 0.91 ms | 4.52 ms (linear) |
+| SQLite `list_recent(50)` | 3.24 ms | **13.86 ms** |
+| Chroma `get(limit=50)` | 2.03 ms | **3.72 ms** |
+
+Chroma does four of the five natively — and two of them *better*:
+
+- **Pagination** — `limit`/`offset`. Going through an index was ~4× slower,
+  because serving ids from it and then fetching them from Chroma is two
+  round-trips.
+- **Expiry sweep** — `where={"$and": [{"expires_at": {"$gt": 0}}, …]}`.
+  `purge_expired` pushes the range down instead of loading the collection.
+- **Type counts** — `where={"type": …}` with `include=[]`.
+- **Lexical reachability** — `where_document`, as above.
+
+What a linear scan gives up is the *flat* lookup curve: at 10⁶ memories it costs
+~180 ms where an inverted index stays at 0.03 ms. That is a real trade, made
+deliberately. Against paying for it: a second index is a second source of truth
+for data Chroma already holds, so it needs verify-on-open, disable-on-mismatch
+and rebuild machinery purely to keep a cache from lying; it duplicates the text;
+it is one database *per collection*, which in a multi-tenant deployment means N
+satellite files with N failure modes; and the primary consumer
+(`ai-houkai-service`) already runs its own WAL SQLite. Three SQLite databases in
+one stack — Chroma's, the service's, and one per collection — to save
+milliseconds on a path dominated by a 50–200 ms hosted embedding call.
+
+The remaining structural gap is reverse links: Chroma stores `links` as an
+opaque metadata string, so "who points at me?" is not expressible as a `where`
+clause and `neighbors(direction="in")` reads every memory, once per frontier
+node per hop. The fix is to denormalise the edge — record a→b on both sides —
+which needs no index at all. Tracked in [ROADMAP.md](ROADMAP.md).
+
+If a true inverted index is ever needed at scale, it belongs in the service's
+existing database where it can be shared across collections and maintained in
+one place, not as satellites the library manages behind Chroma's back.
+
+## 26. Curation & Trash
+
+These operations grew up in `ai-houkai-service`, which implemented them by
+reaching through the library's private API (`store._get_by_id`,
+`store._get_all_memories`, `store.collection.update`, `store._journal`). Every
+one is a store-level primitive that a downstream consumer cannot do correctly
+from outside, so they were graduated into `ai_houkai/memory_system/curation.py`
+and attach to `MemoryStore` as mixin methods.
+
+| Operation | Why it belongs in the store |
+|---|---|
+| `merge(target, other)` | Combines text, transfers outgoing links, and **re-points every incoming link** `x → other` at `x → target`. `forget` does not clean up incoming edges, so without this a merge silently strands every relationship pointing at the absorbed memory. Needs a reverse-link walk. |
+| `versions(id)` | Past text states recovered from the journal, including rotated archives. |
+| `list_tags` / `rename_tag` / `merge_tags` / `delete_tag` | There was no tag maintenance anywhere, yet `tag` is a first-class recall filter and tags accumulate typos permanently. |
+| `find_path(a, b)` | BFS over undirected links. The service's version carried a 2000-row cap that "silently returned wrong *no path* results on larger collections" — the class of bug that belongs behind a library API with a real index. |
+
+`_repoint_incoming` writes each source's link list directly rather than going
+through `unlink`+`link`: that path re-validates the rel vocabulary (rejecting a
+legacy custom rel outright) and costs two journal entries per edge. A
+pre-existing `new_dst → old_dst` edge is dropped rather than turned into a
+self-loop.
+
+### Trash
+
+The store jumped straight from `supersede` (soft, but semantically "replaced by
+X") to `forget` (irreversible); `restore` only undoes a supersede. Trash is the
+missing middle — a recoverable delete, parked in a gzipped JSONL file beside
+the store. **Decay pruning now routes here instead of hard-deleting**, so a
+mis-tuned `min_score` is no longer unrecoverable.
+
+Entries are **appended** one gzip member at a time rather than rewritten, so
+binning N memories costs O(N) — the read-all-rewrite-all version made a
+400-memory prune take 2.16 s against 0.12 s. Both ports' readers (and Python's
+`gzip` module) consume concatenated members transparently, so a file written by
+either is readable by the other. A member truncated by a crash mid-append is
+skipped on read (it surfaces at the gzip layer, not as bad JSON), keeping the
+rest of the trash recoverable.
+
+Entries are **scoped by collection**: the trash file sits beside the store
+path and is shared by every collection opened on it, so each entry records its
+collection and `trash_list` / `trash_restore` / `trash_purge*` only see their
+own (entries written before the field existed stay visible everywhere).
+`trash_restore` also refuses an id that is live again (an export→import can
+resurrect one — restoring over it would be silently ignored by the backend
+while the snapshot was destroyed), and with several entries for one id it
+restores the newest snapshot, leaving older ones recoverable. Mutations are
+serialized (both ports) by a process-wide mutex plus, on POSIX, an exclusive
+flock on a lock file beside the trash: the file is shared read-modify-write
+state, and two stores rewriting it concurrently would lose whichever rewrite
+landed first. A failure to take the flock fails the mutation rather than
+silently proceeding unlocked; without flock(2), cross-process sharing of one
+trash file is unsynchronized (documented limitation).
+
+`trash_purge_expired(ttl_days)` supplies retention, and the maintenance
+scheduler drives it on the same tick as the TTL purge (`trash_ttl_days`,
+default 30 days). Without it a recoverable delete is really a permanent
+archive and the file grows without bound. `ttl_days <= 0` is a **no-op** rather
+than "purge everything" — a misconfigured or unset retention must never be read
+as "delete it all". Surfaced as `houkai trash purge --older-than`,
+`older_than_days` on the `trash_purge` MCP tool, and `POST /trash/purge`.
+
+This is also why the library's trash is the one that survives when it is
+consumed by `ai-houkai-service`: the service's `trash` table had retention and
+cascade-on-collection-delete, and retention was the only one of those the
+library lacked. Cascade is implicit here, because the trash file lives beside
+the store it belongs to.
+
+---
+
+## 27. Working Set: Pinned, Trust, Idempotent
+
+Three write-time fields, each defaulting to the previous behaviour so old
+stores load unchanged.
+
+### `pinned`
+
+The only lever for "always consider this" was `importance`, which
+simultaneously drives ranking, decay survival and the `min_importance` filter —
+three jobs, one number. A pinned memory leads `recall_pack`/`auto_context`
+inside the token budget and is exempt from decay pruning, giving agents an
+explicit standing-instruction slot. (Quota eviction is a ROADMAP item, not a
+feature yet; when it lands, pinned rows are exempt there too.)
+
+The pin **follows a supersede onto the replacement**, and `restore` hands it
+back, and `merge` takes the **union** of the two sides' pins — `other` is
+deleted by the merge, so a pin that does not travel is destroyed outright.
+Reflection does the same when it consolidates: a summary of a pinned
+source is born pinned under `soft` (which supersedes the sources) and `hard`
+(which deletes them), but not under `none`, where the sources stay live and
+pinned and a second pinned row would double the slot. Superseding a standing instruction is how you correct one, and a
+superseded row is out of the working set — without the transfer the slot
+silently emptied and the agent stopped seeing the rule. `trust` is deliberately
+not inherited: both rows survive with their own provenance, unlike `merge`,
+which folds two into one and must take the worse label.
+
+### `trust`
+
+AI-Houkai writes straight into agent context via `recall_pack`/`auto_context`,
+so anything reaching `remember` — a scraped page, a tool result, another
+agent's output — becomes durable, well-ranked context later. `source` is
+free-text with no semantics and no filtering default.
+
+`trust` is `trusted` (default, so old stores are byte-identical) / `reported` /
+`untrusted`, set at ingest boundaries; `recall(min_trust=…)` filters and the
+packer annotates untrusted lines so the consuming model can see the provenance
+boundary. Best-effort labelling, not a security guarantee — the same framing as
+the PII item in the roadmap.
+
+### `idempotent`
+
+Agents re-assert the same fact every session. The only defence was
+`on_conflict="supersede"`, which costs a 12-neighbour vector query per write
+and still creates a new row plus a supersede edge. A normalised-text
+`content_hash` lets `remember(idempotent=True)` return the existing memory and
+bump its access count instead, which matters most in `remember_many` where the
+conflict scan is per item.
+
+The surfaces have to **say which happened**. A dedupe hit creates nothing, so
+`POST /memories` answers `200` with `stored: false` and the existing row (a new
+write stays `201`/`stored: true`), and the `remember` MCP tool returns the row
+with `stored: false`. Both ports reported every idempotent repeat as a fresh
+write, so a client replaying its batch each session was told it had stored N new
+rows when it had stored none — and the Go REST port went further and answered
+`409` with an *empty* conflict list, turning the feature into a hard error
+against a store that already knew the fact. `409` is now reserved for an actual
+conflict rejection, which always carries its conflicts.
+`MemoryStore.find_by_content_hash(text)` is the public form of the lookup, so a
+caller can also ask before writing.
+
+`remember_many` follows the same rule: `stored` counts the rows **created**, not
+the items submitted — 0 for a fully replayed batch (`POST /memories/batch` then
+answers `200`), and intra-batch duplicates count once because they collapse to
+one row. Every input still maps to an entry in `ids` / `memories`, with
+duplicates sharing an id.
+
+---
+
+## 28. Retrieval Evaluation
+
+`ai_houkai/eval.py` could score a ranking for months but was reachable from
+nothing — no CLI command, no MCP tool, no HTTP route, no Go port. The
+consequence was that every ranking constant in the project (graph damping 0.5
+and 3 iterations, the β=0.20 lexical weight, the MMR defaults, the `graph`
+weight itself) was set by intuition, with no way to tell whether a change
+helped.
+
+Now wired to:
+
+| Surface | Entry point |
+|---|---|
+| CLI | `houkai eval <goldset.jsonl>` with ranking flags + `--json` |
+| MCP | the read-only `eval_recall` tool |
+| Go | `go/internal/eval` + `houkai eval`, metric-for-metric with Python |
+
+Gold sets are JSONL — one case per line, `#` comments and blank lines skipped —
+to preserve the stdlib-only ethos. `relevant_ids` accepts 8-char prefixes so a
+set can be written by eye from `houkai list`; an **unresolvable id is an error,
+not a zero score**, because a typo would otherwise look exactly like a ranking
+regression.
+
+Recall runs with `touch=False` throughout (the Go adapter forces it), so
+evaluating never perturbs access-count or recency — otherwise a second run of
+the same gold set would score against a mutated store. The `--json` output
+records the configuration under test alongside the scores, so numbers from two
+runs are attributable.
+
+Metrics (binary relevance, each relevant id credited once so duplicates cannot
+inflate anything): recall@k · precision@k · MRR · MAP · nDCG@k. `k` is reported
+as `-1` when cases used mixed values.

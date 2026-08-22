@@ -28,6 +28,9 @@ WORKDIR /app
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # Install the package with cli (typer/rich → houkai) and dev (pytest) extras.
+# `dev` is what still carries sentence-transformers: it was moved out of the
+# core dependencies into the `local` extra, so a bare `pip install .` no longer
+# provides an embedder and these tests would fail at the first recall.
 COPY . .
 RUN pip install ".[cli,dev]"
 

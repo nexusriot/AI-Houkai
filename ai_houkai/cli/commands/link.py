@@ -79,19 +79,15 @@ def neighbors(
         print(json.dumps([{"id": m.id, "rel": r, "text": m.text} for m, r in results], indent=2))
         return
 
-    try:
-        console = Console()
-        table = Table(show_header=True, header_style="bold cyan")
-        table.add_column("REL", width=14)
-        table.add_column("ID", width=10)
-        table.add_column("TYPE", width=10)
-        table.add_column("TEXT")
-        for mem, r in results:
-            table.add_row(r, out.short_id(mem.id), mem.type, out._truncate(mem.text, 65))
-        console.print(table)
-    except ImportError:
-        for mem, r in results:
-            typer.echo(f"{r}\t{out.short_id(mem.id)}\t{mem.text[:60]}")
+    console = Console()
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("REL", width=14)
+    table.add_column("ID", width=10)
+    table.add_column("TYPE", width=10)
+    table.add_column("TEXT")
+    for mem, r in results:
+        table.add_row(r, out.short_id(mem.id), mem.type, out._truncate(mem.text, 65))
+    console.print(table)
 
 
 def graph(

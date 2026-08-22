@@ -46,6 +46,75 @@ func (b *ChromemBackend) Add(ctx context.Context, items []Item) error {
 	return b.collection.AddDocuments(ctx, docs, 1)
 }
 
+// SearchDocuments returns items whose document text contains substr, using
+// chromem-go's $contains predicate so the scan stays inside the store.
+//
+// QueryWithOptions needs an embedding to rank by, so this uses a zero query and
+// relies on WhereDocument to do the selecting — ordering is irrelevant here
+// because the caller only wants candidate ids to merge into a pool it scores
+// itself.
+func (b *ChromemBackend) SearchDocuments(ctx context.Context, substr string, limit int) ([]Item, error) {
+	n := b.collection.Count()
+	if n == 0 || substr == "" || limit <= 0 || b.dim == 0 {
+		return nil, nil
+	}
+	if limit > n {
+		limit = n
+	}
+	probe := make([]float32, b.dim)
+	probe[0] = 1
+	results, err := b.collection.QueryWithOptions(ctx, chromem.QueryOptions{
+		QueryEmbedding: probe,
+		NResults:       limit,
+		WhereDocument:  map[string]string{"$contains": substr},
+	})
+	if err != nil {
+		// chromem-go returns nil, nil for a filter matching nothing, so an
+		// error here is genuine (bad probe dimension, unsupported operator)
+		// and must reach the caller instead of masquerading as "no match".
+		return nil, err
+	}
+	items := make([]Item, len(results))
+	for i, r := range results {
+		items[i] = Item{ID: r.ID, Content: r.Content,
+			Embedding: r.Embedding, Metadata: r.Metadata}
+	}
+	return items, nil
+}
+
+// SearchMetadata returns items whose metadata matches every pair in where.
+//
+// Same shape as SearchDocuments: QueryWithOptions needs an embedding to rank
+// by, so this uses a fixed probe vector and lets Where do the selecting —
+// ordering is irrelevant because the caller re-sorts what it gets.
+func (b *ChromemBackend) SearchMetadata(ctx context.Context, where map[string]string,
+	limit int) ([]Item, error) {
+	n := b.collection.Count()
+	if n == 0 || len(where) == 0 || b.dim == 0 {
+		return nil, nil
+	}
+	if limit <= 0 || limit > n {
+		limit = n
+	}
+	probe := make([]float32, b.dim)
+	probe[0] = 1
+	results, err := b.collection.QueryWithOptions(ctx, chromem.QueryOptions{
+		QueryEmbedding: probe,
+		NResults:       limit,
+		Where:          where,
+	})
+	if err != nil {
+		// A no-match filter is nil, nil in chromem-go — an error is genuine.
+		return nil, err
+	}
+	items := make([]Item, len(results))
+	for i, r := range results {
+		items[i] = Item{ID: r.ID, Content: r.Content,
+			Embedding: r.Embedding, Metadata: r.Metadata}
+	}
+	return items, nil
+}
+
 func (b *ChromemBackend) Query(ctx context.Context, embedding []float32, k int) ([]Hit, error) {
 	// chromem-go errors out if k > Count(). Clamp to whichever is smaller.
 	n := b.collection.Count()

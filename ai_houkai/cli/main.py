@@ -20,17 +20,31 @@ from ai_houkai.cli.commands.nuke import nuke
 from ai_houkai.cli.commands.edit import edit, tag, bump
 from ai_houkai.cli.commands.link import link, unlink, neighbors, graph
 from ai_houkai.cli.commands.conflicts import conflicts, supersede, restore
+from ai_houkai.cli.commands.curation import (
+    merge,
+    path,
+    tags_app,
+    trash_app,
+    versions,
+)
 from ai_houkai.cli.commands.decay import prune, purge
 from ai_houkai.cli.commands.reflect import reflect
 from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
 from ai_houkai.cli.commands.stats import stats
 from ai_houkai.cli.commands.doctor import doctor
+from ai_houkai.cli.commands.eval_cmd import eval_cmd
 from ai_houkai.cli.commands.ingest import ingest
 from ai_houkai.cli.commands.serve import serve
 from ai_houkai.cli.commands.collections import collections_app
 from ai_houkai.cli.commands.tui_cmd import tui
 from ai_houkai.cli.commands.maintenance import maintenance_app
 from ai_houkai.cli.commands.journal import journal_app
+from ai_houkai.cli.commands.timetravel import (
+    get_at,
+    history,
+    metrics,
+    state_at,
+)
 
 
 app = typer.Typer(
@@ -104,6 +118,9 @@ def _register() -> None:
     app.command("graph")(graph)
     app.command("conflicts")(conflicts)
     app.command("supersede")(supersede)
+    app.command("merge")(merge)
+    app.command("versions")(versions)
+    app.command("path")(path)
     app.command("restore")(restore)
     app.command("prune")(prune)
     app.command("purge")(purge)
@@ -113,13 +130,20 @@ def _register() -> None:
     app.command("info")(info_cmd)
     app.command("backup")(backup)
     app.command("stats")(stats)
+    app.command("metrics")(metrics)
+    app.command("history")(history)
+    app.command("state-at")(state_at)
+    app.command("get-at")(get_at)
     app.command("doctor")(doctor)
+    app.command("eval")(eval_cmd)
     app.command("ingest")(ingest)
     app.command("serve")(serve)
     app.command("tui")(tui)
     app.add_typer(maintenance_app, name="maintenance")
     app.add_typer(journal_app, name="journal")
     app.add_typer(collections_app, name="collections")
+    app.add_typer(tags_app, name="tags")
+    app.add_typer(trash_app, name="trash")
 
 
 _register()

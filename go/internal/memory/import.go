@@ -115,6 +115,8 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 	defer restore()
 
 	var collisions [][2]string
+	renames := map[string]string{}
+	var writtenIDs []string
 	for {
 		var row map[string]any
 		if err := dec.Decode(&row); err != nil {
@@ -124,9 +126,19 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 			summary.Errors = append(summary.Errors, ImportRowError{ID: "?", Msg: err.Error()})
 			break
 		}
-		if err := s.importOne(ctx, row, opts, useVectors, &summary, &collisions); err != nil {
+		if err := s.importOne(ctx, row, opts, useVectors, &summary, &collisions, renames, &writtenIDs); err != nil {
 			id, _ := row["id"].(string)
 			summary.Errors = append(summary.Errors, ImportRowError{ID: id, Msg: err.Error()})
+		}
+	}
+
+	// A renamed row changes its id, but the rest of the file still references
+	// the old one — which now resolves to the pre-existing memory that caused
+	// the collision. Left alone, every such link (and superseded_by) silently
+	// points at an unrelated row, so re-point them at the rename target.
+	if len(renames) > 0 && !opts.DryRun {
+		if err := s.remapImportedRefs(ctx, writtenIDs, renames); err != nil {
+			summary.Errors = append(summary.Errors, ImportRowError{ID: "?", Msg: err.Error()})
 		}
 	}
 
@@ -136,6 +148,39 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 	return summary, nil
 }
 
+// remapImportedRefs re-points this import's links/superseded_by across
+// renamed rows. Journaled as edits so state reconstruction sees the corrected
+// graph, not the pre-remap ids the import entries recorded.
+func (s *MemoryStore) remapImportedRefs(ctx context.Context, writtenIDs []string, renames map[string]string) error {
+	for _, mid := range writtenIDs {
+		mem, err := s.GetByID(ctx, mid)
+		if err != nil {
+			continue
+		}
+		before := mem.ToDict()
+		changed := false
+		for i, l := range mem.Links {
+			if to, ok := renames[l.To]; ok {
+				mem.Links[i].To = to
+				changed = true
+			}
+		}
+		if to, ok := renames[mem.SupersededBy]; ok {
+			mem.SupersededBy = to
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		if err := s.UpdateMemory(ctx, mem, false); err != nil {
+			return err
+		}
+		s.journalEntry("edit", mem.ID, before, mem.ToDict(),
+			map[string]any{"import_remap": true})
+	}
+	return nil
+}
+
 func (s *MemoryStore) importOne(
 	ctx context.Context,
 	row map[string]any,
@@ -143,6 +188,8 @@ func (s *MemoryStore) importOne(
 	useVectors bool,
 	summary *ImportSummary,
 	collisions *[][2]string,
+	renames map[string]string,
+	writtenIDs *[]string,
 ) error {
 	// `meta` carries the full ToDict() snapshot; row.id / row.text override.
 	meta, _ := row["meta"].(map[string]any)
@@ -188,11 +235,14 @@ func (s *MemoryStore) importOne(
 			summary.Skipped++
 			return nil
 		case ImportRename:
+			oldID := mem.ID
 			mem.ID = uuid.NewString()
+			renames[oldID] = mem.ID
 			if !opts.DryRun {
 				if err := s.addImported(ctx, mem, vec); err != nil {
 					return err
 				}
+				*writtenIDs = append(*writtenIDs, mem.ID)
 			}
 			summary.Renamed++
 			return nil
@@ -204,6 +254,7 @@ func (s *MemoryStore) importOne(
 				if err := s.addImported(ctx, mem, vec); err != nil {
 					return err
 				}
+				*writtenIDs = append(*writtenIDs, mem.ID)
 			}
 			summary.Overwritten++
 			return nil
@@ -214,6 +265,7 @@ func (s *MemoryStore) importOne(
 		if err := s.addImported(ctx, mem, vec); err != nil {
 			return err
 		}
+		*writtenIDs = append(*writtenIDs, mem.ID)
 	}
 	summary.Imported++
 	return nil
@@ -281,6 +333,13 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 			Embedding: vecs[0],
 			Metadata:  MemoryToMetadata(mem),
 		}}); err != nil {
+			return false, err
+		}
+		// Trash deletes through Forget, so undoing that entry brings the row
+		// back — and a trash entry for a live memory is a recovery point that
+		// recovers nothing, while making TrashRestore a no-op on the newer row.
+		// Drop it; a plain forget has nothing to drop.
+		if _, err := s.TrashPurge(mem.ID); err != nil {
 			return false, err
 		}
 		s.journalEntry("undo", mem.ID, nil, mem.ToDict(), map[string]any{"of": e.TS, "of_op": e.Op})

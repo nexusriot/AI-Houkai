@@ -61,10 +61,13 @@ func (o *OllamaEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
 		return nil, fmt.Errorf("ollama embed decode: %w", err)
 	}
-	if len(r.Embeddings) == 0 {
-		return nil, fmt.Errorf("ollama returned empty embeddings")
+	// A short response with HTTP 200 would otherwise surface as an index
+	// panic in the store's batch loops.
+	if len(r.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("ollama embed: got %d embeddings for %d inputs",
+			len(r.Embeddings), len(texts))
 	}
-	if o.dim == 0 {
+	if o.dim == 0 && len(r.Embeddings) > 0 {
 		o.dim = len(r.Embeddings[0])
 	}
 	return r.Embeddings, nil

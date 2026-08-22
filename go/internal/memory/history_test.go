@@ -35,7 +35,7 @@ func TestHistoryTimeline(t *testing.T) {
 	store.Edit(ctx, m.ID, EditOpts{Text: &text})
 	store.Forget(ctx, m.ID)
 
-	hist, err := store.History(ctx, m.ID)
+	hist, err := store.History(ctx, m.ID, true)
 	if err != nil {
 		t.Fatalf("History: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestHistoryIncludesLinkTarget(t *testing.T) {
 		t.Fatalf("Link: %v", err)
 	}
 	// The link entry is filed under src (a); b appears only via meta.dst_id.
-	hist, _ := store.History(ctx, b.ID)
+	hist, _ := store.History(ctx, b.ID, true)
 	found := false
 	for _, e := range hist {
 		if e.Op == "link" {
@@ -79,7 +79,7 @@ func TestHistoryIncludesSupersedeCounterpart(t *testing.T) {
 		t.Fatalf("Supersede: %v", err)
 	}
 	// supersede is filed under old; new appears only via meta.new_id.
-	hist, _ := store.History(ctx, newMem.ID)
+	hist, _ := store.History(ctx, newMem.ID, true)
 	found := false
 	for _, e := range hist {
 		if e.Op == "supersede" {

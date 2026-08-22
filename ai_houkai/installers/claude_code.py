@@ -125,7 +125,7 @@ class ClaudeCodeInstaller:
         self,
         *,
         scope: str = "user",
-        overwrite_unparseable: bool = True,
+        overwrite_unparseable: bool = False,
     ) -> str:
         """Register the MCP server with Claude Code. Returns a description of
         what was written (a command line or a config file path).
@@ -188,7 +188,6 @@ class ClaudeCodeInstaller:
         the *target* store (memory_path/collection) reachable. Returns True
         on success."""
         ok = verify_server(
-            self.server_name,
             memory_path=self.memory_path,
             collection=self.collection,
             stream=stream,
@@ -265,7 +264,7 @@ def _main(argv: Optional[list] = None) -> int:
     if args.install:
         try:
             written = inst.install(scope=scope)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             print(f"  err  {exc}")
             return 1
         print(f"  registered via: {written}")

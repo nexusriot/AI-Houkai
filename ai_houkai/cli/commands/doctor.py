@@ -31,6 +31,7 @@ def doctor(
         store_path=store.path,
         collection=store.collection_name,
         embedding_model=store.embedding_model,
+        embedder=store.embedder_name,
     )
 
     # 2. Store reachable.
@@ -45,7 +46,7 @@ def doctor(
     probe = store.probe_embedding()
     add(
         "embedder", bool(probe.get("ok")),
-        model=store.embedding_model,
+        model=store.embedder_name,
         dim=probe.get("dim"),
         latency_ms=probe.get("latency_ms"),
         error=probe.get("error"),

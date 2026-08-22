@@ -98,6 +98,10 @@ type PackOpts struct {
 	DedupThreshold *float32
 	MinCosine      *float32
 	NoTouch        bool
+	// LexicalIndex forwards to Recall: "pool" (the default) scores BM25 only
+	// over the vector over-fetch pool, while "corpus" also pulls candidates
+	// whose text contains the query's tokens into the pool (hybrid mode only).
+	LexicalIndex LexicalIndexMode
 
 	// Query-time compression: candidates that could not be packed individually
 	// are clustered by Jaccard similarity; clusters of ≥ CompressMinGroup
@@ -105,6 +109,16 @@ type PackOpts struct {
 	Compress          bool
 	CompressThreshold float32 // default 0.30 when Compress and zero
 	CompressMinGroup  int     // default 2 when Compress and zero
+
+	// MinTrust filters candidates by provenance (see RecallOpts.MinTrust).
+	MinTrust TrustLevel
+	// IncludePinned prepends every pinned memory ahead of the ranked hits, so
+	// a standing instruction is present whether or not it matches the query.
+	// They still compete for the same budget: a pinned memory that does not
+	// fit is dropped like any other.
+	IncludePinned bool
+	// AsOf packs what was TRUE at a past moment (see RecallOpts.AsOf).
+	AsOf float64
 }
 
 const defaultPackHeader = "## Relevant memory"
@@ -153,9 +167,18 @@ func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpt
 		DedupThreshold:    opts.DedupThreshold,
 		MinCosine:         opts.MinCosine,
 		NoTouch:           opts.NoTouch,
+		LexicalIndex:      opts.LexicalIndex,
+		MinTrust:          opts.MinTrust,
+		AsOf:              opts.AsOf,
 	})
 	if err != nil {
 		return PackResult{}, err
+	}
+	if opts.IncludePinned {
+		ranked, err = s.prependPinned(ctx, ranked, opts.MinTrust)
+		if err != nil {
+			return PackResult{}, err
+		}
 	}
 
 	return packRanked(ranked, opts.TokenBudget, countFn, header,
@@ -232,8 +255,24 @@ func packRanked(ranked []MemoryWithScore, budget int, countFn func(string) int, 
 	}
 }
 
+// packLine renders one packed memory.
+//
+// An untrusted origin is marked inline: the packed block goes straight into a
+// model's context, and a fact scraped from a page should not be
+// indistinguishable there from one the user stated.
 func packLine(m Memory) string {
-	return fmt.Sprintf("- (%s) %s", m.Type, m.Text)
+	var marks []string
+	if m.Pinned {
+		marks = append(marks, "pinned")
+	}
+	if t := TrustOrDefault(m.Trust); t != TrustTrusted {
+		marks = append(marks, string(t))
+	}
+	suffix := ""
+	if len(marks) > 0 {
+		suffix = " [" + strings.Join(marks, ", ") + "]"
+	}
+	return fmt.Sprintf("- (%s)%s %s", m.Type, suffix, m.Text)
 }
 
 // jaccardSim is the token-set Jaccard similarity of two texts.
@@ -308,4 +347,76 @@ func compressGroup(mems []Memory) string {
 		}
 	}
 	return fmt.Sprintf("[×%d similar] %s", len(mems), strings.Join(snippets, " | "))
+}
+
+// PinnedMemories returns every live pinned memory, newest first.
+//
+// Pushed into the backend as a metadata filter rather than read-and-filter:
+// this sits on the RecallPack / AutoContext hot path, and loading the whole
+// collection to find the handful of pinned rows made the cheapest part of the
+// packer the most expensive. Rows written before `pinned` existed have no such
+// metadata key and do not match — which is correct, since an absent key means
+// not pinned.
+func (s *MemoryStore) PinnedMemories(ctx context.Context) ([]Memory, error) {
+	items, err := s.backend.SearchMetadata(ctx, map[string]string{"pinned": "true"}, 0)
+	if err != nil {
+		return nil, err
+	}
+	now := nowFloat()
+	out := make([]Memory, 0, len(items))
+	for _, it := range items {
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.SupersededBy != "" {
+			continue
+		}
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out, nil
+}
+
+// prependPinned puts pinned memories at the front of a ranked list.
+//
+// Scored above every hit rather than merged by relevance: a standing
+// instruction is included *because* it is pinned, not because it matched.
+// Already-ranked pinned memories are moved rather than duplicated.
+func (s *MemoryStore) prependPinned(ctx context.Context, ranked []MemoryWithScore,
+	minTrust TrustLevel) ([]MemoryWithScore, error) {
+	mems, err := s.PinnedMemories(ctx)
+	if err != nil {
+		return ranked, err
+	}
+	var pinned []Memory
+	for _, m := range mems {
+		if minTrust != "" && TrustRank(m.Trust) > TrustRank(minTrust) {
+			continue
+		}
+		pinned = append(pinned, m)
+	}
+	if len(pinned) == 0 {
+		return ranked, nil
+	}
+	pinnedIDs := map[string]bool{}
+	for _, m := range pinned {
+		pinnedIDs[m.ID] = true
+	}
+	var top float32 = 1.0
+	for _, r := range ranked {
+		if r.Score > top {
+			top = r.Score
+		}
+	}
+	out := make([]MemoryWithScore, 0, len(ranked)+len(pinned))
+	for _, m := range pinned {
+		out = append(out, MemoryWithScore{Memory: m, Score: top})
+	}
+	for _, r := range ranked {
+		if !pinnedIDs[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }

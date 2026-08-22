@@ -236,3 +236,82 @@ class TestReinforcement:
         removed = engine.prune(now=now)
         assert len(removed) == 2
         assert store.count() == 0
+
+
+class TestPruneRoutesToTrash:
+    """Decay pruning must be recoverable.
+
+    Trash exists precisely because a mis-tuned `min_score` silently destroyed
+    data — README and docs/DESIGN.md §26 both promise "decay pruning routes here
+    instead of hard-deleting". `prune` called `store.forget` instead, so that
+    safety property was documented but absent.
+    """
+
+    def _age(self, store, mem, days=400):
+        old = time.time() - days * 86_400
+        meta = dict(store.collection.get(
+            ids=[mem.id], include=["metadatas"])["metadatas"][0])
+        meta["created_at"] = old
+        meta["last_accessed"] = old
+        store.collection.update(ids=[mem.id], metadatas=[meta])
+
+    def test_pruned_memory_lands_in_the_trash(self, store):
+        doomed = store.remember("stale enough to prune")
+        self._age(store, doomed)
+
+        pruned = DecayEngine(store, decay_rate=0.5, min_score=0.9).prune()
+        assert [m.id for m in pruned] == [doomed.id]
+        assert store.get(doomed.id) is None, "still removed from the live store"
+        assert [e.memory_id for e in store.trash_list()] == [doomed.id]
+
+    def test_a_pruned_memory_is_restorable(self, store):
+        doomed = store.remember("prune then think again")
+        self._age(store, doomed)
+        DecayEngine(store, decay_rate=0.5, min_score=0.9).prune()
+
+        back = store.trash_restore(doomed.id)
+        assert back is not None and back.id == doomed.id
+        assert store.get(doomed.id) is not None
+
+    def test_dry_run_touches_neither_store_nor_trash(self, store):
+        doomed = store.remember("dry run subject")
+        self._age(store, doomed)
+
+        pruned = DecayEngine(store, decay_rate=0.5,
+                             min_score=0.9).prune(dry_run=True)
+        assert [m.id for m in pruned] == [doomed.id]
+        assert store.get(doomed.id) is not None
+        assert store.trash_list() == []
+
+    def test_the_trash_entry_is_attributed_to_decay(self, store):
+        """So an operator reviewing the trash can tell why something left."""
+        doomed = store.remember("attributed subject")
+        self._age(store, doomed)
+        DecayEngine(store, decay_rate=0.5, min_score=0.9).prune()
+
+        entry = store.trash_list()[0]
+        assert entry.actor == "decay"
+
+    def test_pinned_and_protected_are_never_pruned(self, store):
+        pin = store.remember("ALWAYS keep me", pinned=True)
+        proc = store.remember("a procedure", type="procedural")
+        for mem in (pin, proc):
+            self._age(store, mem)
+
+        assert DecayEngine(store, decay_rate=0.5, min_score=0.9).prune() == []
+        assert store.trash_list() == []
+        assert store.get(pin.id) is not None and store.get(proc.id) is not None
+
+    def test_a_failed_trash_is_not_reported_as_pruned(self, store, monkeypatch):
+        """The return value is the caller's audit trail.
+
+        `prune` appended unconditionally, so a row that vanished mid-run — or
+        any trash write that failed — was still counted. That over-reports what
+        left the store and inflates the scheduler's cumulative `total_decayed`.
+        """
+        doomed = store.remember("stale enough to prune")
+        self._age(store, doomed)
+        monkeypatch.setattr(store, "trash", lambda memory_id: False)
+
+        pruned = DecayEngine(store, decay_rate=0.5, min_score=0.9).prune()
+        assert pruned == []

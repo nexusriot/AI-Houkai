@@ -542,3 +542,101 @@ func TestTickPurgeDisabled(t *testing.T) {
 func f64(v float64) *float64 { return &v }
 
 func nowSec() float64 { return float64(time.Now().Unix()) }
+
+// Trash retention rides the purge tick in Python (MaintenanceScheduler
+// trash_ttl_days). Without it on this port, "recoverable delete" is really a
+// permanent archive — and now that decay prunes into the trash, the file grows
+// without bound.
+func TestTickEnforcesTrashRetention(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	m, _, _, err := store.Remember(ctx, "trash me", memory.RememberOpts{})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := store.Trash(ctx, m.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	cfg := Config{
+		DecayRate: 0.1, MinScore: 0.05,
+		DecayEvery: -1, ReflectEvery: -1,
+		TrashTTLDays: 30,
+	}
+	// The trash entry is 60 days old relative to this tick.
+	now := float64(time.Now().Unix()) + 60*86_400
+	res := Tick(ctx, store, store, cfg, statePath, now)
+	if res.Err != nil {
+		t.Fatalf("Tick: %v", res.Err)
+	}
+	if res.TrashPurged != 1 {
+		t.Fatalf("TrashPurged = %d, want 1", res.TrashPurged)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("trash still holds %d entries", len(entries))
+	}
+	if got := LoadState(statePath).TotalTrashPurged; got != 1 {
+		t.Fatalf("TotalTrashPurged = %d, want 1", got)
+	}
+}
+
+// 0 days disables retention; it must not be read as "purge everything".
+func TestTickZeroTrashTTLKeepsTheTrash(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	m, _, _, err := store.Remember(ctx, "keep me in the bin", memory.RememberOpts{})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := store.Trash(ctx, m.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+
+	cfg := Config{DecayRate: 0.1, MinScore: 0.05, DecayEvery: -1, ReflectEvery: -1}
+	res := Tick(ctx, store, store, cfg, "",
+		float64(time.Now().Unix())+9000*86_400)
+	if res.TrashPurged != 0 {
+		t.Fatalf("TrashPurged = %d, want 0 when TTL is unset", res.TrashPurged)
+	}
+	entries, _ := store.TrashList()
+	if len(entries) != 1 {
+		t.Fatalf("trash = %d entries, want the one we put there", len(entries))
+	}
+}
+
+// The decay job is the reason retention matters: pruning must be recoverable
+// end to end through a real store, not just against the decay package's fake.
+func TestTickDecayPrunesIntoTheTrash(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	// importance 0.01 < MinScore 0.05 even when fresh → prune candidate.
+	m, _, _, err := store.Remember(ctx, "stale",
+		memory.RememberOpts{Importance: memory.Float32Ptr(0.01)})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+
+	cfg := Config{DecayRate: 0.1, MinScore: 0.05, ReflectEvery: -1, PurgeEvery: -1}
+	res := Tick(ctx, store, store, cfg, "", 1000)
+	if res.Err != nil {
+		t.Fatalf("Tick: %v", res.Err)
+	}
+	if res.Pruned != 1 {
+		t.Fatalf("Pruned = %d, want 1", res.Pruned)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MemoryID != m.ID {
+		t.Fatalf("trash = %+v, want the pruned memory", entries)
+	}
+	if _, ok, err := store.TrashRestore(ctx, m.ID); err != nil || !ok {
+		t.Fatalf("TrashRestore(%s) = %v, %v; want a recoverable prune", m.ID, ok, err)
+	}
+}

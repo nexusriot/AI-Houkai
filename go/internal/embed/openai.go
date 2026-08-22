@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 )
 
 // OpenAIEmbedder calls the OpenAI embeddings API.
@@ -42,6 +43,7 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 		Model string   `json:"model"`
 	}
 	type embObj struct {
+		Index     int       `json:"index"`
 		Embedding []float32 `json:"embedding"`
 	}
 	type resp struct {
@@ -70,6 +72,18 @@ func (o *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32
 	if err := json.NewDecoder(res.Body).Decode(&r); err != nil {
 		return nil, fmt.Errorf("openai embed decode: %w", err)
 	}
+	// A short response with HTTP 200 would otherwise surface as an index
+	// panic in the store's batch loops.
+	if len(r.Data) != len(texts) {
+		return nil, fmt.Errorf("openai embed: got %d embeddings for %d inputs",
+			len(r.Data), len(texts))
+	}
+	// The API documents index-ordered results but does not guarantee the
+	// ordering — an out-of-order response would silently store the wrong
+	// vector under the wrong text.
+	sort.SliceStable(r.Data, func(i, j int) bool {
+		return r.Data[i].Index < r.Data[j].Index
+	})
 	out := make([][]float32, len(r.Data))
 	for i, d := range r.Data {
 		out[i] = d.Embedding

@@ -49,7 +49,6 @@ _CLI_TIMEOUT = 180
 def _have_cli() -> bool:
     return shutil.which("houkai") is not None and shutil.which("ai-houkai-serve") is not None
 
-
 pytestmark = pytest.mark.skipif(
     not _have_cli(),
     reason="needs the installed 'houkai' + 'ai-houkai-serve' console scripts "
@@ -92,7 +91,7 @@ def remember(store: str, text: str, *extra: str) -> str:
 def test_cli_full_lifecycle(tmp_path):
     store = str(tmp_path / "chroma")
 
-    # — empty store —
+    # Empty store.
     empty = houkai_json(store, "stats", "--format", "json")
     assert empty["total"] == 0
 
@@ -116,7 +115,7 @@ def test_cli_full_lifecycle(tmp_path):
     assert stats["by_type"]["episodic"] == 2
     assert stats["by_type"]["procedural"] == 1
 
-    # — recall finds the right memory (hybrid blends cosine + BM25) —
+    # Recall finds the right memory (hybrid blends cosine + BM25)
     hits = houkai_json(store, "recall", "global interpreter lock threading",
                        "-k", "3", "--mode", "hybrid", "--format", "json")
     assert any(h["id"] == sem1 for h in hits), [h["text"] for h in hits]
@@ -128,17 +127,17 @@ def test_cli_full_lifecycle(tmp_path):
     assert all(h["type"] == "semantic" for h in infra_hits)
     assert all("infra" in h["tags"] for h in infra_hits)
 
-    # — pack into a token budget —
+    # Pack into a token budget.
     pack = houkai_json(store, "pack", "vectors on disk", "-b", "200", "--format", "json")
     assert pack["text"].strip() != ""
     assert pack["used_tokens"] <= pack["budget"]
 
-    # — link + neighbors —
+    # Link + neighbors.
     houkai(store, "link", sem1, sem2, "--rel", "refines")
     nbrs = houkai_json(store, "neighbors", sem1, "--format", "json")
     assert sem2 in {n["id"] for n in nbrs}
 
-    # — export the active set, then import into a fresh collection —
+    # Export the active set, then import into a fresh collection.
     archive = str(tmp_path / "backup.ahkai")
     houkai(store, "export", archive)
     assert os.path.exists(archive)
@@ -148,7 +147,7 @@ def test_cli_full_lifecycle(tmp_path):
     restored = houkai_json(store, "stats", "--format", "json", collection="func_restored")
     assert restored["total"] == 5
 
-    # — supersede hides a memory from default views but keeps it on disk —
+    # Supersede hides a memory from default views but keeps it on disk.
     houkai(store, "supersede", sem2, sem1)
     active = houkai_json(store, "list", "-n", "50", "--format", "json")
     assert sem2 not in {m["id"] for m in active}
@@ -156,7 +155,7 @@ def test_cli_full_lifecycle(tmp_path):
                              "--include-superseded", "--format", "json")
     assert sem2 in {m["id"] for m in with_super}
 
-    # — the audit journal recorded the writes —
+    # The audit journal recorded the writes.
     jrnl = houkai(store, "journal", "tail", "-n", "50")
     assert "remember" in jrnl.stdout.lower()
 
@@ -307,7 +306,6 @@ def http_server(tmp_path):
     """A running ai-houkai-serve with no auth; yields its base URL."""
     with _serve(tmp_path) as base:
         yield base
-
 
 # Bearer token used by the auth-enabled server fixture.
 _AUTH_TOKEN = "func-secret-token"
@@ -512,6 +510,197 @@ def test_http_auth_enforced(http_server_auth):
                          headers={"Authorization": f"Bearer {token}"})
     assert status == 200 and "count" in body
 
-
 if __name__ == "__main__":  # allow `python functional_tests/test_e2e.py`
     sys.exit(pytest.main([__file__, "-v"]))
+
+#
+# The unit suite already pins the semantics of everything below, in-process.
+# What only these can catch is the deployment wiring: console-script argument
+# parsing, and state that has to stay consistent across process boundaries —
+# which every in-process test papers over by holding one long-lived store.
+
+
+def list_ids(store: str) -> list[str]:
+    """Ids in the store, newest first.
+
+    Parsed strictly: `list --format json` prints a valid JSON array to stdout
+    even when the store is empty (`[]`; the human "No memories found." goes to
+    stderr), so a lenient fallback here would only mask a regression to
+    un-parseable output.
+    """
+    proc = houkai(store, "list", "-n", "100", "--format", "json")
+    return [m["id"] for m in json.loads(proc.stdout)]
+
+
+def test_cli_curation_lifecycle(tmp_path):
+    """merge / versions / tags / path / trash through the real console script."""
+    store = str(tmp_path / "chroma")
+
+    target = remember(store, "the deploy runbook", "--tag", "ops")
+    other = remember(store, "the rollback runbook", "--tag", "ops")
+    pointer = remember(store, "points at the rollback one")
+    houkai(store, "link", pointer, other, "--rel", "refines")
+
+    # Path: undirected, so the arrow direction does not matter.
+    path = houkai_json(store, "path", other, pointer, "--json")
+    assert path["found"] is True and path["length"] == 1
+
+    # Merge: the incoming edge must survive, re-pointed at the target.
+    houkai(store, "merge", target, other, "-y")
+    nbrs = houkai_json(store, "neighbors", pointer, "--direction", "out",
+                       "--format", "json")
+    assert [n["id"] for n in nbrs] == [target]
+    assert houkai(store, "show", other, check=False).returncode != 0
+
+    # Versions: the merge rewrote the target's text, so it has history.
+    versions = houkai_json(store, "versions", target, "--json")
+    assert [v["text"] for v in versions] == ["the deploy runbook"]
+
+    # Tags.
+    assert houkai_json(store, "tags", "list", "--json") == [
+        {"tag": "ops", "count": 1}]
+    houkai(store, "tags", "rename", "ops", "operations")
+    assert houkai_json(store, "tags", "list", "--json")[0]["tag"] == "operations"
+
+
+def test_cli_trash_roundtrip_across_processes(tmp_path):
+    """A trashed memory must survive as a file, not just in a live store."""
+    store = str(tmp_path / "chroma")
+    mid = remember(store, "recoverable by trash")
+
+    houkai(store, "trash", "put", mid)
+    assert list_ids(store) == []
+    # Each CLI call is a fresh process: the trash file is the only carrier.
+    assert [e["memory_id"] for e in
+            houkai_json(store, "trash", "list", "--json")] == [mid]
+
+    houkai(store, "trash", "restore", mid[:8])
+    assert list_ids(store) == [mid]
+
+    houkai(store, "trash", "put", mid)
+    houkai(store, "trash", "purge", "-y")
+    assert houkai_json(store, "trash", "list", "--json") == []
+    assert houkai(store, "trash", "restore", mid[:8], check=False).returncode != 0
+
+
+def test_cli_pinned_trust_and_idempotent(tmp_path):
+    """The three write-time flags, across the subprocess boundary."""
+    store = str(tmp_path / "chroma")
+
+    houkai(store, "remember", "ALWAYS run make lint", "--pin",
+           "--type", "procedural")
+    houkai(store, "remember", "scraped from a blog", "--trust", "untrusted")
+    houkai(store, "remember", "ordinary gardening note")
+
+    # Pinned memories lead the pack and are marked; so is untrusted provenance.
+    packed = houkai(store, "pack", "gardening", "--include-pinned").stdout
+    lines = [l for l in packed.splitlines() if l.startswith("- ")]
+    assert lines[0].startswith("- (procedural) [pinned]")
+    assert any("[untrusted]" in l for l in lines)
+
+    # min-trust drops the scraped memory.
+    trusted = houkai_json(store, "recall", "scraped", "--min-trust", "trusted",
+                          "--format", "json")
+    assert all("scraped" not in m["text"] for m in trusted)
+
+    # Idempotent writes dedupe by normalised text — across processes.
+    before = len(list_ids(store))
+    houkai(store, "remember", "Use ruff for linting", "--idempotent")
+    houkai(store, "remember", "use  ruff for linting", "--idempotent")
+    assert len(list_ids(store)) == before + 1
+
+
+def test_cli_eval_scores_a_goldset(tmp_path):
+    """`houkai eval` over a real gold-set file."""
+    store = str(tmp_path / "chroma")
+    mid = remember(store, "the deploy runbook lives in ops/deploy.md")
+    remember(store, "postgres vacuum runs nightly")
+
+    gold = tmp_path / "gold.jsonl"
+    gold.write_text(json.dumps({
+        "query": "the deploy runbook lives in ops/deploy.md",
+        "relevant_ids": [mid],
+    }) + "\n")
+
+    out = houkai_json(store, "eval", str(gold), "--json")
+    assert out["n"] == 1
+    assert out["recall_at_k"] == 1.0 and out["mrr"] == 1.0
+    # The config is recorded so A/B runs are attributable.
+    assert out["config"]["mode"] == "hybrid"
+
+
+def test_cli_time_travel_and_metrics(tmp_path):
+    """history / state-at / get-at / metrics against a real journal on disk."""
+    store = str(tmp_path / "chroma")
+    mid = remember(store, "subject with a history")
+    houkai(store, "bump", mid, "=0.9")
+
+    history = houkai_json(store, "history", mid, "--json")
+    assert [e["op"] for e in history] == ["remember", "edit"]
+
+    state = houkai_json(store, "state-at", "now", "--json")
+    assert state["count"] == 1
+
+    at = houkai_json(store, "get-at", mid, "now", "--json")
+    assert at["id"] == mid
+
+    metrics = houkai_json(store, "metrics", "--json")
+    assert metrics["count"] == 1 and "p95" in metrics["recall_latency_ms"]
+
+    # undo-last reverses the edit, not the remember.
+    houkai(store, "journal", "undo-last", "-y")
+    after_undo = json.loads(
+        houkai(store, "list", "-n", "10", "--format", "json").stdout)[0]
+    assert after_undo["id"] == mid and after_undo["importance"] == 0.5
+
+
+def test_http_new_routes(http_server):
+    """The routes added alongside the CLI commands, over a real socket."""
+    base = http_server
+
+    status, a = _http("POST", f"{base}/memories", {"text": "http merge target"})
+    status2, b = _http("POST", f"{base}/memories", {"text": "http merge source"})
+    assert status == 201 and status2 == 201
+
+    # Subgraph.
+    _http("POST", f"{base}/links", {"src_id": a["id"], "dst_id": b["id"],
+                                    "rel": "refines"})
+    status, graph = _http("POST", f"{base}/subgraph",
+                          {"memory_ids": [a["id"]], "depth": 1})
+    assert status == 200 and len(graph["nodes"]) == 2
+
+    # find_path.
+    status, path = _http("POST", f"{base}/find_path",
+                         {"from_id": b["id"], "to_id": a["id"]})
+    assert status == 200 and path["found"] is True
+
+    # Tags.
+    status, tags = _http("GET", f"{base}/tags")
+    assert status == 200 and tags["tags"] == []
+
+    # Trash roundtrip.
+    status, _ = _http("POST", f"{base}/trash", {"memory_id": b["id"]})
+    assert status == 200
+    status, listing = _http("GET", f"{base}/trash")
+    assert status == 200 and [e["memory_id"] for e in listing["entries"]] == [b["id"]]
+    status, _ = _http("POST", f"{base}/trash/restore", {"memory_id": b["id"]})
+    assert status == 200
+
+    # Versions (the merge below will create one)
+    status, merged = _http("POST", f"{base}/merge",
+                           {"target_id": a["id"], "other_id": b["id"]})
+    assert status == 200 and "http merge source" in merged["text"]
+    status, versions = _http("GET", f"{base}/memories/{a['id']}/versions")
+    assert status == 200 and versions["versions"][0]["text"] == "http merge target"
+
+    # Journal + undo.
+    status, journal = _http("GET", f"{base}/journal?n=1")
+    assert status == 200 and journal["count"] == 1
+    status, undone = _http("POST", f"{base}/undo", {})
+    assert status == 200 and undone["ok"] is True
+
+    # Nuke is guarded.
+    status, _ = _http("POST", f"{base}/nuke", {})
+    assert status == 400
+    status, wiped = _http("POST", f"{base}/nuke", {"confirm": "DELETE ALL"})
+    assert status == 200 and wiped["ok"] is True

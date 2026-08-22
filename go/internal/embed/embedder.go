@@ -8,9 +8,9 @@ type Embedder interface {
 	Embed(ctx context.Context, texts []string) ([][]float32, error)
 }
 
-// Provider names for config.
+// Provider names for config. Ollama has no constant: it is the default
+// branch wherever providers are switched on, never compared by name.
 const (
-	ProviderOllama       = "ollama"
 	ProviderOpenAI       = "openai"
 	ProviderDigitalOcean = "digitalocean"
 )

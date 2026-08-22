@@ -299,3 +299,107 @@ def test_rotate_crash_mid_compress_loses_nothing(
     # And appends keep working on a fresh active file.
     j.append(_entry(9))
     assert [e.id for e in j.read(include_archives=True)][-1] == "id-9"
+
+
+def test_undo_of_a_trash_clears_the_trash_entry(store: MemoryStore) -> None:
+    """`trash` deletes through `forget`, so undoing it resurrects the row — but
+    the trash entry stayed behind, listing a memory that is live again. The
+    stale entry then makes `trash_restore` a silent no-op on the newer row, and
+    `trash_list` shows a recovery point that recovers nothing."""
+    mem = store.remember(text="binned then reinstated")
+    store.trash(mem.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == mem.id)
+
+    assert store.undo(entry) is True
+    assert store.get(mem.id) is not None
+    assert store.trash_list() == []
+
+
+def test_undo_of_a_plain_forget_leaves_the_trash_alone(store: MemoryStore) -> None:
+    """Only the entry for the undone memory goes — anything else in the bin
+    stays recoverable."""
+    kept = store.remember(text="still in the bin")
+    store.trash(kept.id)
+    gone = store.remember(text="plainly forgotten")
+    store.forget(gone.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == gone.id)
+
+    assert store.undo(entry) is True
+    assert [e.memory_id for e in store.trash_list()] == [kept.id]
+
+
+def test_trash_restore_does_not_clobber_a_live_memory(store: MemoryStore) -> None:
+    """Belt and braces: even if a stale entry appears some other way (an import
+    that recreates a trashed id, say), restoring it must not roll a live memory
+    back to an older snapshot."""
+    mem = store.remember(text="original text", tags=["before"])
+    store.trash(mem.id)
+    entry = next(e for e in store.journal.read()
+                 if e.op == "forget" and e.id == mem.id)
+    store.undo(entry)
+    store.edit(mem.id, tags=["after"])
+
+    store.trash_restore(mem.id)
+    assert store.get(mem.id).tags == ["after"]
+
+
+def test_truncated_archive_keeps_history_readable(tmp_path: Path) -> None:
+    """A crash mid-compression can leave a truncated .log.gz (pre-fix
+    rotations compressed under the final name). Reading it raises at the
+    gzip layer, not per line — it must not take the rest of history down."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(5):
+        j.append(_entry(i))
+    j._rotate()
+    for i in range(5, 8):
+        j.append(_entry(i))
+
+    archive = next(tmp_path.glob("j-*.log.gz"))
+    raw = archive.read_bytes()
+    archive.write_bytes(raw[: len(raw) // 2])
+
+    ids = [e.id for e in j.read(include_archives=True)]
+    # The active file's entries must all survive; the truncated archive
+    # contributes whatever decompressed cleanly.
+    assert ids[-3:] == ["id-5", "id-6", "id-7"]
+
+
+def test_plain_rotation_wins_over_same_stem_archive(tmp_path: Path) -> None:
+    """When both x.log and x.log.gz exist (crash between compress and
+    unlink), entries must not be yielded twice."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(4):
+        j.append(_entry(i))
+    j._rotate()
+    archive = next(tmp_path.glob("j-*.log.gz"))
+    plain = archive.with_name(archive.name[: -len(".gz")])
+    with gzip.open(archive, "rt", encoding="utf-8") as f:
+        plain.write_text(f.read())
+
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(4)]
+
+
+def test_rotate_compresses_via_temp_name(tmp_path: Path, monkeypatch) -> None:
+    """A crash mid-compression must never leave a truncated file under the
+    final archive name — the half-written file keeps a .tmp suffix."""
+    j = Journal(tmp_path / "j.log", rotate_mb=64)
+    for i in range(5):
+        j.append(_entry(i))
+
+    real_open = journal_mod.gzip.open
+    def dies_mid_write(*a, **k):
+        handle = real_open(*a, **k)
+        handle.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(journal_mod.gzip, "open", dies_mid_write)
+    with pytest.raises(OSError):
+        j._rotate()
+    monkeypatch.undo()
+
+    assert not list(tmp_path.glob("j-*.log.gz"))
+    ids = [e.id for e in j.read(include_archives=True)]
+    assert ids == [f"id-{i}" for i in range(5)]

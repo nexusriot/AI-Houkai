@@ -31,7 +31,7 @@ func TestRememberManyStoresAllInOrder(t *testing.T) {
 		{Text: "alpha fact"},
 		{Text: "beta fact", RememberOpts: RememberOpts{Type: Procedural, Tags: []string{"x"}}},
 		{Text: "gamma fact", RememberOpts: RememberOpts{Importance: Float32Ptr(0.9)}},
-	}, 128, "")
+	}, 128, "", false)
 	if err != nil {
 		t.Fatalf("RememberMany: %v", err)
 	}
@@ -55,9 +55,9 @@ func TestRememberManyStoresAllInOrder(t *testing.T) {
 func TestRememberManyEmpty(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	mems, err := store.RememberMany(ctx, nil, 128, "")
+	mems, err := store.RememberMany(ctx, nil, 128, "", false)
 	if err != nil {
-		t.Fatalf("RememberMany(nil): %v", err)
+		t.Fatalf("RememberMany(nil, false): %v", err)
 	}
 	if len(mems) != 0 {
 		t.Errorf("want 0, got %d", len(mems))
@@ -75,7 +75,7 @@ func TestRememberManyBatchesEmbedCalls(t *testing.T) {
 	for i := range items {
 		items[i] = RememberItem{Text: string(rune('a'+i)) + " item"}
 	}
-	if _, err := store.RememberMany(ctx, items, 4, PolicyIgnore); err != nil {
+	if _, err := store.RememberMany(ctx, items, 4, PolicyIgnore, false); err != nil {
 		t.Fatalf("RememberMany: %v", err)
 	}
 	if calls != 3 { // ceil(10 / 4)
@@ -88,7 +88,7 @@ func TestRememberManyBatchesEmbedCalls(t *testing.T) {
 
 func TestRememberManyBatchSizeMustBePositive(t *testing.T) {
 	store := newTestStore(t)
-	if _, err := store.RememberMany(context.Background(), []RememberItem{{Text: "x"}}, 0, ""); err == nil {
+	if _, err := store.RememberMany(context.Background(), []RememberItem{{Text: "x"}}, 0, "", false); err == nil {
 		t.Fatal("expected error for batch_size=0")
 	}
 }
@@ -99,7 +99,7 @@ func TestRememberManyValidationAbortsBeforeWrite(t *testing.T) {
 	_, err := store.RememberMany(ctx, []RememberItem{
 		{Text: "ok one"},
 		{Text: "bad", RememberOpts: RememberOpts{Type: "not-a-type"}},
-	}, 128, "")
+	}, 128, "", false)
 	if err == nil {
 		t.Fatal("expected validation error for bad type")
 	}
@@ -110,7 +110,7 @@ func TestRememberManyValidationAbortsBeforeWrite(t *testing.T) {
 
 func TestRememberManyRaiseRejected(t *testing.T) {
 	store := newTestStore(t)
-	if _, err := store.RememberMany(context.Background(), []RememberItem{{Text: "x"}}, 128, PolicyRaise); err == nil {
+	if _, err := store.RememberMany(context.Background(), []RememberItem{{Text: "x"}}, 128, PolicyRaise, false); err == nil {
 		t.Fatal("expected error: raise is not supported by RememberMany")
 	}
 }
@@ -122,7 +122,7 @@ func TestRememberManyWarnStoresAll(t *testing.T) {
 	mems, err := store.RememberMany(ctx, []RememberItem{
 		{Text: "duplicate fact"},
 		{Text: "duplicate fact"},
-	}, 128, PolicyWarn)
+	}, 128, PolicyWarn, false)
 	if err != nil {
 		t.Fatalf("RememberMany warn: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRememberManySupersedeEarlierWins(t *testing.T) {
 	mems, err := store.RememberMany(ctx, []RememberItem{
 		{Text: "duplicate fact"},
 		{Text: "duplicate fact"},
-	}, 128, PolicySupersede)
+	}, 128, PolicySupersede, false)
 	if err != nil {
 		t.Fatalf("RememberMany supersede: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestRememberManyTTLSetsExpiresAt(t *testing.T) {
 	ttl := 3600.0
 	mems, err := store.RememberMany(ctx, []RememberItem{
 		{Text: "temp", RememberOpts: RememberOpts{TTLSeconds: &ttl}},
-	}, 128, "")
+	}, 128, "", false)
 	if err != nil {
 		t.Fatalf("RememberMany ttl: %v", err)
 	}
@@ -179,13 +179,13 @@ func TestRememberManyTTLSetsExpiresAt(t *testing.T) {
 func TestRememberManyJournalsPerIDAndUndo(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	mems, err := store.RememberMany(ctx, []RememberItem{{Text: "j1"}, {Text: "j2"}}, 128, "")
+	mems, err := store.RememberMany(ctx, []RememberItem{{Text: "j1"}, {Text: "j2"}}, 128, "", false)
 	if err != nil {
 		t.Fatalf("RememberMany: %v", err)
 	}
 	// Exactly one "remember" entry per id.
 	for _, m := range mems {
-		hist, err := store.History(ctx, m.ID)
+		hist, err := store.History(ctx, m.ID, true)
 		if err != nil {
 			t.Fatalf("History: %v", err)
 		}
@@ -200,7 +200,7 @@ func TestRememberManyJournalsPerIDAndUndo(t *testing.T) {
 		}
 	}
 	// Undo the second id's entry → only that memory disappears.
-	hist, _ := store.History(ctx, mems[1].ID)
+	hist, _ := store.History(ctx, mems[1].ID, true)
 	var entry JournalEntry
 	for _, e := range hist {
 		if e.Op == "remember" && e.ID == mems[1].ID {
@@ -216,5 +216,68 @@ func TestRememberManyJournalsPerIDAndUndo(t *testing.T) {
 	}
 	if _, err := store.GetByID(ctx, mems[0].ID); err != nil {
 		t.Errorf("mems[0] should survive undo: %v", err)
+	}
+}
+
+// Idempotent bulk write: a batch replayed every session must not accumulate
+// near-duplicates. Mirrors Python's remember_many(idempotent=True).
+
+func TestRememberManyIdempotentCollapsesIntraBatch(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	mems, err := store.RememberMany(ctx, []RememberItem{
+		{Text: "Use ruff for linting"},
+		{Text: "use  ruff for linting  "},
+		{Text: "Use ruff for linting"},
+	}, 128, PolicyIgnore, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mems) != 3 {
+		t.Fatalf("returned %d entries, want one per input", len(mems))
+	}
+	ids := map[string]bool{}
+	for _, m := range mems {
+		ids[m.ID] = true
+	}
+	if len(ids) != 1 {
+		t.Errorf("distinct ids = %d, want 1 (normalised duplicates collapse)", len(ids))
+	}
+	n, _ := store.Count(ctx)
+	if n != 1 {
+		t.Errorf("stored %d rows, want 1", n)
+	}
+}
+
+func TestRememberManyIdempotentMatchesExistingRow(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	first, _, _, err := store.Remember(ctx, "Use ruff for linting", RememberOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mems, err := store.RememberMany(ctx,
+		[]RememberItem{{Text: "use ruff for linting"}}, 128, PolicyIgnore, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mems) != 1 || mems[0].ID != first.ID {
+		t.Errorf("got %v, want the existing %s", mems, first.ID)
+	}
+	if n, _ := store.Count(ctx); n != 1 {
+		t.Errorf("stored %d rows, want 1", n)
+	}
+}
+
+func TestRememberManyDefaultStillWritesDuplicates(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.RememberMany(ctx, []RememberItem{
+		{Text: "same text"}, {Text: "same text"},
+	}, 128, PolicyIgnore, false); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := store.Count(ctx); n != 2 {
+		t.Errorf("stored %d rows, want 2 — idempotency must stay opt-in", n)
 	}
 }

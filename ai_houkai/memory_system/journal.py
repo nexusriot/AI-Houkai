@@ -136,20 +136,28 @@ class Journal:
         # active file — the old compress-then-truncate order silently dropped
         # any entry appended between the copy and the truncate. A crash
         # mid-compression leaves the plain rotated file behind; read() still
-        # includes it, so no entries are lost either way.
+        # includes it, so no entries are lost either way. Compression goes
+        # through a temp name so a crash can never leave a *truncated* file
+        # under the archive name — read() would keep skipping it, but every
+        # scan would pay to discover the truncation again.
         os.rename(self.path, rotated)
-        with open(rotated, "rb") as src, gzip.open(archive, "wb") as dst:
+        tmp = archive.with_name(archive.name + ".tmp")
+        with open(rotated, "rb") as src, gzip.open(tmp, "wb") as dst:
             while True:
                 chunk = src.read(1024 * 1024)
                 if not chunk:
                     break
                 dst.write(chunk)
+        os.replace(tmp, archive)
         rotated.unlink()
 
     def _prune_archives(self) -> None:
         cutoff = time.time() - self.keep_days * 86_400
-        # `-*.log` covers plain rotated files orphaned by a crash mid-compression.
-        for pattern in (f"{self.path.stem}-*.log.gz", f"{self.path.stem}-*.log"):
+        # `-*.log` covers plain rotated files orphaned by a crash
+        # mid-compression, `-*.log.gz.tmp` half-written compressions.
+        for pattern in (f"{self.path.stem}-*.log.gz",
+                        f"{self.path.stem}-*.log",
+                        f"{self.path.stem}-*.log.gz.tmp"):
             for p in self.path.parent.glob(pattern):
                 try:
                     if p.stat().st_mtime < cutoff:
@@ -177,10 +185,18 @@ class Journal:
         if include_archives:
             # Plain `-*.log` files are rotations orphaned by a crash before
             # compression finished — their entries are still valid history.
-            files.extend(sorted(
-                list(self.path.parent.glob(f"{self.path.stem}-*.log.gz"))
-                + list(self.path.parent.glob(f"{self.path.stem}-*.log"))
-            ))
+            # When both `x.log` and `x.log.gz` exist (older code could crash
+            # between compressing and unlinking), the plain file wins: it is
+            # complete by construction, while the archive may be truncated
+            # and would double-count whatever did decompress.
+            plain = list(self.path.parent.glob(f"{self.path.stem}-*.log"))
+            plain_names = {p.name for p in plain}
+            archives = [
+                p for p in
+                self.path.parent.glob(f"{self.path.stem}-*.log.gz")
+                if p.name[: -len(".gz")] not in plain_names
+            ]
+            files.extend(sorted(archives + plain))
         if self.path.exists():
             files.append(self.path)
 
@@ -192,7 +208,16 @@ class Journal:
             except OSError:
                 continue
             with handle as f:
-                for line in f:
+                while True:
+                    try:
+                        line = f.readline()
+                    except (EOFError, OSError):
+                        # A truncated archive (crash mid-compression) raises
+                        # at the gzip layer, not per line — it must not make
+                        # the rest of history unreadable.
+                        break
+                    if not line:
+                        break
                     line = line.strip()
                     if not line:
                         continue

@@ -219,6 +219,7 @@ class TestCollectionsCommands:
         assert result.exit_code == 1
         assert "active collection" in result.output
 
+    @pytest.mark.needs_model
     def test_copy_preserves_memories_and_search(self, tmp_path):
         store_path = str(tmp_path / "chroma")
         _invoke(["remember", "The deploy target is the staging box", "--tag", "ops"],
@@ -244,3 +245,38 @@ class TestCollectionsCommands:
         result = _invoke(["collections", "copy", "ghost", "dst", "--yes"],
                          str(tmp_path / "chroma"))
         assert result.exit_code == 1
+
+
+class TestSplittingNeverLosesText:
+    """`min_chars` drops noise, not the tail of a real paragraph.
+
+    Greedy sentence packing leaves a short fragment whenever the next sentence
+    will not fit, and that fragment can land anywhere — including last. Applying
+    the `min_chars` noise filter to it deletes ingested text with no warning,
+    which is not what the filter is for: separators and stray list bullets are
+    noise, the last sentence of a paragraph is content.
+    """
+
+    def test_a_short_split_tail_survives(self):
+        tail = "Tiny tail."
+        para = " ".join(["A" * 38 + ".", "B" * 38 + ".", "C" * 96 + ".", tail])
+        chunks = chunk_text(para, max_chars=100, min_chars=30)
+        assert any(tail in c for c in chunks), f"tail was dropped: {chunks}"
+
+    def test_every_sentence_of_a_split_paragraph_is_kept(self):
+        sentences = ["A" * 38 + ".", "B" * 38 + ".", "C" * 96 + ".", "Tiny tail."]
+        chunks = chunk_text(" ".join(sentences), max_chars=100, min_chars=30)
+        joined = " ".join(chunks)
+        for s in sentences:
+            assert s in joined, f"{s!r} vanished from {chunks}"
+
+    def test_a_short_leading_fragment_survives(self):
+        """A runt can also come first, when one huge sentence follows a tiny one."""
+        chunks = chunk_text("Hi. " + "Z" * 300 + ".", max_chars=100, min_chars=30)
+        assert any("Hi." in c for c in chunks), f"leading fragment lost: {chunks}"
+
+    def test_noise_blocks_are_still_dropped(self):
+        """The filter must keep doing its job on standalone short blocks."""
+        text = "---\n\n" + "R" * 80 + "\n\n*\n"
+        chunks = chunk_text(text, max_chars=500, min_chars=30)
+        assert chunks == ["R" * 80]

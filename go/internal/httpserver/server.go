@@ -27,11 +27,31 @@
 //	POST   /links        {src_id,dst_id,rel?}      add a directed link
 //	POST   /unlink       {src_id,dst_id,rel?}      remove link(s)
 //	POST   /supersede    {old_id,new_id}           soft-delete + supersede link
+//	POST   /restore      {memory_id}               clear a supersede (un-soft-delete)
 //	POST   /conflicts    {memory_id?,threshold?}   duplicate / contradiction scan
+//	POST   /subgraph     {memory_ids,depth?}       link graph reachable from ids
+//	POST   /undo         {ts?,memory_id?}          reverse a journaled mutation
+//	POST   /nuke         {confirm}                 delete every memory (guarded)
+//	GET    /journal?n=&op=&since=                  audit-journal tail
+//	POST   /export       {path,…}                  write a .ahkai archive (server-side path)
+//	POST   /import       {path,on_conflict?,…}     read a .ahkai archive (server-side path)
+//	POST   /merge        {target_id,other_id,…}    fold one memory into another
+//	GET    /memories/{id}/versions                 past text states from the journal
+//	GET    /tags?include_superseded=               tag usage counts
+//	POST   /tags/rename  {old,new}                 rename a tag collection-wide
+//	POST   /tags/merge   {sources,into}            fold several tags into one
+//	DELETE /tags/{tag}                             strip a tag from every memory
+//	POST   /find_path    {from_id,to_id,max_depth?} shortest undirected link path
+//	POST   /trash        {memory_id}               soft-delete (recoverable)
+//	GET    /trash                                  list soft-deleted memories
+//	POST   /trash/restore {memory_id}              bring one back
+//	POST   /trash/purge  {memory_id?, older_than_days?}  permanently drop (irreversible)
 //
 // Optional bearer-token auth: pass a token (or set AI_HOUKAI_HTTP_TOKEN) and
 // every request must carry "Authorization: Bearer <token>". /health and /ready
 // stay reachable so liveness/readiness probes work without the secret.
+// /export and /import (which read/write server-side paths) additionally
+// require a token to be configured at all; a tokenless server refuses them.
 package httpserver
 
 import (
@@ -44,6 +64,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -114,7 +135,25 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /links", s.wrap(s.link))
 	mux.HandleFunc("POST /unlink", s.wrap(s.unlink))
 	mux.HandleFunc("POST /supersede", s.wrap(s.supersede))
+	mux.HandleFunc("POST /restore", s.wrap(s.restore))
 	mux.HandleFunc("POST /conflicts", s.wrap(s.conflicts))
+	mux.HandleFunc("POST /subgraph", s.wrap(s.subgraph))
+	mux.HandleFunc("POST /undo", s.wrap(s.undo))
+	mux.HandleFunc("POST /nuke", s.wrap(s.nuke))
+	mux.HandleFunc("GET /journal", s.wrap(s.journalTail))
+	mux.HandleFunc("POST /export", s.wrap(s.export))
+	mux.HandleFunc("POST /import", s.wrap(s.importArchive))
+	mux.HandleFunc("POST /merge", s.wrap(s.merge))
+	mux.HandleFunc("GET /memories/{id}/versions", s.wrap(s.versions))
+	mux.HandleFunc("GET /tags", s.wrap(s.tags))
+	mux.HandleFunc("POST /tags/rename", s.wrap(s.renameTag))
+	mux.HandleFunc("POST /tags/merge", s.wrap(s.mergeTags))
+	mux.HandleFunc("DELETE /tags/{tag}", s.wrap(s.deleteTag))
+	mux.HandleFunc("POST /find_path", s.wrap(s.findPath))
+	mux.HandleFunc("POST /trash", s.wrap(s.trash))
+	mux.HandleFunc("GET /trash", s.wrap(s.trashList))
+	mux.HandleFunc("POST /trash/restore", s.wrap(s.trashRestore))
+	mux.HandleFunc("POST /trash/purge", s.wrap(s.trashPurge))
 	return s.middleware(mux)
 }
 
@@ -241,9 +280,21 @@ func (s *Server) wrap(fn apiFunc) http.HandlerFunc {
 // callLocked runs a handler while holding storeMu, releasing it (even on panic,
 // via defer) before the caller writes the response — the response write must
 // not hold the lock. Mirrors Python's `with store_lock: fn(...)`.
-func (s *Server) callLocked(fn apiFunc, r *http.Request) (int, any, error) {
+func (s *Server) callLocked(fn apiFunc, r *http.Request) (status int, payload any, err error) {
 	s.storeMu.Lock()
 	defer s.storeMu.Unlock()
+	// The body/query coercers reject mistyped values by panicking with an
+	// *httpError — Go handler signatures give them no error channel of their
+	// own. Anything else keeps panicking.
+	defer func() {
+		if rec := recover(); rec != nil {
+			he, ok := rec.(*httpError)
+			if !ok {
+				panic(rec)
+			}
+			status, payload, err = 0, nil, he
+		}
+	}()
 	return fn(r)
 }
 
@@ -342,7 +393,7 @@ func journalEntryDict(e memory.JournalEntry) map[string]any {
 
 func (s *Server) history(r *http.Request) (int, any, error) {
 	id := r.PathValue("id")
-	entries, err := s.store.History(r.Context(), id)
+	entries, err := s.store.History(r.Context(), id, true)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -429,6 +480,17 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		Source:     bodyStr(b, "source", ""),
 		Polarity:   int(bodyFloat(b, "polarity", 0)),
 		OnConflict: memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
+		Pinned:     bodyBool(b, "pinned"),
+		Trust:      memory.TrustLevel(bodyStr(b, "trust", "")),
+		Idempotent: bodyBool(b, "idempotent"),
+	}
+	// Valid time — when the memory was true, as opposed to when we learned it.
+	// Probed as float64 like the TTL below: an epoch needs the precision.
+	if v, ok := b["valid_from"].(float64); ok {
+		opts.ValidFrom = &v
+	}
+	if v, ok := b["valid_until"].(float64); ok {
+		opts.ValidUntil = &v
 	}
 	// TTL: probe as float64 (JSON numbers) — an epoch needs float64 precision,
 	// which bodyFloatPtr (*float32) can't carry.
@@ -447,7 +509,17 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	if !stored {
-		return 409, conflictPayload(conflicts), nil
+		// Two very different reasons to write nothing. A conflict policy
+		// rejected the write → 409 with the conflicts. An idempotent repeat
+		// found the existing row and bumped it → the feature working, so 200
+		// with that row and stored:false. Mapping both onto 409 made every
+		// replayed batch fail against a store that already knew the fact.
+		if len(conflicts) > 0 {
+			return 409, conflictPayload(conflicts), nil
+		}
+		out := memDict(mem)
+		out["stored"] = false
+		return 200, out, nil
 	}
 	out := memDict(mem)
 	out["stored"] = true
@@ -495,18 +567,32 @@ func (s *Server) rememberMany(r *http.Request) (int, any, error) {
 	if v, ok := b["batch_size"].(float64); ok {
 		batchSize = int(v)
 	}
+	started := float64(time.Now().UnixNano()) / 1e9
 	mems, err := s.store.RememberMany(
 		r.Context(), items, batchSize,
 		memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
+		bodyBool(b, "idempotent"),
 	)
 	if err != nil {
 		return 0, nil, err // validation (raise / bad item) → 400 via wrap
 	}
 	out := make([]map[string]any, len(mems))
+	// `stored` is how many rows the batch CREATED. An idempotent replay returns
+	// the pre-existing rows, and reporting len(mems) told the client it had
+	// written N rows when it had written none. Counting distinct new ids also
+	// collapses intra-batch duplicates, which map to one row.
+	created := map[string]bool{}
 	for i, m := range mems {
 		out[i] = memDict(m)
+		if m.CreatedAt >= started {
+			created[m.ID] = true
+		}
 	}
-	return 201, map[string]any{"stored": len(mems), "memories": out}, nil
+	status := 201
+	if len(created) == 0 {
+		status = 200
+	}
+	return status, map[string]any{"stored": len(created), "memories": out}, nil
 }
 
 func (s *Server) getOne(r *http.Request) (int, any, error) {
@@ -533,7 +619,30 @@ func (s *Server) edit(r *http.Request) (int, any, error) {
 		return 0, nil, errStatus(400, "empty edit: provide at least one field")
 	}
 	var opts memory.EditOpts
+	// These four count as editable fields too: `{"pinned": true}` or a
+	// validity correction alone is a legitimate edit, and dropping to the
+	// "no editable fields" 400 silently made pin/trust/valid-time edits
+	// impossible over HTTP.
 	fields := 0
+	if v, ok := b["pinned"].(bool); ok {
+		opts.Pinned = &v
+		fields++
+	}
+	if v, ok := b["trust"].(string); ok && v != "" {
+		t := memory.TrustLevel(v)
+		opts.Trust = &t
+		fields++
+	}
+	// Valid time: correct the interval during which the memory was true. 0 on
+	// an end reopens it.
+	if v, ok := b["valid_from"].(float64); ok {
+		opts.ValidFrom = &v
+		fields++
+	}
+	if v, ok := b["valid_until"].(float64); ok {
+		opts.ValidUntil = &v
+		fields++
+	}
 	if v, ok := b["text"].(string); ok {
 		opts.Text = &v
 		fields++
@@ -674,6 +783,13 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		// Same gap as recall had: these were reachable through the MCP tool but
+		// not over HTTP, so an HTTP client could not set a trust floor on the
+		// one call whose output goes straight into a model's context.
+		MinTrust:      memory.TrustLevel(bodyStr(b, "min_trust", "")),
+		LexicalIndex:  memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+		IncludePinned: bodyBool(b, "include_pinned"),
+		AsOf:          bodyFloat(b, "as_of", 0),
 	}
 	// header: absent → default; explicit "" → no header line (PackOpts.Header
 	// contract). bodyStr can't express the empty string, so probe the map.
@@ -734,6 +850,8 @@ func (s *Server) autoContext(r *http.Request) (int, any, error) {
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
 		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		LexicalIndex:      memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+		MinTrust:          memory.TrustLevel(bodyStr(b, "min_trust", "")),
 	})
 	if err != nil {
 		return 0, nil, err
@@ -828,6 +946,231 @@ func (s *Server) conflicts(r *http.Request) (int, any, error) {
 	return 200, map[string]any{"conflicts": out}, nil
 }
 
+func (s *Server) restore(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	id, err := requireStr(b, "memory_id")
+	if err != nil {
+		return 0, nil, err
+	}
+	if _, err := s.store.GetByID(r.Context(), id); err != nil {
+		return 0, nil, errStatus(404, "memory not found")
+	}
+	ok, err := s.store.Restore(r.Context(), id)
+	if err != nil {
+		return 0, nil, err
+	}
+	return 200, map[string]any{"restored": ok, "id": id}, nil
+}
+
+func (s *Server) subgraph(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	var ids []string
+	switch v := b["memory_ids"].(type) {
+	case string:
+		ids = []string{v}
+	case []any:
+		for _, x := range v {
+			if str, ok := x.(string); ok {
+				ids = append(ids, str)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil, errStatus(400, "missing required field: memory_ids")
+	}
+	graph, err := s.store.Subgraph(r.Context(), ids, int(bodyFloat(b, "depth", 1)))
+	if err != nil {
+		return 0, nil, err
+	}
+	nodes := make([]map[string]any, len(graph.Nodes))
+	for i, n := range graph.Nodes {
+		nodes[i] = memDict(n)
+	}
+	edges := make([]map[string]any, len(graph.Edges))
+	for i, e := range graph.Edges {
+		edges[i] = map[string]any{"src": e.From, "dst": e.To, "rel": e.Rel}
+	}
+	return 200, map[string]any{"nodes": nodes, "edges": edges}, nil
+}
+
+// undo reverses a journaled mutation: the newest, one by exact ts, or the
+// newest touching a given memory.
+func (s *Server) undo(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	j := s.store.Journal()
+	if j == nil {
+		return 0, nil, errStatus(409, "journaling is disabled — nothing to undo")
+	}
+	var entry *memory.JournalEntry
+	if p := bodyFloatPtr(b, "ts"); p != nil {
+		ts := bodyFloat(b, "ts", 0)
+		found, ferr := j.FindByTS(ts, 1e-3)
+		if ferr != nil || found == nil {
+			return 0, nil, errStatus(404, "no journal entry at ts=%v", ts)
+		}
+		entry = found
+	} else {
+		entries, rerr := j.Read(memory.ReadOpts{})
+		if rerr != nil {
+			return 0, nil, rerr
+		}
+		memID := bodyStr(b, "memory_id", "")
+		for i := len(entries) - 1; i >= 0; i-- {
+			if memID == "" || memory.EntryTouches(entries[i], memID) {
+				entry = &entries[i]
+				break
+			}
+		}
+		if entry == nil {
+			return 0, nil, errStatus(404, "no journal entry to undo")
+		}
+	}
+	ok, err := s.store.Undo(r.Context(), *entry)
+	if err != nil {
+		return 0, nil, err
+	}
+	return 200, map[string]any{"ok": ok, "op": string(entry.Op), "id": entry.ID,
+		"ts": entry.TS, "actor": entry.Actor}, nil
+}
+
+// nuke deletes every memory, guarded by an explicit confirm string so a stray
+// request can't empty the store.
+func (s *Server) nuke(r *http.Request) (int, any, error) {
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	if bodyStr(b, "confirm", "") != "DELETE ALL" {
+		return 0, nil, errStatus(400, `refusing to nuke: pass {"confirm": "DELETE ALL"}`)
+	}
+	n, err := s.store.Nuke(r.Context())
+	if err != nil {
+		return 0, nil, err
+	}
+	return 200, map[string]any{"ok": true, "deleted": n}, nil
+}
+
+func (s *Server) journalTail(r *http.Request) (int, any, error) {
+	j := s.store.Journal()
+	if j == nil {
+		return 200, map[string]any{"count": 0, "entries": []any{}}, nil
+	}
+	since, _, err := timeparse.Parse(r.URL.Query().Get("since"))
+	if err != nil {
+		return 0, nil, errStatus(400, "%s", err.Error())
+	}
+	entries, err := j.Read(memory.ReadOpts{
+		Op:    r.URL.Query().Get("op"),
+		Since: since,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	if n := qsInt(r, "n", 20); n > 0 && len(entries) > n {
+		entries = entries[len(entries)-n:]
+	}
+	out := make([]map[string]any, len(entries))
+	for i, e := range entries {
+		out[i] = journalEntryDict(e)
+	}
+	return 200, map[string]any{"count": len(out), "entries": out}, nil
+}
+
+// archiveRouteAllowed gates /export and /import: they reach past the store
+// onto the server's filesystem (arbitrary read into the store / arbitrary .gz
+// write), so unlike the store-scoped routes they require a configured token
+// outright. A peer-address check is no substitute: the handler accepts any
+// Content-Type, so even a loopback bind is reachable by a drive-by
+// cross-origin POST from a browser, and localhost proxies forward remote
+// callers with a loopback peer address. Local tokenless workflows use the
+// CLI (`houkai export` / `houkai import`), which talks to the store directly.
+func (s *Server) archiveRouteAllowed(_ *http.Request) error {
+	if s.token != "" {
+		return nil
+	}
+	return errStatus(403, "archive routes read/write server-side paths and "+
+		"require a configured auth token; use the `houkai export` / "+
+		"`houkai import` CLI commands for tokenless local use")
+}
+
+// export writes a .ahkai archive to a server-side path. The path is resolved
+// on the server; this route requires a configured auth token (see
+// archiveRouteAllowed).
+func (s *Server) export(r *http.Request) (int, any, error) {
+	if err := s.archiveRouteAllowed(r); err != nil {
+		return 0, nil, err
+	}
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	path, err := requireStr(b, "path")
+	if err != nil {
+		return 0, nil, err
+	}
+	since, err := parseTimeVal(b["since"])
+	if err != nil {
+		return 0, nil, err
+	}
+	var types []memory.MemoryType
+	for _, t := range bodyStrSlice(b, "types") {
+		types = append(types, memory.MemoryType(t))
+	}
+	summary, err := s.store.Export(r.Context(), path, memory.ExportOpts{
+		IncludeVectors:    bodyBoolDef(b, "include_vectors", true),
+		IncludeSuperseded: bodyBool(b, "include_superseded"),
+		Types:             types,
+		Tags:              bodyStrSlice(b, "tags"),
+		Since:             since,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	return 200, summary, nil
+}
+
+func (s *Server) importArchive(r *http.Request) (int, any, error) {
+	if err := s.archiveRouteAllowed(r); err != nil {
+		return 0, nil, err
+	}
+	b, err := readBody(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	path, err := requireStr(b, "path")
+	if err != nil {
+		return 0, nil, err
+	}
+	summary, err := s.store.Import(r.Context(), path, memory.ImportOpts{
+		OnConflict:        memory.ImportConflictPolicy(bodyStr(b, "on_conflict", "")),
+		RegenerateVectors: bodyBool(b, "regenerate_vectors"),
+		DryRun:            bodyBool(b, "dry_run"),
+	})
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil, errStatus(404, "archive not found: %s", path)
+		}
+		// Mirror Python's status mapping: id collisions are a conflict (409),
+		// any other import failure (bad format, model mismatch) is caller
+		// error (400) — neither is an internal fault.
+		var conflict *memory.ImportConflictError
+		if errors.As(err, &conflict) {
+			return 0, nil, errStatus(409, "%s", err.Error())
+		}
+		return 0, nil, errStatus(400, "%s", err.Error())
+	}
+	return 200, summary, nil
+}
+
 // recallParams pulls recall arguments from a JSON body (POST) or query (GET).
 func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, error) {
 	if r.Method == http.MethodPost {
@@ -851,7 +1194,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Since:             since,
 			Until:             until,
 			Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeSemantic))),
-			Overfetch:         4,
+			Overfetch:         int(bodyFloat(b, "overfetch", 4)),
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
 			IncludeExpired:    bodyBool(b, "include_expired"),
 			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
@@ -862,6 +1205,12 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Expand:            expandFromBody(b),
 			NoTouch:           !bodyBoolDef(b, "touch", true),
 			Explain:           bodyBool(b, "explain"),
+			// These three were reachable through the MCP tool and through the
+			// Python port's HTTP recall, but not here — so an HTTP client of the
+			// Go server had no trust floor at all.
+			MinTrust:     memory.TrustLevel(bodyStr(b, "min_trust", "")),
+			LexicalIndex: memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
+			AsOf:         bodyFloat(b, "as_of", 0),
 		}, int(bodyFloat(b, "k", 5)), nil
 	}
 
@@ -881,10 +1230,17 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 		Since:             since,
 		Until:             until,
 		Mode:              memory.RecallMode(qsStr(r, "mode", string(memory.ModeSemantic))),
-		Overfetch:         4,
+		Overfetch:         qsInt(r, "overfetch", 4),
 		IncludeSuperseded: qsBool(r, "include_superseded"),
 		IncludeExpired:    qsBool(r, "include_expired"),
 		Explain:           qsBool(r, "explain"),
+		// Plain scalars, so they map onto a query string too. touch=false
+		// lets eval/monitoring traffic recall without inflating access
+		// counters, which feed decay reinforcement.
+		NoTouch:      !qsBoolDef(r, "touch", true),
+		MinTrust:     memory.TrustLevel(qsStr(r, "min_trust", "")),
+		LexicalIndex: memory.LexicalIndexMode(qsStr(r, "lexical_index", "")),
+		AsOf:         qsFloat(r, "as_of", 0),
 	}, qsInt(r, "k", 5), nil
 }
 
@@ -978,6 +1334,15 @@ func memDict(m memory.Memory) map[string]any {
 		"superseded_by": superseded,
 		"superseded_at": supersededAt,
 		"expires_at":    expiresAt,
+		// Always present, never elided to null: a REST client can set these on
+		// a write, so it has to be able to read them back — and "absent" would
+		// be indistinguishable from "not pinned" / "unlabelled".
+		"pinned": m.Pinned,
+		"trust":  string(memory.TrustOrDefault(m.Trust)),
+		// Valid time — when the memory was true, as opposed to when we learned
+		// it. 0 on either end means unbounded.
+		"valid_from":  m.ValidFrom,
+		"valid_until": m.ValidUntil,
 	}
 }
 
@@ -1043,6 +1408,11 @@ func requireStr(b map[string]any, key string) (string, error) {
 	return s, nil
 }
 
+// The body coercers below reject mistyped present values by panicking with
+// an *httpError, recovered in callLocked into a 400 (mirrors Python's
+// coercers raising HttpError). Silent defaulting was destructive in the
+// worst case: `{"dry_run": "true"}` coerced to false and ran a real purge.
+
 func bodyStr(b map[string]any, key, def string) string {
 	if v, ok := b[key].(string); ok && v != "" {
 		return v
@@ -1052,31 +1422,56 @@ func bodyStr(b map[string]any, key, def string) string {
 
 func bodyFloat(b map[string]any, key string, def float64) float64 {
 	switch v := b[key].(type) {
+	case nil:
+		return def
+	case bool:
+		// bool would coerce to 0/1 — reject explicitly, like Python.
 	case float64:
 		return v
 	case json.Number:
 		f, _ := v.Float64()
 		return f
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
-	return def
+	panic(errStatus(400, "%s: not a valid number", key))
 }
 
 func bodyBool(b map[string]any, key string) bool {
-	v, _ := b[key].(bool)
-	return v
+	return bodyBoolDef(b, key, false)
 }
 
 // bodyBoolDef reads an optional bool defaulting to def when the key is absent.
 func bodyBoolDef(b map[string]any, key string, def bool) bool {
-	if v, ok := b[key].(bool); ok {
+	switch v := b[key].(type) {
+	case nil:
+		return def
+	case bool:
 		return v
+	case string:
+		// JSON string "false" must not be truthy (mirrors Python).
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		}
+		return false
+	case float64:
+		return v != 0
+	case json.Number:
+		f, _ := v.Float64()
+		return f != 0
 	}
-	return def
+	panic(errStatus(400, "%s: not a valid boolean", key))
 }
 
 // bodyFloatPtr returns a *float32 for an optional numeric field (nil = absent).
 func bodyFloatPtr(b map[string]any, key string) *float32 {
 	switch v := b[key].(type) {
+	case nil:
+		return nil
+	case bool:
 	case float64:
 		x := float32(v)
 		return &x
@@ -1084,22 +1479,37 @@ func bodyFloatPtr(b map[string]any, key string) *float32 {
 		f, _ := v.Float64()
 		x := float32(f)
 		return &x
-	}
-	return nil
-}
-
-func bodyStrSlice(b map[string]any, key string) []string {
-	raw, ok := b[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, v := range raw {
-		if s, ok := v.(string); ok {
-			out = append(out, s)
+	case string:
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			x := float32(f)
+			return &x
 		}
 	}
-	return out
+	panic(errStatus(400, "%s: not a valid number", key))
+}
+
+// bodyStrSlice coerces a string-list field. A lone string becomes a
+// one-element list — passing it through raw would drop the value entirely.
+// Anything other than a string / list of strings is a 400 (mirrors Python's
+// _body_tags).
+func bodyStrSlice(b map[string]any, key string) []string {
+	switch v := b[key].(type) {
+	case nil:
+		return nil
+	case string:
+		return []string{v}
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, x := range v {
+			s, ok := x.(string)
+			if !ok {
+				panic(errStatus(400, "%s: must be a string or a list of strings", key))
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+	panic(errStatus(400, "%s: must be a string or a list of strings", key))
 }
 
 // bodySinceUntil resolves the since/until time filters from a JSON body. They
@@ -1147,7 +1557,7 @@ func qsInt(r *http.Request, key string, def int) int {
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		panic(errStatus(400, "'%s' is not a valid integer", v))
 	}
 	return n
 }
@@ -1159,13 +1569,21 @@ func qsFloat(r *http.Request, key string, def float64) float64 {
 	}
 	f, err := strconv.ParseFloat(v, 64)
 	if err != nil {
-		return def
+		panic(errStatus(400, "'%s' is not a valid number", v))
 	}
 	return f
 }
 
 func qsBool(r *http.Request, key string) bool {
-	switch r.URL.Query().Get(key) {
+	return qsBoolDef(r, key, false)
+}
+
+func qsBoolDef(r *http.Request, key string, def bool) bool {
+	v := r.URL.Query().Get(key)
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
 	case "1", "true", "yes", "on":
 		return true
 	}

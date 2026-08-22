@@ -18,6 +18,7 @@ from ai_houkai.memory_system import AsyncMemoryStore, MemoryStore
 
 
 class TestEditStore:
+    @pytest.mark.needs_model
     def test_edit_text_reembeds(self, store: MemoryStore):
         m = store.remember("today the weather in the mountains was rainy",
                            tags=["log"])

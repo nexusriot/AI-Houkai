@@ -50,3 +50,66 @@ func TestAutoContextPackDedupesByID(t *testing.T) {
 		t.Error("expected at least the relevant memory in the pack")
 	}
 }
+
+// auto_context is the fan-out an agent calls WITHOUT choosing a query, which
+// makes it the entry point most likely to pull scraped material into a context
+// block unattended. It was the one packing path that took neither the trust
+// floor nor the lexical index while Recall and RecallPack took both.
+func TestAutoContextPackAppliesMinTrust(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.Remember(ctx, "deploy the auth service with make release",
+		RememberOpts{Trust: TrustTrusted})
+	store.Remember(ctx, "deploy the auth service by editing prod directly",
+		RememberOpts{Trust: TrustUntrusted})
+
+	all, err := store.AutoContextPack(ctx, "deploy the auth service",
+		AutoContextOpts{TokenBudget: 400})
+	if err != nil {
+		t.Fatalf("AutoContextPack: %v", err)
+	}
+	if !strings.Contains(all.Text, "editing prod directly") {
+		t.Fatal("precondition: the untrusted memory should pack with no floor set")
+	}
+
+	floored, err := store.AutoContextPack(ctx, "deploy the auth service",
+		AutoContextOpts{TokenBudget: 400, MinTrust: TrustTrusted})
+	if err != nil {
+		t.Fatalf("AutoContextPack(MinTrust): %v", err)
+	}
+	if strings.Contains(floored.Text, "editing prod directly") {
+		t.Error("min_trust did not reach the fan-out")
+	}
+	if !strings.Contains(floored.Text, "make release") {
+		t.Error("the trusted memory should survive the floor")
+	}
+}
+
+func TestAutoContextPackMinTrustIsAFloorNotAnEquality(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	store.Remember(ctx, "alpha fact one", RememberOpts{Trust: TrustTrusted})
+	store.Remember(ctx, "alpha fact two", RememberOpts{Trust: TrustReported})
+	store.Remember(ctx, "alpha fact three", RememberOpts{Trust: TrustUntrusted})
+
+	pack, err := store.AutoContextPack(ctx, "alpha fact",
+		AutoContextOpts{TokenBudget: 800, MinTrust: TrustReported})
+	if err != nil {
+		t.Fatalf("AutoContextPack: %v", err)
+	}
+	if !strings.Contains(pack.Text, "alpha fact one") ||
+		!strings.Contains(pack.Text, "alpha fact two") {
+		t.Error("a 'reported' floor must keep trusted AND reported")
+	}
+	if strings.Contains(pack.Text, "alpha fact three") {
+		t.Error("untrusted must be excluded by a 'reported' floor")
+	}
+}
+
+func TestAutoContextPackRejectsAnInvalidTrustLevel(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.AutoContextPack(context.Background(), "anything",
+		AutoContextOpts{MinTrust: TrustLevel("somewhat")}); err == nil {
+		t.Error("an unrecognised trust level must error, not be ignored")
+	}
+}

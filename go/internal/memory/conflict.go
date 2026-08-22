@@ -73,6 +73,15 @@ func detectConflicts(a Memory, candidates []MemoryWithScore, threshold float32, 
 		if b.SupersededBy != "" {
 			continue
 		}
+		// A lapsed row is hidden from recall/list and waiting for PurgeExpired,
+		// so it must not clash with a new write: under on_conflict="raise" it
+		// would reject the write with a conflict the caller cannot see or
+		// resolve, and under "supersede" it would re-label a memory that is
+		// already on its way out. findByContentHash skips expired rows for the
+		// same reason.
+		if b.ExpiresAt > 0 && b.ExpiresAt <= nowFloat() {
+			continue
+		}
 		if b.Type != a.Type {
 			continue
 		}

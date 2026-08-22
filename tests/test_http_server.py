@@ -590,3 +590,236 @@ class TestHistoryEndpoints:
         s, _ = _req(server, "GET",
                     "/memories/" + mem["id"] + "/at?ts=" + str(t))
         assert s == 404
+
+
+class TestWriteFlagsAreReadableBack:
+    """`pinned` and `trust` can be set over HTTP but never read back.
+
+    The MCP serialiser carries both; `_mem_dict` does not, so a REST client —
+    ai-houkai-service is the main one — can pin a memory or mark it untrusted
+    and then has no way to see that state again. Anything rendering a memory
+    list cannot show a pin, and a client cannot tell trusted content from
+    scraped content it labelled itself.
+    """
+
+    def test_post_memories_echoes_the_flags(self, server):
+        status, body = _req(server, "POST", "/memories",
+                            {"text": "a standing rule", "pinned": True,
+                             "trust": "reported"})
+        assert status == 201, body
+        assert body["pinned"] is True
+        assert body["trust"] == "reported"
+
+    def test_get_memory_reports_the_flags(self, server):
+        _, created = _req(server, "POST", "/memories",
+                          {"text": "another standing rule", "pinned": True,
+                           "trust": "untrusted"})
+        status, body = _req(server, "GET", f"/memories/{created['id']}")
+        assert status == 200, body
+        assert body["pinned"] is True
+        assert body["trust"] == "untrusted"
+
+    def test_defaults_are_reported_explicitly(self, server):
+        """Absent is not the same as false: a client must not have to guess."""
+        _, created = _req(server, "POST", "/memories", {"text": "a plain fact"})
+        _, body = _req(server, "GET", f"/memories/{created['id']}")
+        assert body["pinned"] is False
+        assert body["trust"] == "trusted"
+
+    def test_recall_hits_carry_the_flags(self, server):
+        _req(server, "POST", "/memories",
+             {"text": "recallable standing rule", "pinned": True,
+              "trust": "reported"})
+        status, body = _req(server, "POST", "/recall",
+                            {"query": "recallable standing rule", "k": 5})
+        assert status == 200, body
+        hit = next(h for h in body["results"]
+                   if h["text"] == "recallable standing rule")
+        assert hit["pinned"] is True
+        assert hit["trust"] == "reported"
+
+    def test_list_reports_the_flags(self, server):
+        _req(server, "POST", "/memories",
+             {"text": "listed standing rule", "pinned": True})
+        status, body = _req(server, "GET", "/memories?limit=10")
+        assert status == 200, body
+        row = next(m for m in body["memories"]
+                   if m["text"] == "listed standing rule")
+        assert row["pinned"] is True
+        assert row["trust"] == "trusted"
+
+
+class TestIdempotentRepeatReportsNoNewRow:
+    """201/stored:true says "I created something". An idempotent repeat creates
+    nothing — it finds the existing row and bumps it — so a client replaying a
+    batch every session was told it had written N new rows when it wrote none.
+    """
+
+    def test_first_write_is_created(self, server):
+        status, body = _req(server, "POST", "/memories",
+                            {"text": "repeat me", "idempotent": True})
+        assert status == 201, body
+        assert body["stored"] is True
+
+    def test_the_repeat_is_a_200_with_stored_false(self, server):
+        _, first = _req(server, "POST", "/memories",
+                        {"text": "repeat me", "idempotent": True})
+        status, second = _req(server, "POST", "/memories",
+                              {"text": "repeat me", "idempotent": True})
+        assert status == 200, second
+        assert second["stored"] is False
+        assert second["id"] == first["id"]
+        assert "conflicts" not in second
+
+    def test_a_write_without_the_flag_is_always_created(self, server):
+        _req(server, "POST", "/memories", {"text": "no flag here"})
+        status, body = _req(server, "POST", "/memories", {"text": "no flag here"})
+        assert status == 201, body
+        assert body["stored"] is True
+
+
+class TestTrashPurgeHonoursRetention:
+    """`older_than_days` must not fall through to "empty the whole trash".
+
+    The handler used to read only `memory_id`, so a client asking to reclaim
+    month-old entries got every recoverable memory destroyed instead — silently,
+    and with no way back. The Go port and the MCP tool both take the argument.
+    """
+
+    def _trash_two(self, server):
+        ids = []
+        for text in ("first to bin", "second to bin"):
+            _, mem = _req(server, "POST", "/memories", {"text": text})
+            _req(server, "POST", "/trash", {"memory_id": mem["id"]})
+            ids.append(mem["id"])
+        return ids
+
+    def test_a_retention_cutoff_spares_fresh_entries(self, server):
+        self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge",
+                            {"older_than_days": 30})
+        assert status == 200, body
+        assert body["purged"] == 0, "just-trashed entries are not 30 days old"
+        _, listed = _req(server, "GET", "/trash")
+        assert len(listed["entries"]) == 2
+
+    def test_both_arguments_together_are_rejected(self, server):
+        ids = self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge",
+                            {"memory_id": ids[0], "older_than_days": 30})
+        assert status == 400, body
+        _, listed = _req(server, "GET", "/trash")
+        assert len(listed["entries"]) == 2, "a rejected request must purge nothing"
+
+    def test_an_empty_body_still_empties_the_trash(self, server):
+        self._trash_two(server)
+        status, body = _req(server, "POST", "/trash/purge", {})
+        assert status == 200, body
+        assert body["purged"] == 2
+
+
+class TestRecallScalarKnobs:
+    """POST `touch` and GET `min_trust`/`lexical_index` used to be silently
+    dropped — a read-only recall still bumped access stats, and a GET client
+    that set a provenance floor got untrusted rows anyway."""
+
+    def test_post_touch_false_leaves_access_stats(self, server, store):
+        m = store.remember("untouchable fact")
+        status, body = _req(server, "POST", "/recall",
+                            {"query": "untouchable fact", "k": 1,
+                             "touch": False})
+        assert status == 200 and body["results"]
+        assert store.get(m.id).access_count == 0
+
+    def test_post_touch_defaults_on(self, server, store):
+        m = store.remember("touchable fact")
+        _req(server, "POST", "/recall", {"query": "touchable fact", "k": 1})
+        assert store.get(m.id).access_count == 1
+
+    def test_get_touch_false(self, server, store):
+        m = store.remember("get untouchable")
+        status, body = _req(server, "GET",
+                            "/recall?query=get+untouchable&k=1&touch=false")
+        assert status == 200 and body["results"]
+        assert store.get(m.id).access_count == 0
+
+    def test_get_min_trust_filters(self, server, store):
+        store.remember("provenance fact", trust="untrusted")
+        status, body = _req(
+            server, "GET", "/recall?query=provenance+fact&min_trust=trusted")
+        assert status == 200
+        assert body["results"] == []
+        status, body = _req(server, "GET", "/recall?query=provenance+fact")
+        assert status == 200 and body["results"]
+
+    def test_get_lexical_index_accepted(self, server, store):
+        store.remember("corpus lexical subject")
+        status, body = _req(
+            server, "GET",
+            "/recall?query=corpus+lexical+subject&mode=hybrid"
+            "&lexical_index=corpus")
+        assert status == 200 and body["results"]
+
+
+class TestArchiveRouteGate:
+    """/export and /import reach past the store onto the server filesystem, so
+    they require a configured token outright — a peer-address check is no
+    substitute (any-Content-Type parsing makes even a loopback bind reachable
+    by a drive-by cross-origin POST, and localhost proxies forward remote
+    callers with a loopback peer)."""
+
+    def test_predicate(self):
+        allowed = http_mod._archive_route_allowed
+        assert not allowed("/export", None)
+        assert not allowed("/import", None)
+        # An empty token is unconfigured, not a credential — its "Bearer "
+        # header carries no secret.
+        assert not allowed("/export", "")
+        assert allowed("/export", "sekrit")
+        assert allowed("/import", "sekrit")
+        # Store-scoped routes are unaffected by the gate.
+        assert allowed("/recall", None)
+        assert allowed("/recall", "")
+
+    def test_empty_token_server_refuses_archive_routes(self, store, tmp_path):
+        httpd = make_server(host="127.0.0.1", port=0, store=store,
+                            auth_token="")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        host, port = httpd.server_address
+        try:
+            status, body = _req(
+                f"http://{host}:{port}", "POST", "/export",
+                {"path": str(tmp_path / "empty-token.ahkai")},
+                headers={"Authorization": "Bearer "})
+            assert status == 403
+            assert "server-side paths" in body["error"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_tokenless_server_refuses_archive_routes(self, server, tmp_path):
+        for path in ("/export", "/import"):
+            status, body = _req(server, "POST", path,
+                                {"path": str(tmp_path / "x.ahkai")})
+            assert status == 403, (path, status)
+            assert "server-side paths" in body["error"]
+
+    def test_tokened_server_allows_archive_routes(self, store, tmp_path):
+        store.remember("archive gate subject")
+        httpd = make_server(host="127.0.0.1", port=0, store=store,
+                            auth_token="s3cret")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        host, port = httpd.server_address
+        try:
+            status, body = _req(
+                f"http://{host}:{port}", "POST", "/export",
+                {"path": str(tmp_path / "gate.ahkai")},
+                headers={"Authorization": "Bearer s3cret"})
+            assert status == 200 and body["count"] >= 1
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)

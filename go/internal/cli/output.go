@@ -12,11 +12,10 @@ import (
 )
 
 var (
-	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	idStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	tagStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	impStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	idStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	tagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	impStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 // OutputFormat controls how results are rendered.
@@ -75,6 +74,12 @@ type MemRow struct {
 func PrintRows(w io.Writer, rows []MemRow, format OutputFormat) {
 	switch format {
 	case FormatJSON:
+		// A nil slice marshals to `null`, which is valid JSON but not iterable:
+		// `houkai list -f json | jq '.[]'` failed on a fresh store. An empty
+		// result is an empty list.
+		if rows == nil {
+			rows = []MemRow{}
+		}
 		b, _ := json.MarshalIndent(rows, "", "  ")
 		fmt.Fprintln(w, string(b))
 	case FormatTSV:
@@ -98,7 +103,7 @@ func PrintRows(w io.Writer, rows []MemRow, format OutputFormat) {
 func printRich(w io.Writer, rows []MemRow) {
 	colW := []int{8, 11, 14, 10, 16, 0} // id, type, importance, age, tags, text
 	hdr := []string{"ID", "TYPE", "IMPORTANCE", "AGE", "TAGS", "TEXT"}
-	printRow(w, hdr, colW, headerStyle)
+	printRow(w, hdr, colW)
 	fmt.Fprintln(w, strings.Repeat("─", 80))
 	for _, r := range rows {
 		sup := ""
@@ -113,11 +118,11 @@ func printRich(w io.Writer, rows []MemRow) {
 			tagStyle.Render(strings.Join(r.Tags, ",")),
 			r.Text + dimStyle.Render(sup),
 		}
-		printRow(w, cells, colW, lipgloss.NewStyle())
+		printRow(w, cells, colW)
 	}
 }
 
-func printRow(w io.Writer, cells []string, widths []int, _ lipgloss.Style) {
+func printRow(w io.Writer, cells []string, widths []int) {
 	for i, c := range cells {
 		if i < len(widths)-1 && widths[i] > 0 {
 			fmt.Fprintf(w, "%-*s  ", widths[i], truncate(stripAnsi(c), widths[i]))

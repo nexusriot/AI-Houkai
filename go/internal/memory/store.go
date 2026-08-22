@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -180,6 +182,11 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 	if err := validateTags(opts.Tags); err != nil {
 		return Memory{}, err
 	}
+	if opts.Trust != "" {
+		if err := validateChoice(string(opts.Trust), TrustLevels, "trust"); err != nil {
+			return Memory{}, err
+		}
+	}
 
 	// Expiry: absolute epoch (ExpiresAt) or relative (TTLSeconds from now).
 	// nil / 0 means "never expires". They are mutually exclusive.
@@ -197,6 +204,11 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 			return Memory{}, validationErrorf("expires_at must be >= 0")
 		}
 		expiresAt = *opts.ExpiresAt
+	}
+
+	validFrom, validUntil, err := resolveValidity(opts.ValidFrom, opts.ValidUntil)
+	if err != nil {
+		return Memory{}, err
 	}
 
 	// Importance nil means "unset" → auto-score when an ImportanceFn is
@@ -231,14 +243,88 @@ func (s *MemoryStore) buildMemory(text string, opts RememberOpts) (Memory, error
 		SupersededAt: 0,
 		Polarity:     opts.Polarity,
 		ExpiresAt:    expiresAt,
+		Pinned:       opts.Pinned,
+		Trust:        TrustOrDefault(opts.Trust),
+		ValidFrom:    validFrom,
+		ValidUntil:   validUntil,
 	}
+	// Always recorded, not only when this write asked for idempotency. Gating it
+	// on the flag made dedup work solely between writes that BOTH opted in: an
+	// ordinary Remember followed by an Idempotent re-assertion of the same fact
+	// created a duplicate, because the first row carried no hash to match
+	// against. Mirrors the Python store.
+	m.ContentHash = ContentHash(text)
 	if m.Tags == nil {
 		m.Tags = []string{}
 	}
 	return m, nil
 }
 
+// ContentHash is a stable hash of text for write-time dedup.
+//
+// Normalises case and collapses whitespace first, so "Use ruff for linting"
+// and "use  ruff for linting\n" are the same assertion — which is how the same
+// fact tends to arrive twice from an agent. Deliberately NOT semantic: this is
+// the cheap exact-repeat check that runs before (and independently of) the
+// vector conflict scan.
+func ContentHash(text string) string {
+	normalised := strings.Join(strings.Fields(strings.ToLower(text)), " ")
+	// SHA-256 truncated to 16 bytes: stdlib in both ports, so a hash written
+	// by the Go store is recognised by the Python one and vice versa.
+	sum := sha256.Sum256([]byte(normalised))
+	return hex.EncodeToString(sum[:16])
+}
+
+// findByContentHash returns the live memory carrying digest, or false.
+//
+// Superseded and expired rows are skipped — re-asserting a fact that was
+// explicitly replaced should create a new memory, not resurrect the old.
+func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Memory, bool, error) {
+	if digest == "" {
+		return Memory{}, false, nil
+	}
+	// An indexed metadata lookup, not backend.All: this runs on every
+	// idempotent write, and a full-collection scan made the dedup check the
+	// most expensive part of storing a memory. Limit 0 = every row matching
+	// the exact-hash filter (still tiny) — a fixed cap could hide the one
+	// live row behind enough superseded/expired ones sharing the digest.
+	// Errors propagate — treating a transient backend failure as "no match"
+	// silently inserted a duplicate instead of surfacing the problem.
+	items, err := s.backend.SearchMetadata(ctx, map[string]string{"content_hash": digest}, 0)
+	if err != nil {
+		return Memory{}, false, err
+	}
+	now := nowFloat()
+	for _, it := range items {
+		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+		if m.SupersededBy != "" {
+			continue
+		}
+		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		return m, true, nil
+	}
+	return Memory{}, false, nil
+}
+
 func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
+	if opts.Idempotent {
+		existing, ok, err := s.findByContentHash(ctx, ContentHash(strings.TrimSpace(text)))
+		if err != nil {
+			return Memory{}, false, nil, err
+		}
+		if ok {
+			if err := s.touchMany(ctx, []*Memory{&existing}); err != nil {
+				return existing, false, nil, err
+			}
+			refreshed, err := s.GetByID(ctx, existing.ID)
+			if err != nil {
+				return existing, false, nil, nil
+			}
+			return refreshed, false, nil, nil
+		}
+	}
 	if opts.OnConflict != "" {
 		if err := validateChoice(string(opts.OnConflict), ConflictPolicies, "on_conflict"); err != nil {
 			return Memory{}, false, nil, err
@@ -326,6 +412,23 @@ type RememberOpts struct {
 	// OnConflict overrides the store's configured conflict policy for this
 	// call only (empty = use the store default).
 	OnConflict ConflictPolicy
+	// Pinned marks a standing instruction: always offered to the packer,
+	// never pruned by decay.
+	Pinned bool
+	// Trust records how much the memory's ORIGIN is trusted (empty = trusted).
+	Trust TrustLevel
+	// Idempotent makes a repeated assertion a no-op: the normalised text is
+	// hashed, and if a live memory carries the same hash its access count is
+	// bumped and it is returned unchanged. Agents re-assert the same fact
+	// every session, and the alternative — a vector conflict scan per write —
+	// costs an embedding query and still creates a row.
+	Idempotent bool
+	// ValidFrom/ValidUntil record when the memory was true *in the world*
+	// (half-open, nil/0 = unbounded). Separate from the journal, which records
+	// when we learned it: use these to say "the office moved in March", then ask
+	// Recall with AsOf to get the answer that held at a chosen moment.
+	ValidFrom  *float64
+	ValidUntil *float64
 }
 
 // RememberItem is one entry for RememberMany: a text plus the same optional
@@ -351,7 +454,7 @@ type RememberItem struct {
 //     by the earlier one; an item already superseded within this call is
 //     skipped, so no intra-batch supersede cycles form.
 //   - PolicyRaise is rejected (bulk rollback is ill-defined; use Remember).
-func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, batchSize int, onConflict ConflictPolicy) ([]Memory, error) {
+func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, batchSize int, onConflict ConflictPolicy, idempotent bool) ([]Memory, error) {
 	if batchSize < 1 {
 		return nil, validationErrorf("batch_size must be >= 1")
 	}
@@ -367,16 +470,57 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 	}
 
 	// Build + validate all up front so a bad item aborts before any write.
-	mems := make([]Memory, 0, len(items))
+	built := make([]Memory, 0, len(items))
 	for i, it := range items {
 		m, err := s.buildMemory(it.Text, it.RememberOpts)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
-		mems = append(mems, m)
+		built = append(built, m)
 	}
-	if len(mems) == 0 {
+	if len(built) == 0 {
 		return []Memory{}, nil
+	}
+
+	// `result` keeps one entry per input so the caller can zip it against their
+	// list; `mems` is only the rows that actually get written. firstSeen handles
+	// intra-call duplicates, which a store lookup alone would miss because
+	// nothing has been written yet.
+	result := built
+	mems := built
+	if idempotent {
+		result = make([]Memory, 0, len(built))
+		mems = make([]Memory, 0, len(built))
+		firstSeen := make(map[string]Memory, len(built))
+		var touch []*Memory
+		for i := range built {
+			digest := ContentHash(strings.TrimSpace(built[i].Text))
+			if prev, ok := firstSeen[digest]; ok {
+				result = append(result, prev)
+				continue
+			}
+			existing, ok, err := s.findByContentHash(ctx, digest)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				firstSeen[digest] = existing
+				result = append(result, existing)
+				touch = append(touch, &existing)
+				continue
+			}
+			firstSeen[digest] = built[i]
+			result = append(result, built[i])
+			mems = append(mems, built[i])
+		}
+		if len(touch) > 0 {
+			if err := s.touchMany(ctx, touch); err != nil {
+				return nil, err
+			}
+		}
+		if len(mems) == 0 {
+			return result, nil
+		}
 	}
 
 	// Batched embed + add; keep each vector to reuse for the conflict scan.
@@ -414,6 +558,8 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 		}
 	}
 
+	// Only newly written rows are scanned: an idempotent hit was already in the
+	// store, so re-scanning it would flag it against itself.
 	if policy != PolicyIgnore {
 		superseded := make(map[string]bool)
 		flagged := 0
@@ -423,7 +569,7 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 			}
 			hits, err := s.backend.Query(ctx, vecsAll[i], 12)
 			if err != nil {
-				return mems, fmt.Errorf("conflict scan: %w", err)
+				return result, fmt.Errorf("conflict scan: %w", err)
 			}
 			conflicts := detectConflicts(m, hitsToMemoriesWithScore(hits), s.cfg.ConflictThreshold, s.cfg.ConflictFn)
 			if len(conflicts) == 0 {
@@ -438,7 +584,7 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 						continue
 					}
 					if err := s.doSupersede(ctx, c.B.ID, m.ID); err != nil {
-						return mems, fmt.Errorf("supersede conflict %s: %w", c.B.ID, err)
+						return result, fmt.Errorf("supersede conflict %s: %w", c.B.ID, err)
 					}
 					superseded[c.B.ID] = true
 				}
@@ -449,7 +595,7 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 		}
 	}
 
-	return mems, nil
+	return result, nil
 }
 
 // Recall returns up to k memories matching query.
@@ -459,6 +605,14 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	}
 	if err := validateChoice(string(opts.Mode), RecallModes, "mode"); err != nil {
 		return nil, err
+	}
+	if opts.MinTrust != "" {
+		if err := validateChoice(string(opts.MinTrust), TrustLevels, "min_trust"); err != nil {
+			return nil, err
+		}
+	}
+	if opts.AsOf < 0 {
+		return nil, validationErrorf("as_of must be >= 0")
 	}
 	if opts.Fusion == "" {
 		opts.Fusion = FusionWeighted
@@ -479,6 +633,15 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	}
 	if opts.MinCosine != nil && (*opts.MinCosine < -1 || *opts.MinCosine > 1) {
 		return nil, validationErrorf("min_cosine must be in [-1, 1]")
+	}
+	// "" means unspecified and defaults to pool. Anything else has to be a
+	// known mode: "corpus" replaced an earlier "fts" spelling, and unvalidated
+	// that name reads as "pool", losing full-corpus recall with no error.
+	if opts.LexicalIndex != "" {
+		if err := validateChoice(string(opts.LexicalIndex),
+			LexicalIndexes, "lexical_index"); err != nil {
+			return nil, err
+		}
 	}
 
 	t0 := time.Now()
@@ -509,11 +672,19 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	// where-clause), the Go backend filters entirely client-side, so ANY active
 	// filter — not just tag — forces an over-fetch to avoid under-returning.
 	// Expiry filtering and reranking both reorder/drop rows, so they force it too.
+	//
+	// EVERY optional post-query filter has to be listed here. One that is
+	// missing does not fail loudly: it silently returns fewer than k results,
+	// because the rows that would have replaced the dropped ones were never
+	// fetched. The validity filter cannot be listed — it is always on — so the
+	// fast path re-queries with overfetch on a shortfall below, which also
+	// catches any future filter this list misses.
 	noPostFilter := opts.Mode == ModeSemantic && opts.IncludeSuperseded &&
 		opts.IncludeExpired && reranker == nil &&
 		opts.Tag == "" && opts.Type == "" && opts.MinImportance <= 0 &&
 		opts.Source == "" && opts.Since == 0 && opts.Until == 0 &&
-		!needEmb && opts.MinCosine == nil
+		!needEmb && opts.MinCosine == nil && opts.MinTrust == "" &&
+		opts.LexicalIndex != LexicalCorpus && opts.AsOf == 0
 
 	nFetch := k
 	if !noPostFilter {
@@ -530,42 +701,20 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	if err != nil {
 		return nil, err
 	}
-	hits, err := s.backend.Query(ctx, vecs[0], nFetch)
-	if err != nil {
-		return nil, err
-	}
 
 	now := nowFloat()
 
-	// The "where-clause" filters (type/importance/source/since/until) form the
-	// scoring pool; tag/superseded/min_cosine are applied inside the scorers so
-	// the BM25 pool matches Python's server-side-filtered document set.
-	var pool []cand
-	for _, h := range hits {
-		m := MetadataToMemory(h.ID, h.Content, h.Metadata)
-		if opts.Type != "" && m.Type != opts.Type {
-			continue
-		}
-		if m.Importance < opts.MinImportance {
-			continue
-		}
-		if opts.Source != "" && m.Source != opts.Source {
-			continue
-		}
-		if opts.Since > 0 && m.CreatedAt < opts.Since {
-			continue
-		}
-		if opts.Until > 0 && m.CreatedAt > opts.Until {
-			continue
-		}
-		// Drop expired unless asked to keep them. Post-filter (not a backend
-		// query filter), so rows written before TTL existed (ExpiresAt 0) are
-		// unaffected.
-		if !opts.IncludeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
-			continue
-		}
-		pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
+	// Which instant the validity interval is tested against: "now" unless the
+	// caller asked about a past moment.
+	validityTS := now
+	if opts.AsOf > 0 {
+		validityTS = opts.AsOf
 	}
+	// A memory replaced since AsOf is exactly what "what was true then" should
+	// return, so AsOf admits superseded rows into the pool and lets the validity
+	// filter decide. Without this, AsOf would answer with today's beliefs
+	// wearing a past timestamp.
+	poolSuperseded := opts.IncludeSuperseded || opts.AsOf > 0
 
 	w := opts.Weights
 	if w == (HybridWeights{}) {
@@ -581,24 +730,104 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	}
 
 	var expl map[string]map[string]any
-	if opts.Explain {
-		expl = map[string]map[string]any{}
-	}
-
 	var scored []scoredCand
-	if opts.Mode == ModeHybrid {
-		docs := make([]string, len(pool))
-		for i, c := range pool {
-			docs[i] = c.mem.Text
+	for {
+		hits, qerr := s.backend.Query(ctx, vecs[0], nFetch)
+		if qerr != nil {
+			return nil, qerr
 		}
-		bm25 := bm25Score(query, docs)
-		if opts.Fusion == FusionRRF {
-			scored = s.scoreRRF(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now, 60)
+
+		// Full-corpus lexical recall — see unionLexical.
+		if opts.LexicalIndex == LexicalCorpus && opts.Mode == ModeHybrid {
+			hits = s.unionLexical(ctx, hits, query, vecs[0], nFetch)
+		}
+
+		// The "where-clause" filters (type/importance/source/since/until) form
+		// the scoring pool; tag/superseded/min_cosine are applied inside the
+		// scorers so the BM25 pool matches Python's server-side-filtered
+		// document set. Trust, validity and expiry deliberately do NOT trim
+		// the pool: Python filters them after scoring, and dropping rows here
+		// would shift BM25 statistics and RRF ranks away from the reference
+		// port.
+		var pool []cand
+		for _, h := range hits {
+			m := MetadataToMemory(h.ID, h.Content, h.Metadata)
+			if opts.Type != "" && m.Type != opts.Type {
+				continue
+			}
+			if m.Importance < opts.MinImportance {
+				continue
+			}
+			if opts.Source != "" && m.Source != opts.Source {
+				continue
+			}
+			if opts.Since > 0 && m.CreatedAt < opts.Since {
+				continue
+			}
+			if opts.Until > 0 && m.CreatedAt > opts.Until {
+				continue
+			}
+			pool = append(pool, cand{mem: m, cosine: h.Similarity, emb: h.Embedding})
+		}
+
+		expl = nil
+		if opts.Explain {
+			expl = map[string]map[string]any{}
+		}
+
+		if opts.Mode == ModeHybrid {
+			docs := make([]string, len(pool))
+			for i, c := range pool {
+				docs[i] = c.mem.Text
+			}
+			bm25 := bm25Score(query, docs)
+			if opts.Fusion == FusionRRF {
+				scored = s.scoreRRF(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now, 60)
+			} else {
+				scored = s.scoreWeighted(pool, bm25, w, opts.Tag, poolSuperseded, opts.MinCosine, expl, now)
+			}
 		} else {
-			scored = s.scoreWeighted(pool, bm25, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl, now)
+			scored = scoreSemantic(pool, w, opts.Tag, poolSuperseded, opts.MinCosine, expl)
 		}
-	} else {
-		scored = scoreSemantic(pool, w, opts.Tag, opts.IncludeSuperseded, opts.MinCosine, expl)
+
+		// Post-scoring filters, in the reference port's order: trust, then
+		// validity, then expiry. Rows written before these features existed
+		// carry zero values and pass untouched.
+		kept := scored[:0]
+		for _, sc := range scored {
+			if opts.MinTrust != "" && TrustRank(sc.mem.Trust) > TrustRank(opts.MinTrust) {
+				continue
+			}
+			// Drop memories that were not true at the moment being asked
+			// about. Default (AsOf unset) means "now", so closing a
+			// ValidUntil retires a fact from ordinary recall without
+			// deleting it.
+			if !isValidAt(sc.mem, validityTS) {
+				continue
+			}
+			if !opts.IncludeExpired && sc.mem.ExpiresAt > 0 && sc.mem.ExpiresAt <= now {
+				continue
+			}
+			kept = append(kept, sc)
+		}
+		scored = kept
+
+		// Fast-path shortfall: the always-on validity filter can drop rows
+		// the fetch-exactly-k guard cannot anticipate. When it does — and
+		// unfetched rows remain — fall back to one overfetched pass rather
+		// than silently returning fewer than k.
+		if noPostFilter && len(scored) < k && nFetch < count {
+			noPostFilter = false
+			nFetch = k * overfetch
+			if nFetch > count {
+				nFetch = count
+			}
+			if nFetch < k {
+				nFetch = k
+			}
+			continue
+		}
+		break
 	}
 
 	// Second-stage rerank over the surviving pool, before the top-k cut.
@@ -762,7 +991,38 @@ type RecallOpts struct {
 	// Reranker overrides the store's default reranker for this call: it
 	// rescores the first-stage pool before the top-k cut. nil = store default.
 	Reranker Reranker
+	// MinTrust keeps only memories whose provenance is at least this trusted:
+	// "trusted" admits only trusted, "reported" also admits reported,
+	// "untrusted" admits everything. Empty = no filter. Old rows have no trust
+	// label and read as trusted, so they are never silently excluded.
+	MinTrust TrustLevel
+	// LexicalIndex selects where lexical candidates come from: "" / "pool"
+	// (default) scores BM25 only over the vector over-fetch pool, as before;
+	// "corpus" first unions in whole-corpus matches found through the backend's
+	// own content predicate (chromem-go's $contains), so a memory whose wording
+	// matches but whose vector does not can still surface.
+	LexicalIndex LexicalIndexMode
+	// AsOf asks what was true at a past moment, using the memories' VALID-time
+	// interval (see Memory.ValidFrom). Without it, results are filtered to what
+	// is valid *now*, so a memory whose ValidUntil has passed drops out of
+	// ordinary recall. With it, superseded memories are admitted before the
+	// validity filter runs — a memory that has since been replaced is exactly
+	// what "what was true then" should return, and hiding it would make AsOf
+	// answer with today's beliefs wearing a past timestamp. 0 = not set.
+	AsOf float64
 }
+
+// LexicalIndexMode selects the lexical candidate source for hybrid recall.
+type LexicalIndexMode string
+
+const (
+	LexicalPool   LexicalIndexMode = "pool"
+	LexicalCorpus LexicalIndexMode = "corpus"
+)
+
+// LexicalIndexes is the validated vocabulary, mirroring Python's
+// LEXICAL_INDEXES. The retired "fts" spelling is deliberately absent.
+var LexicalIndexes = []string{string(LexicalPool), string(LexicalCorpus)}
 
 // Forget deletes a memory by ID. Returns true if found and deleted.
 func (s *MemoryStore) Forget(ctx context.Context, id string) (bool, error) {
@@ -792,6 +1052,15 @@ type EditOpts struct {
 	// ExpiresAt: nil = unchanged; a pointer to 0 clears the TTL.
 	ExpiresAt *float64
 	Source    *string
+	// Pinned / Trust: nil = unchanged.
+	Pinned *bool
+	Trust  *TrustLevel
+	// ValidFrom/ValidUntil correct the interval during which the memory was
+	// true; nil = unchanged. Closing an interval is how a fact retires without
+	// being deleted: it drops out of a default recall while staying reachable
+	// via Recall with AsOf inside the old interval. Pass 0 to reopen an end.
+	ValidFrom  *float64
+	ValidUntil *float64
 }
 
 // Edit updates fields of an existing memory in place, keeping its id.
@@ -832,6 +1101,31 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 		}
 		mem.ExpiresAt = *opts.ExpiresAt
 	}
+	if opts.Pinned != nil {
+		mem.Pinned = *opts.Pinned
+	}
+	if opts.Trust != nil {
+		if err := validateChoice(string(*opts.Trust), TrustLevels, "trust"); err != nil {
+			return Memory{}, err
+		}
+		mem.Trust = *opts.Trust
+	}
+	if opts.ValidFrom != nil || opts.ValidUntil != nil {
+		// Validated as a pair against the memory's *resulting* interval, so
+		// closing one end cannot silently produce until <= from.
+		from, until := mem.ValidFrom, mem.ValidUntil
+		if opts.ValidFrom != nil {
+			from = *opts.ValidFrom
+		}
+		if opts.ValidUntil != nil {
+			until = *opts.ValidUntil
+		}
+		vf, vu, err := resolveValidity(&from, &until)
+		if err != nil {
+			return Memory{}, err
+		}
+		mem.ValidFrom, mem.ValidUntil = vf, vu
+	}
 	if opts.Tags != nil {
 		if err := validateTags(opts.Tags); err != nil {
 			return Memory{}, err
@@ -848,6 +1142,14 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 			return Memory{}, validationErrorf("text must be non-empty")
 		}
 		textChanged = newText != mem.Text
+		// Keep the dedup hash in step, or an edited memory would still answer
+		// to its original text on the next idempotent write. Unconditional, as
+		// in the Python port: a row written before the field existed reads back
+		// with an empty hash, and skipping it here would leave that row unable
+		// to dedup for the rest of its life.
+		if textChanged {
+			mem.ContentHash = ContentHash(newText)
+		}
 		mem.Text = newText
 	}
 
@@ -863,8 +1165,30 @@ func (s *MemoryStore) Edit(ctx context.Context, memoryID string, opts EditOpts) 
 	return mem, nil
 }
 
+// ListRecentOpts bounds a ListRecentPage query.
+type ListRecentOpts struct {
+	Limit             int
+	IncludeSuperseded bool
+	IncludeExpired    bool
+	// Before is a keyset cursor on created_at: pass the created_at of the last
+	// item from the previous page to get the next one. Paging by offset would
+	// re-scan the prefix each time; a cursor does not, which is what makes
+	// walking a large store viable. 0 = start from the newest.
+	Before float64
+}
+
 // ListRecent returns up to limit memories sorted by created_at desc.
 func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]Memory, error) {
+	return s.ListRecentPage(ctx, ListRecentOpts{
+		Limit: limit, IncludeSuperseded: includeSuperseded,
+		IncludeExpired: includeExpired,
+	})
+}
+
+// ListRecentPage is ListRecent with a keyset cursor: pass the previous page's
+// last CreatedAt as before. Reads every row and sorts in Go, because the
+// backend offers no ordered pagination.
+func (s *MemoryStore) ListRecentPage(ctx context.Context, o ListRecentOpts) ([]Memory, error) {
 	items, err := s.backend.All(ctx)
 	if err != nil {
 		return nil, err
@@ -873,10 +1197,13 @@ func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSupersed
 	var mems []Memory
 	for _, it := range items {
 		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
-		if !includeSuperseded && m.SupersededBy != "" {
+		if !o.IncludeSuperseded && m.SupersededBy != "" {
 			continue
 		}
-		if !includeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
+		if !o.IncludeExpired && m.ExpiresAt > 0 && m.ExpiresAt <= now {
+			continue
+		}
+		if o.Before > 0 && m.CreatedAt >= o.Before {
 			continue
 		}
 		mems = append(mems, m)
@@ -886,10 +1213,28 @@ func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSupersed
 	sort.SliceStable(mems, func(i, j int) bool {
 		return mems[i].CreatedAt > mems[j].CreatedAt
 	})
-	if limit > 0 && len(mems) > limit {
-		mems = mems[:limit]
+	if o.Limit > 0 && len(mems) > o.Limit {
+		mems = mems[:o.Limit]
 	}
 	return mems, nil
+}
+
+// incomingCandidates returns memories with an edge pointing at id.
+//
+// The backend stores links as an opaque metadata string, so "who points at me?"
+// is not expressible as a metadata filter — the only way to answer it is to read
+// every memory. Neighbors asks once per frontier node per hop, so a depth-2 walk
+// over ten neighbours is eleven full loads. The fix is to denormalise the edge
+// (record a→b on both sides) so this becomes a direct Get; until then, callers
+// on large stores should prefer direction="out".
+func (s *MemoryStore) incomingCandidates(ctx context.Context, id, rel string) []Memory {
+	mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
+	if err != nil {
+		return nil
+	}
+	return mems
 }
 
 // Count returns total stored memories.
@@ -1048,13 +1393,18 @@ func (s *MemoryStore) PurgeExpired(ctx context.Context, now float64, dryRun bool
 	if now == 0 {
 		now = nowFloat()
 	}
-	items, err := s.backend.All(ctx)
+	// Unlike Chroma, chromem-go's Where is exact-match only (map[string]string),
+	// so an expires_at range cannot be pushed into the backend — this reads
+	// every row. Python pushes the range down; the difference is a backend
+	// capability, not a design choice.
+	mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
 	if err != nil {
 		return nil, err
 	}
 	var expired []Memory
-	for _, it := range items {
-		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
+	for _, m := range mems {
 		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
 			expired = append(expired, m)
 		}
@@ -1086,15 +1436,22 @@ func entryTouches(e JournalEntry, memoryID string) bool {
 	return false
 }
 
+// EntryTouches reports whether a journal entry concerns memoryID, including as
+// a link target or supersede counterpart. Exported for the surfaces (MCP/HTTP
+// "undo the newest change to X") that need the same relation History uses.
+func EntryTouches(e JournalEntry, memoryID string) bool {
+	return entryTouches(e, memoryID)
+}
+
 // History returns every journaled event touching memoryID, oldest first.
 // Covers the memory as an op's subject and as a link/supersede counterpart.
 // Store-wide "nuke" events are omitted (use JournalTail for those). Bounded by
 // journal retention.
-func (s *MemoryStore) History(ctx context.Context, memoryID string) ([]JournalEntry, error) {
+func (s *MemoryStore) History(ctx context.Context, memoryID string, includeArchives bool) ([]JournalEntry, error) {
 	if s.journal == nil {
 		return nil, nil
 	}
-	all, err := s.journal.Read(ReadOpts{IncludeArchives: true})
+	all, err := s.journal.Read(ReadOpts{IncludeArchives: includeArchives})
 	if err != nil {
 		return nil, err
 	}
@@ -1423,11 +1780,10 @@ func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction strin
 					}
 				}
 			}
-			// Incoming links (reverse scan).
+			// Incoming links: an index lookup when available, a full scan
+			// per frontier node per hop when not.
 			if direction == "in" || direction == "both" {
-				all, _ := s.backend.All(ctx)
-				for _, it := range all {
-					other := MetadataToMemory(it.ID, it.Content, it.Metadata)
+				for _, other := range s.incomingCandidates(ctx, qid, rel) {
 					if visited[other.ID] {
 						continue
 					}
@@ -1605,6 +1961,21 @@ func (s *MemoryStore) doSupersede(ctx context.Context, oldID, newID string) erro
 	if err := s.backend.UpdateMetadata(ctx, old.ID, MemoryToMetadata(old)); err != nil {
 		return err
 	}
+	// The pin follows the live head of the chain. Superseding a standing
+	// instruction is how you correct one, and a superseded memory is out of the
+	// working set — so without this the pinned slot silently emptied and the
+	// agent stopped seeing the rule until somebody re-pinned by hand. Trust is
+	// deliberately not inherited: both rows survive, each with its own
+	// provenance (unlike Merge, which folds two into one).
+	if old.Pinned && !newMem.Pinned {
+		pinBefore := newMem.ToDict()
+		newMem.Pinned = true
+		if err := s.backend.UpdateMetadata(ctx, newMem.ID, MemoryToMetadata(newMem)); err != nil {
+			return err
+		}
+		s.journalEntry("edit", newMem.ID, pinBefore, newMem.ToDict(),
+			map[string]any{"pinned_from": old.ID})
+	}
 	if _, err := s.linkRaw(ctx, newMem.ID, old.ID, RelSupersedes); err != nil {
 		return err
 	}
@@ -1634,6 +2005,19 @@ func (s *MemoryStore) Restore(ctx context.Context, memID string) (bool, error) {
 	m.SupersededAt = 0
 	if err := s.backend.UpdateMetadata(ctx, m.ID, MemoryToMetadata(m)); err != nil {
 		return false, err
+	}
+	// Hand the pin back: Supersede moved it to the superseder, so leaving it
+	// there would put two rows of the same chain in the working set.
+	if m.Pinned {
+		if sup, serr := s.GetByID(ctx, superseder); serr == nil && sup.Pinned {
+			supBefore := sup.ToDict()
+			sup.Pinned = false
+			if err := s.backend.UpdateMetadata(ctx, sup.ID, MemoryToMetadata(sup)); err != nil {
+				return false, err
+			}
+			s.journalEntry("edit", sup.ID, supBefore, sup.ToDict(),
+				map[string]any{"pinned_back_to": m.ID})
+		}
 	}
 	// Remove the "supersedes" edge from the superseder, matching Python.
 	_, _ = s.unlinkRaw(ctx, superseder, m.ID, RelSupersedes)

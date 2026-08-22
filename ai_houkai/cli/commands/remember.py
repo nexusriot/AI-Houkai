@@ -22,6 +22,18 @@ def remember(
     source: Optional[str] = typer.Option(None, "-s", "--source"),
     on_conflict: str = typer.Option("ignore", "--on-conflict", help="ignore|warn|supersede|raise"),
     polarity: int = typer.Option(0, "--polarity", help="-1, 0, or 1"),
+    pinned: bool = typer.Option(
+        False, "--pin",
+        help="Standing instruction: always offered to `pack --include-pinned`, "
+             "never pruned by decay."),
+    trust: str = typer.Option(
+        "trusted", "--trust",
+        help="trusted|reported|untrusted — how much the memory's ORIGIN is "
+             "trusted. Use untrusted for anything read from content you did "
+             "not author."),
+    idempotent: bool = typer.Option(
+        False, "--idempotent",
+        help="No-op if a live memory already has the same normalised text."),
     ttl: Optional[float] = typer.Option(
         None, "--ttl", help="Time-to-live in seconds; the memory expires after this."),
     expires_at: Optional[float] = typer.Option(
@@ -65,6 +77,9 @@ def remember(
                 expires_at=expires_at,
                 ttl_seconds=ttl,
                 on_conflict=on_conflict,
+                pinned=pinned,
+                trust=trust,
+                idempotent=idempotent,
             )
     except ConflictError as e:
         # --on-conflict raise doing its job: the memory was NOT stored.

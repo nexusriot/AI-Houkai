@@ -30,17 +30,36 @@ def resolve_mcp_command() -> str:
     return CONSOLE_SCRIPT
 
 
-def load_json(path: str, *, overwrite_unparseable: bool = True) -> dict:
-    """Load a JSON config file, returning {} if missing or (optionally) invalid."""
+def load_json(path: str, *, overwrite_unparseable: bool = False) -> dict:
+    """Load a JSON config file, returning {} when it is missing.
+
+    An existing-but-invalid (or non-object) file raises ValueError by
+    default: these are the user's own client configs, and install() writes
+    the merged result back — treating garbage as {} would silently replace
+    the whole file with just our server block. overwrite_unparseable=True
+    opts into exactly that, after parking a ``.bak`` copy of the original.
+    """
     if not os.path.isfile(path):
         return {}
     try:
         with open(path) as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        if not overwrite_unparseable:
-            raise
+            loaded = json.load(f)
+    except json.JSONDecodeError as e:
+        if overwrite_unparseable:
+            shutil.copy2(path, path + ".bak")
+            return {}
+        raise ValueError(
+            f"{path} is not valid JSON ({e}) — fix or remove it, then re-run"
+        ) from e
+    if isinstance(loaded, dict):
+        return loaded
+    if overwrite_unparseable:
+        shutil.copy2(path, path + ".bak")
         return {}
+    raise ValueError(
+        f"{path}: expected a JSON object at the top level, "
+        f"got {type(loaded).__name__} — fix or remove it, then re-run"
+    )
 
 
 def write_json(path: str, config: dict) -> str:
@@ -66,7 +85,6 @@ def write_json(path: str, config: dict) -> str:
 
 
 def verify_server(
-    server_name: str,
     *,
     memory_path: str | None = None,
     collection: str | None = None,

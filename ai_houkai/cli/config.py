@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import os
-import tomllib
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # 3.10 predates the stdlib parser; tomli is its published backport.
+    import tomli as tomllib
 
 from ai_houkai.maintenance.durations import parse_duration
 
@@ -48,6 +53,10 @@ class MaintenanceConfig:
     # summary, "hard" deletes them. Default soft — without consolidation a
     # scheduled apply-mode reflection re-summarises the same clusters forever.
     reflect_consolidate: bool | str = True
+    # Retention for trashed memories, swept on the same tick as the TTL purge.
+    # 0 keeps them forever. Defaulted so an existing constructor keeps working —
+    # a new config field must not break callers.
+    trash_ttl_days: float = 30.0
 
 
 def _resolve_importance(value: object) -> float | str:
@@ -120,6 +129,7 @@ def load_maintenance() -> MaintenanceConfig:
         decay_every=_resolve_interval(m.get("decay_every", "24h")),
         reflect_every=_resolve_interval(m.get("reflect_every", "7d")),
         purge_every=_resolve_interval(m.get("purge_every", "24h")),
+        trash_ttl_days=float(m.get("trash_ttl_days", 30.0)),
         tick_interval=_resolve_interval(m.get("tick_interval", "5m")) or 300,
         log_path=os.path.expanduser(
             str(m.get("log_path", str(_HOUKAI_DIR / "maintenance.log")))

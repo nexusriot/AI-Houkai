@@ -3,11 +3,17 @@ gated graph expansion (ExpandSpec.rerank)."""
 
 from __future__ import annotations
 
+import time
+import types
+
 import pytest
 
 from ai_houkai.memory_system import (
     ExpandSpec, HybridWeights, Link, Memory, MemoryStore,
 )
+# The scoring code reads the clock through its own module namespace, so
+# freezing it means swapping the `time` binding the store actually uses.
+from ai_houkai.memory_system import store as store_module
 
 
 class TestGraphSpread:
@@ -70,8 +76,16 @@ class TestGraphFusionWeighted:
             store.link(center.id, leaf.id, rel="related")
         return center, lonely
 
-    def test_graph_zero_is_noop(self, store: MemoryStore):
+    def test_graph_zero_is_noop(self, store: MemoryStore, monkeypatch):
         self._seed_star(store)
+        # Freeze the clock: the recency term is exp(-λ·age) sampled at call
+        # time, so two wall-clock-separated recalls differ slightly. On a
+        # loaded machine that drift reaches the 6th decimal and this assertion
+        # flakes — but the claim under test ("graph=0.0 changes nothing") is a
+        # property of the scoring function at a fixed instant.
+        frozen = time.time()
+        monkeypatch.setattr(store_module, "time", types.SimpleNamespace(
+            time=lambda: frozen, perf_counter=time.perf_counter))
         base = store.recall("kubernetes", k=5, mode="hybrid",
                             weights=HybridWeights(), touch=False)
         withw = store.recall("kubernetes", k=5, mode="hybrid",
@@ -138,6 +152,7 @@ class TestExpansionGating:
             children.append(c)
         return hub, children
 
+    @pytest.mark.needs_model
     def test_legacy_append_can_exceed_k(self, store: MemoryStore):
         self._seed_hub(store, n_children=5)
         hits = store.recall(

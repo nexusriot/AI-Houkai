@@ -149,3 +149,107 @@ func TestJournalRotateAndPrune(t *testing.T) {
 		t.Errorf("FindByTS: got %+v err=%v", e, err)
 	}
 }
+
+func TestImportRenameRepointsLinks(t *testing.T) {
+	ctx := context.Background()
+	src := newTestStore(t)
+	tgt := newTestStore(t)
+
+	hub, _, _, _ := src.Remember(ctx, "the hub", RememberOpts{})
+	spoke, _, _, _ := src.Remember(ctx, "the spoke", RememberOpts{})
+	if err := src.Link(ctx, spoke.ID, hub.ID, RelRefines); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "linked.ahkai")
+	if _, err := src.Export(ctx, out, ExportOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Squat the hub's id in the target with an unrelated memory.
+	squatter := Memory{
+		ID: hub.ID, Text: "unrelated squatter", Type: Semantic,
+		CreatedAt: nowFloat(), Tags: []string{}, Links: []Link{},
+	}
+	if err := tgt.UpdateMemory(ctx, squatter, true); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := tgt.Import(ctx, out, ImportOpts{OnConflict: ImportRename})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Renamed != 1 || summary.Imported != 1 {
+		t.Fatalf("summary = %+v, want 1 renamed + 1 imported", summary)
+	}
+
+	importedSpoke, err := tgt.GetByID(ctx, spoke.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(importedSpoke.Links) != 1 {
+		t.Fatalf("links = %v, want exactly one", importedSpoke.Links)
+	}
+	link := importedSpoke.Links[0]
+	if link.To == hub.ID {
+		t.Fatal("link still points at the squatter, not the renamed hub")
+	}
+	renamedHub, err := tgt.GetByID(ctx, link.To)
+	if err != nil || renamedHub.Text != "the hub" {
+		t.Fatalf("renamed hub: %+v err=%v", renamedHub, err)
+	}
+}
+
+func TestImportOnConflictValidation(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	_, err := store.Import(ctx, filepath.Join(t.TempDir(), "missing.ahkai"), ImportOpts{OnConflict: "merge"})
+	if !IsValidationError(err) {
+		t.Errorf("bad import policy: err = %v, want ValidationError", err)
+	}
+}
+
+func TestImportJournalsVectorsPreserved(t *testing.T) {
+	ctx := context.Background()
+
+	src := newTestStore(t)
+	if _, _, _, err := src.Remember(ctx, "exported knowledge", RememberOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Vectors included → the file's embedding is reused → preserved=true.
+	withVec := filepath.Join(t.TempDir(), "with.ahkai")
+	if _, err := src.Export(ctx, withVec, ExportOpts{IncludeVectors: true}); err != nil {
+		t.Fatal(err)
+	}
+	dst1 := newTestStore(t)
+	if _, err := dst1.Import(ctx, withVec, ImportOpts{OnConflict: ImportSkip}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := dst1.Journal().Read(ReadOpts{Op: "import"})
+	if len(entries) != 1 {
+		t.Fatalf("import entries = %d, want 1", len(entries))
+	}
+	if v, _ := entries[0].Meta["vectors_preserved"].(bool); !v {
+		t.Errorf("vectors_preserved = %v, want true (file vector reused)", entries[0].Meta["vectors_preserved"])
+	}
+
+	// Vectors stripped → the row is re-embedded → preserved=false.
+	noVec := filepath.Join(t.TempDir(), "without.ahkai")
+	if _, err := src.Export(ctx, noVec, ExportOpts{IncludeVectors: false}); err != nil {
+		t.Fatal(err)
+	}
+	dst2 := newTestStore(t)
+	if _, err := dst2.Import(ctx, noVec, ImportOpts{OnConflict: ImportSkip}); err != nil {
+		t.Fatal(err)
+	}
+	// Sibling TempDir stores share a default journal path, so read the LATEST
+	// import entry (dst1's import is also in the file).
+	entries, _ = dst2.Journal().Read(ReadOpts{Op: "import"})
+	if len(entries) == 0 {
+		t.Fatal("no import entries journaled")
+	}
+	last := entries[len(entries)-1]
+	if v, _ := last.Meta["vectors_preserved"].(bool); v {
+		t.Errorf("vectors_preserved = true, want false (row was re-embedded)")
+	}
+}

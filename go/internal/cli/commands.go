@@ -26,6 +26,8 @@ func newRememberCmd() *cobra.Command {
 	var polarity int
 	var autoImportance, stdin bool
 	var ttlSeconds float64
+	var pinned, idempotent bool
+	var trust string
 
 	cmd := &cobra.Command{
 		Use:   "remember <text>",
@@ -75,6 +77,9 @@ func newRememberCmd() *cobra.Command {
 				Source:     source,
 				Polarity:   polarity,
 				OnConflict: memory.ConflictPolicy(onConflict),
+				Pinned:     pinned,
+				Trust:      memory.TrustLevel(trust),
+				Idempotent: idempotent,
 			}
 			if cmd.Flags().Changed("ttl") {
 				opts.TTLSeconds = &ttlSeconds
@@ -106,12 +111,18 @@ func newRememberCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&autoImportance, "auto-importance", false,
 		"Score importance heuristically from the text (also: default_importance = \"auto\" in config.toml)")
 	cmd.Flags().Float64Var(&ttlSeconds, "ttl", 0, "Time-to-live in seconds; the memory expires (and is hidden from recall) after this")
+	cmd.Flags().BoolVar(&pinned, "pin", false,
+		"Standing instruction: always offered to `pack --include-pinned`, never pruned by decay")
+	cmd.Flags().StringVar(&trust, "trust", "",
+		"trusted|reported|untrusted — how much the memory's ORIGIN is trusted. Use untrusted for anything read from content you did not author")
+	cmd.Flags().BoolVar(&idempotent, "idempotent", false,
+		"No-op if a live memory already has the same normalised text")
 	return cmd
 }
 
 func newRecallCmd() *cobra.Command {
 	var k int
-	var tag, memType, mode, source, since, until string
+	var tag, memType, mode, source, since, until, minTrust string
 	var minImp float32
 	var inclSup, inclExp bool
 
@@ -140,6 +151,7 @@ func newRecallCmd() *cobra.Command {
 				Source:            source,
 				Since:             sinceTS,
 				Until:             untilTS,
+				MinTrust:          memory.TrustLevel(minTrust),
 			}
 			results, err := store.Recall(cmd.Context(), args[0], k, opts)
 			if err != nil {
@@ -169,6 +181,8 @@ func newRecallCmd() *cobra.Command {
 	cmd.Flags().StringVar(&mode, "mode", "semantic", "Scoring mode: semantic|hybrid")
 	cmd.Flags().BoolVar(&inclSup, "include-superseded", false, "Include superseded memories")
 	cmd.Flags().BoolVar(&inclExp, "include-expired", false, "Include memories whose TTL has passed")
+	cmd.Flags().StringVar(&minTrust, "min-trust", "",
+		"trusted|reported|untrusted — keep only memories at least this trusted")
 	cmd.Flags().StringVar(&source, "source", "", "Filter by exact provenance string")
 	cmd.Flags().StringVar(&since, "since", "", "Only memories created at/after (ISO date, epoch, or '7d')")
 	cmd.Flags().StringVar(&until, "until", "", "Only memories created at/before (ISO date, epoch, or '7d')")
@@ -627,13 +641,11 @@ func newGraphCmd() *cobra.Command {
 // graphToASCII renders a subgraph as an indented node/edge listing.
 func graphToASCII(g memory.Graph) string {
 	var b strings.Builder
-	labels := map[string]string{}
 	for _, n := range g.Nodes {
 		snippet := n.Text
 		if r := []rune(snippet); len(r) > 50 {
 			snippet = string(r[:50]) + "…"
 		}
-		labels[n.ID] = snippet
 		fmt.Fprintf(&b, "%s (%s) %s\n", fmtID(n.ID), n.Type, snippet)
 	}
 	for _, e := range g.Edges {
@@ -843,7 +855,8 @@ func newReflectCmd() *cobra.Command {
 	var consolidate string
 	var threshold float32
 	var minCluster int
-	var summarizer string
+	var summarizer, types string
+	var maxLevel int
 	cmd := &cobra.Command{
 		Use:   "reflect",
 		Short: "Cluster episodic memories into semantic reflections (dry-run by default)",
@@ -869,6 +882,12 @@ func newReflectCmd() *cobra.Command {
 				}
 			}
 			engine := reflectpkg.New(store, threshold, minCluster, summarize)
+			for _, t := range strings.Split(types, ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					engine.Types = append(engine.Types, memory.MemoryType(t))
+				}
+			}
+			engine.MaxLevel = maxLevel
 			created, err := engine.Reflect(cmd.Context(), !apply, mode)
 			if err != nil {
 				return err
@@ -901,6 +920,10 @@ func newReflectCmd() *cobra.Command {
 	cmd.Flags().StringVar(&summarizer, "summarizer", "",
 		"provider:model (extractive|ollama:M|openai:M|anthropic:M); default from `summarizer` in config.toml. "+
 			"LLM summarizers are also called for the dry-run preview.")
+	cmd.Flags().StringVar(&types, "types", "episodic",
+		"Comma-separated memory types to cluster. Historically episodic only, which meant summaries were never themselves consolidated")
+	cmd.Flags().IntVar(&maxLevel, "max-level", 1,
+		"Tiers of reflection-of-reflections to allow. Each summary is tagged level:N; 1 (default) never re-summarises")
 	return cmd
 }
 
@@ -1011,7 +1034,8 @@ func newJournalCmd() *cobra.Command {
 		Use:   "journal",
 		Short: "Inspect the audit journal",
 	}
-	cmd.AddCommand(newJournalTailCmd(), newJournalShowCmd(), newJournalUndoCmd())
+	cmd.AddCommand(newJournalTailCmd(), newJournalShowCmd(), newJournalUndoCmd(),
+		newJournalUndoLastCmd())
 	return cmd
 }
 
@@ -1036,8 +1060,10 @@ func newJournalTailCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Tail-N then reverse.
-			if len(entries) > n {
+			// Tail-N then reverse. n <= 0 would slice out of bounds.
+			if n <= 0 {
+				entries = nil
+			} else if len(entries) > n {
 				entries = entries[len(entries)-n:]
 			}
 			if len(entries) == 0 {

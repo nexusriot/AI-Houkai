@@ -72,6 +72,11 @@ type MaintenanceConfig struct {
 	DecayEverySecs   int `toml:"decay_every_secs"`
 	ReflectEverySecs int `toml:"reflect_every_secs"`
 	PurgeEverySecs   int `toml:"purge_every_secs"`
+
+	// TrashTTLDays drops trashed memories deleted more than this many days ago,
+	// on the same tick as the TTL purge (mirrors Python's trash_ttl_days).
+	// 0 disables retention — the trash then keeps everything forever.
+	TrashTTLDays float64 `toml:"trash_ttl_days"`
 }
 
 // MaintPaths returns the resolved state/pid/log paths, defaulting to files
@@ -128,6 +133,7 @@ func defaultConfig() Config {
 			DecayEverySecs:   86_400,  // 24h, matching Python's decay_every
 			ReflectEverySecs: 604_800, // 7d, matching Python's reflect_every
 			PurgeEverySecs:   86_400,  // 24h, matching Python's purge_every
+			TrashTTLDays:     30,      // matching Python's trash_ttl_days
 		},
 	}
 }
@@ -165,6 +171,14 @@ func ResolveConfig(storePath, collection string) Config {
 			continue
 		}
 		_ = toml.Unmarshal(data, &cfg)
+	}
+
+	// TOML cannot tell "absent" from "0", so an explicit `embed_dim = 0` lands
+	// here as a real value. It is never valid — every vector would be
+	// zero-length — so treat it as unset rather than carrying it into the
+	// backend, which builds a probe vector from it.
+	if cfg.EmbedDim <= 0 {
+		cfg.EmbedDim = defaultConfig().EmbedDim
 	}
 
 	// Env vars.

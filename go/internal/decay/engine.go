@@ -36,6 +36,14 @@ type actorScoped interface {
 	AsActor(name string) func()
 }
 
+// trashable is the recoverable-delete capability Prune prefers over Forget.
+// Optional for the same reason as actorScoped: a fake need not grow a trash
+// implementation. *memory.MemoryStore satisfies it, so real pruning is always
+// recoverable.
+type trashable interface {
+	Trash(ctx context.Context, memoryID string) (bool, error)
+}
+
 func New(store Storable, decayRate, minScore float32, protectTypes []memory.MemoryType, frequencyWeight float32) *Engine {
 	if decayRate == 0 {
 		decayRate = 0.1
@@ -71,6 +79,11 @@ func (e *Engine) scoreAt(m memory.Memory, now time.Time) float32 {
 
 // Prune removes memories below MinScore (unless protected). Returns pruned IDs.
 // If dryRun is true, no deletions occur.
+//
+// Pruned memories go to the trash, not to Forget: decay is a heuristic driven
+// by tunable constants, and a mis-set MinScore used to destroy data with no way
+// back. They leave the live store either way, but stay restorable until the
+// trash retention window closes (maintenance enforces it via TrashTTLDays).
 func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error) {
 	// includeSuperseded=true so soft-deleted memories also age out — otherwise
 	// every supersede leaves the old memory in the store forever and the
@@ -85,6 +98,7 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 			defer as.AsActor("decay")()
 		}
 	}
+	bin, recoverable := e.store.(trashable)
 	now := time.Now()
 	var pruned []memory.Memory
 	for _, m := range mems {
@@ -93,7 +107,18 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 		}
 		if e.scoreAt(m, now) < e.MinScore {
 			if !dryRun {
-				_, _ = e.store.Forget(ctx, m.ID)
+				// Only report what actually left. A row can vanish between the
+				// listing and here, and this slice is both the caller's audit
+				// trail and what the scheduler adds to its cumulative total.
+				var removed bool
+				if recoverable {
+					removed, _ = bin.Trash(ctx, m.ID)
+				} else {
+					removed, _ = e.store.Forget(ctx, m.ID)
+				}
+				if !removed {
+					continue
+				}
 			}
 			pruned = append(pruned, m)
 		}
@@ -102,6 +127,12 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 }
 
 func (e *Engine) isProtected(m memory.Memory) bool {
+	// A pinned memory is a standing instruction: decay must not reach it
+	// however stale it looks. Without this the only way to protect one is to
+	// inflate its importance, which distorts every search it appears in.
+	if m.Pinned {
+		return true
+	}
 	for _, t := range e.ProtectTypes {
 		if m.Type == t {
 			return true
