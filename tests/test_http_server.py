@@ -759,3 +759,32 @@ class TestRecallScalarKnobs:
             "/recall?query=corpus+lexical+subject&mode=hybrid"
             "&lexical_index=corpus")
         assert status == 200 and body["results"]
+
+
+class TestArchiveRouteGate:
+    """/export and /import reach past the store onto the server filesystem, so
+    with no token configured they must only answer loopback peers."""
+
+    def test_predicate(self):
+        allowed = http_mod._archive_route_allowed
+        assert allowed("/export", None, "127.0.0.1")
+        assert allowed("/import", None, "::1")
+        assert not allowed("/export", None, "203.0.113.9")
+        assert not allowed("/import", None, "not-an-ip")
+        # A configured token restores the documented trust model.
+        assert allowed("/export", "sekrit", "203.0.113.9")
+        # Store-scoped routes are unaffected.
+        assert allowed("/recall", None, "203.0.113.9")
+
+    def test_dispatch_enforces_the_gate(self, server, store, monkeypatch):
+        monkeypatch.setattr(http_mod, "_archive_route_allowed",
+                            lambda *a: False)
+        status, body = _req(server, "POST", "/export", {"path": "/tmp/x.ahkai"})
+        assert status == 403
+        assert "server-side paths" in body["error"]
+
+    def test_loopback_tokenless_export_still_works(self, server, store, tmp_path):
+        store.remember("archive gate subject")
+        status, body = _req(server, "POST", "/export",
+                            {"path": str(tmp_path / "gate.ahkai")})
+        assert status == 200 and body["count"] >= 1

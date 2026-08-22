@@ -523,13 +523,13 @@ if __name__ == "__main__":  # allow `python functional_tests/test_e2e.py`
 def list_ids(store: str) -> list[str]:
     """Ids in the store, newest first.
 
-    Not `houkai_json(... "list")`: on an *empty* store the list command prints
-    a human message to stderr and nothing at all to stdout, so `--format json`
-    yields un-parseable output. Tolerated here rather than worked around at
-    every call site.
+    Parsed strictly: `list --format json` prints a valid JSON array to stdout
+    even when the store is empty (`[]`; the human "No memories found." goes to
+    stderr), so a lenient fallback here would only mask a regression to
+    un-parseable output.
     """
     proc = houkai(store, "list", "-n", "100", "--format", "json")
-    return [m["id"] for m in json.loads(proc.stdout or "[]")]
+    return [m["id"] for m in json.loads(proc.stdout)]
 
 
 def test_cli_curation_lifecycle(tmp_path):

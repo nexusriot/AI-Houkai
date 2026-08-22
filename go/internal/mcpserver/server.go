@@ -725,14 +725,19 @@ func editHandler(store *memory.MemoryStore) func(context.Context, mcp.CallToolRe
 			return jsonText(map[string]any{"ok": false, "error": err.Error()}), nil
 		}
 		out := map[string]any{
-			"ok":         true,
-			"id":         m.ID,
-			"text":       m.Text,
-			"type":       string(m.Type),
-			"tags":       m.Tags,
-			"importance": m.Importance,
-			"polarity":   m.Polarity,
-			"source":     m.Source,
+			"ok":           true,
+			"id":           m.ID,
+			"text":         m.Text,
+			"type":         string(m.Type),
+			"tags":         m.Tags,
+			"importance":   m.Importance,
+			"polarity":     m.Polarity,
+			"source":       m.Source,
+			"pinned":       m.Pinned,
+			"trust":        string(m.Trust),
+			"content_hash": m.ContentHash,
+			"valid_from":   m.ValidFrom,
+			"valid_until":  m.ValidUntil,
 		}
 		if m.ExpiresAt != 0 {
 			out["expires_at"] = m.ExpiresAt
@@ -762,7 +767,15 @@ func memRecord(m memory.Memory) map[string]any {
 		"superseded_by": m.SupersededBy,
 		"superseded_at": m.SupersededAt,
 		"expires_at":    m.ExpiresAt,
-		"links":         links,
+		// Carried explicitly — including their defaults — like the HTTP
+		// serializer: an agent that pins, re-labels trust, or retires a fact
+		// must be able to verify it afterwards.
+		"pinned":       m.Pinned,
+		"trust":        string(m.Trust),
+		"content_hash": m.ContentHash,
+		"valid_from":   m.ValidFrom,
+		"valid_until":  m.ValidUntil,
+		"links":        links,
 	}
 }
 

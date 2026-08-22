@@ -2357,7 +2357,10 @@ own (entries written before the field existed stay visible everywhere).
 `trash_restore` also refuses an id that is live again (an export→import can
 resurrect one — restoring over it would be silently ignored by the backend
 while the snapshot was destroyed), and with several entries for one id it
-restores the newest snapshot, leaving older ones recoverable.
+restores the newest snapshot, leaving older ones recoverable. Mutations take
+an exclusive flock on a lock file beside the trash (both ports): the file is
+shared read-modify-write state, and two stores rewriting it concurrently
+would lose whichever rewrite landed first.
 
 `trash_purge_expired(ttl_days)` supplies retention, and the maintenance
 scheduler drives it on the same tick as the TTL purge (`trash_ttl_days`,

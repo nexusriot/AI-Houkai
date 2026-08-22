@@ -8,8 +8,9 @@ sentence-transformers>=2.7.0
 tomli>=2.0.1; python_version < "3.11"
 
 # MCP server
-# <2: mcp 2.0.0 removed mcp.server.fastmcp (see pyproject for the full note).
-mcp>=1.2.0,<2
+# <2: mcp 2.0.0 removed mcp.server.fastmcp; >=1.28.1 is the tested floor
+# (see pyproject for the full note).
+mcp>=1.28.1,<2
 
 # Claude agent example + anthropic: summarizer
 anthropic>=0.40.0

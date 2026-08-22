@@ -54,7 +54,6 @@ type PathHop struct {
 }
 
 // TrashEntry is a soft-deleted memory parked in the trash file.
-// TrashEntry is a soft-deleted memory parked in the trash file.
 //
 // Collection scopes the entry: the trash file lives beside the store path and
 // is shared by every collection opened on it, so without the tag a restore
@@ -451,7 +450,10 @@ func (s *MemoryStore) Trash(ctx context.Context, memoryID string) (bool, error) 
 		MemoryID: mem.ID, DeletedAt: nowFloat(), Actor: s.actor,
 		Memory: mem.ToDict(), Collection: s.cfg.Collection,
 	}
-	if err := s.appendTrash(entry); err != nil {
+	unlock := s.lockTrash()
+	err = s.appendTrash(entry)
+	unlock()
+	if err != nil {
 		return false, err
 	}
 	restore := s.AsActor("trash")
@@ -524,6 +526,10 @@ func (s *MemoryStore) TrashList() ([]TrashEntry, error) {
 // the entry is kept instead. With several entries for one id (trash → import
 // → trash), the newest snapshot is restored and older ones stay recoverable.
 func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory, bool, error) {
+	// The read-filter-rewrite below must be atomic against other stores
+	// sharing the trash file (one per collection, or another process) —
+	// unlocked, two concurrent mutations lose whichever rewrite lands first.
+	defer s.lockTrash()()
 	entries, err := s.readTrash()
 	if err != nil {
 		return Memory{}, false, err
@@ -563,6 +569,7 @@ func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory
 // operation that loses data. Other collections' entries in the shared trash
 // file are untouched.
 func (s *MemoryStore) TrashPurge(memoryID string) (int, error) {
+	defer s.lockTrash()()
 	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err
@@ -598,6 +605,7 @@ func (s *MemoryStore) TrashPurgeExpired(ttlDays float64, now float64) (int, erro
 	if now == 0 {
 		now = nowFloat()
 	}
+	defer s.lockTrash()()
 	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err

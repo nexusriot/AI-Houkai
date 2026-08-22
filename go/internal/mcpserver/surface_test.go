@@ -1,7 +1,9 @@
 package mcpserver
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/memory"
 )
@@ -276,5 +278,39 @@ func TestEvalRecallToolMixedK(t *testing.T) {
 	})
 	if mixed["k"].(float64) != -1 {
 		t.Errorf("mixed k = %v, want -1", mixed["k"])
+	}
+}
+
+func TestHistoryTool(t *testing.T) {
+	store := newJournaledStore(t)
+	s := New(store, "/store", "test")
+	rem := callTool(t, s, "remember", map[string]any{"text": "mcp v1"})
+	id := rem["id"].(string)
+	callTool(t, s, "edit", map[string]any{"memory_id": id, "text": "mcp v2"})
+	hist := callToolArray(t, s, "history", map[string]any{"memory_id": id})
+	ops := make([]string, len(hist))
+	for i, e := range hist {
+		ops[i] = e["op"].(string)
+	}
+	if len(ops) != 2 || ops[0] != "remember" || ops[1] != "edit" {
+		t.Errorf("history ops = %v, want [remember edit]", ops)
+	}
+}
+
+func TestStateAtAndGetAtTool(t *testing.T) {
+	store := newJournaledStore(t)
+	s := New(store, "/store", "test")
+	rem := callTool(t, s, "remember", map[string]any{"text": "mcp point in time"})
+	id := rem["id"].(string)
+	time.Sleep(20 * time.Millisecond)
+	ts := fmt.Sprintf("%f", float64(time.Now().UnixNano())/1e9)
+
+	state := callTool(t, s, "state_at", map[string]any{"ts": ts})
+	if state["count"].(float64) < 1 {
+		t.Errorf("state_at count = %v, want >=1", state["count"])
+	}
+	one := callTool(t, s, "get_at", map[string]any{"memory_id": id, "ts": ts})
+	if one["ok"] != true || one["text"] != "mcp point in time" {
+		t.Errorf("get_at = %v", one)
 	}
 }

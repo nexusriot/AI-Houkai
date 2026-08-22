@@ -69,9 +69,10 @@ func (b *ChromemBackend) SearchDocuments(ctx context.Context, substr string, lim
 		WhereDocument:  map[string]string{"$contains": substr},
 	})
 	if err != nil {
-		// A filter that matches nothing is an error in chromem-go, not an
-		// empty result; a lexical bonus is never worth failing the recall.
-		return nil, nil
+		// chromem-go returns nil, nil for a filter matching nothing, so an
+		// error here is genuine (bad probe dimension, unsupported operator)
+		// and must reach the caller instead of masquerading as "no match".
+		return nil, err
 	}
 	items := make([]Item, len(results))
 	for i, r := range results {
@@ -103,9 +104,8 @@ func (b *ChromemBackend) SearchMetadata(ctx context.Context, where map[string]st
 		Where:          where,
 	})
 	if err != nil {
-		// chromem-go treats a filter matching nothing as an error, not an
-		// empty result.
-		return nil, nil
+		// A no-match filter is nil, nil in chromem-go — an error is genuine.
+		return nil, err
 	}
 	items := make([]Item, len(results))
 	for i, r := range results {

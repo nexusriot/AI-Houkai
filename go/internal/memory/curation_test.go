@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/nexusriot/ai-houkai/internal/vector"
@@ -831,5 +832,225 @@ func TestMergeOfTwoUnpinnedRowsPinsNothing(t *testing.T) {
 	}
 	if merged.Pinned {
 		t.Error("merged row was pinned out of nowhere")
+	}
+}
+
+// newCollectionStore builds a store on a shared dir under its own collection,
+// the shape two collections opened on one store path have in production.
+func newCollectionStore(t *testing.T, dir, collection string) *MemoryStore {
+	t.Helper()
+	backend, err := vector.NewChromem(filepath.Join(dir, "s-"+collection), collection, 16)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	return NewMemoryStore(backend, &stubEmbedder{dim: 16}, DefaultStoreConfig(dir, collection))
+}
+
+func TestTrashScopedByCollection(t *testing.T) {
+	dir := t.TempDir()
+	colA := newCollectionStore(t, dir, "col_a")
+	colB := newCollectionStore(t, dir, "col_b")
+	ctx := context.Background()
+
+	m, _, _, err := colA.Remember(ctx, "belongs to a", RememberOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := colA.Trash(ctx, m.ID); err != nil || !ok {
+		t.Fatalf("Trash: ok=%v err=%v", ok, err)
+	}
+
+	if entries, _ := colB.TrashList(); len(entries) != 0 {
+		t.Fatalf("col_b sees col_a's trash: %v", entries)
+	}
+	if _, found, _ := colB.TrashRestore(ctx, m.ID); found {
+		t.Fatal("col_b restored col_a's memory — cross-collection leak")
+	}
+	if _, err := colB.GetByID(ctx, m.ID); err == nil {
+		t.Fatal("col_a's memory materialized in col_b")
+	}
+	restored, found, err := colA.TrashRestore(ctx, m.ID)
+	if err != nil || !found || restored.ID != m.ID {
+		t.Fatalf("col_a restore: found=%v err=%v", found, err)
+	}
+}
+
+func TestTrashPurgeLeavesOtherCollections(t *testing.T) {
+	dir := t.TempDir()
+	colA := newCollectionStore(t, dir, "col_a")
+	colB := newCollectionStore(t, dir, "col_b")
+	ctx := context.Background()
+
+	a, _, _, _ := colA.Remember(ctx, "a's trash", RememberOpts{})
+	b, _, _, _ := colB.Remember(ctx, "b's trash", RememberOpts{})
+	colA.Trash(ctx, a.ID)
+	colB.Trash(ctx, b.ID)
+
+	if n, err := colB.TrashPurge(""); err != nil || n != 1 {
+		t.Fatalf("purge-all in col_b: n=%d err=%v (want 1)", n, err)
+	}
+	entries, _ := colA.TrashList()
+	if len(entries) != 1 || entries[0].MemoryID != a.ID {
+		t.Fatalf("col_a's entry lost to col_b's purge: %v", entries)
+	}
+	if _, found, _ := colA.TrashRestore(ctx, a.ID); !found {
+		t.Fatal("col_a can no longer restore after col_b purged")
+	}
+}
+
+func TestTrashPurgeExpiredScopedToCollection(t *testing.T) {
+	dir := t.TempDir()
+	colA := newCollectionStore(t, dir, "col_a")
+	colB := newCollectionStore(t, dir, "col_b")
+	ctx := context.Background()
+
+	a, _, _, _ := colA.Remember(ctx, "old in a", RememberOpts{})
+	b, _, _, _ := colB.Remember(ctx, "old in b", RememberOpts{})
+	colA.Trash(ctx, a.ID)
+	colB.Trash(ctx, b.ID)
+
+	// Both entries are ancient; only col_a runs retention.
+	future := nowFloat() + 90*86400
+	if n, err := colA.TrashPurgeExpired(30, future); err != nil || n != 1 {
+		t.Fatalf("TrashPurgeExpired: n=%d err=%v (want 1)", n, err)
+	}
+	if entries, _ := colB.TrashList(); len(entries) != 1 {
+		t.Fatalf("col_b's entry TTL-purged by col_a's maintenance: %v", entries)
+	}
+}
+
+func TestLegacyUntaggedTrashEntryVisibleEverywhere(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	m, _, _, _ := store.Remember(ctx, "template row", RememberOpts{})
+	store.Forget(ctx, m.ID)
+
+	legacy := TrashEntry{
+		MemoryID: m.ID, DeletedAt: nowFloat(), Actor: "lib",
+		Memory: m.ToDict(), // Collection deliberately left ""
+	}
+	if err := store.appendTrash(legacy); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := store.TrashList()
+	if len(entries) != 1 {
+		t.Fatalf("legacy entry invisible: %v", entries)
+	}
+	if _, found, err := store.TrashRestore(ctx, m.ID); err != nil || !found {
+		t.Fatalf("legacy entry not restorable: found=%v err=%v", found, err)
+	}
+}
+
+func TestTrashRestoreRefusesLiveID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	m, _, _, _ := store.Remember(ctx, "original text", RememberOpts{})
+	store.Trash(ctx, m.ID)
+
+	// Resurrect the id out-of-band (an import can do this legitimately).
+	live := m
+	live.Text = "resurrected by import"
+	if err := store.UpdateMemory(ctx, live, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, found, _ := store.TrashRestore(ctx, m.ID); found {
+		t.Fatal("restore over a live id must be refused")
+	}
+	entries, _ := store.TrashList()
+	if len(entries) != 1 {
+		t.Fatal("refused restore must keep the snapshot recoverable")
+	}
+}
+
+func TestTrashRestorePicksNewestDuplicate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	m, _, _, _ := store.Remember(ctx, "version ONE", RememberOpts{})
+	store.Trash(ctx, m.ID)
+
+	entries, _ := store.TrashList()
+	newer := entries[0]
+	newer.DeletedAt += 10
+	newer.Memory = m.ToDict()
+	newer.Memory["text"] = "version TWO"
+	if err := store.appendTrash(newer); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, found, err := store.TrashRestore(ctx, m.ID)
+	if err != nil || !found {
+		t.Fatalf("restore: found=%v err=%v", found, err)
+	}
+	if restored.Text != "version TWO" {
+		t.Fatalf("restored %q, want the newest snapshot", restored.Text)
+	}
+	if entries, _ = store.TrashList(); len(entries) != 1 {
+		t.Fatal("older snapshot must stay parked")
+	}
+	store.Forget(ctx, m.ID)
+	restored, found, _ = store.TrashRestore(ctx, m.ID)
+	if !found || restored.Text != "version ONE" {
+		t.Fatalf("second restore got %q found=%v, want version ONE", restored.Text, found)
+	}
+}
+
+func TestConcurrentTrashMutationsLoseNothing(t *testing.T) {
+	// Two stores (one per collection) share the trash file; unlocked, their
+	// read-filter-rewrite mutations raced and whichever rewrite landed last
+	// silently dropped the other's entries.
+	dir := t.TempDir()
+	colA := newCollectionStore(t, dir, "col_a")
+	colB := newCollectionStore(t, dir, "col_b")
+	ctx := context.Background()
+
+	const n = 8
+	idsA := make([]string, n)
+	idsB := make([]string, n)
+	for i := 0; i < n; i++ {
+		a, _, _, _ := colA.Remember(ctx, fmt.Sprintf("a doomed %d", i), RememberOpts{})
+		b, _, _, _ := colB.Remember(ctx, fmt.Sprintf("b doomed %d", i), RememberOpts{})
+		idsA[i], idsB[i] = a.ID, b.ID
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for _, id := range idsA {
+			if ok, err := colA.Trash(ctx, id); err != nil || !ok {
+				t.Errorf("colA.Trash(%s): ok=%v err=%v", id, ok, err)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for _, id := range idsB {
+			if ok, err := colB.Trash(ctx, id); err != nil || !ok {
+				t.Errorf("colB.Trash(%s): ok=%v err=%v", id, ok, err)
+			}
+			// Interleave a rewrite-path mutation with colA's appends.
+			if _, _, err := colB.TrashRestore(ctx, id); err != nil {
+				t.Errorf("colB.TrashRestore(%s): %v", id, err)
+			}
+			if ok, err := colB.Trash(ctx, id); err != nil || !ok {
+				t.Errorf("colB re-Trash(%s): ok=%v err=%v", id, ok, err)
+			}
+		}
+	}()
+	wg.Wait()
+
+	entriesA, err := colA.TrashList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entriesB, err := colB.TrashList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entriesA) != n || len(entriesB) != n {
+		t.Fatalf("lost trash entries under concurrency: colA=%d colB=%d, want %d each",
+			len(entriesA), len(entriesB), n)
 	}
 }

@@ -49,6 +49,8 @@ Routes (all JSON in / JSON out):
 Optional bearer-token auth: pass ``auth_token`` (or set ``AI_HOUKAI_HTTP_TOKEN``)
 and every request must carry ``Authorization: Bearer <token>``.  ``/health`` and
 ``/ready`` stay reachable so liveness/readiness probes work without the secret.
+With no token, ``/export`` and ``/import`` (which read/write server-side paths)
+only answer loopback peers.
 
 The handler is intentionally framework-free: a single regex routing table maps
 ``(method, path)`` to small functions taking ``(store, match, query, body)``.
@@ -57,6 +59,7 @@ The handler is intentionally framework-free: a single regex routing table maps
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -774,9 +777,34 @@ def _str_list(b: dict[str, Any], key: str) -> "list[str] | None":
     raise HttpError(400, f"{key}: expected a string or list of strings")
 
 
+_ARCHIVE_DENIED = (
+    "archive routes read/write server-side paths; configure an auth token "
+    "(or call from loopback) to use /export and /import"
+)
+
+
+def _archive_route_allowed(path: str, auth_token: str | None,
+                           client_ip: str) -> bool:
+    """Whether /export & /import may run for this caller.
+
+    These two routes reach past the store onto the server's filesystem
+    (arbitrary read into the store / arbitrary .gz write), so unlike the
+    store-scoped routes they are not offered to unauthenticated REMOTE
+    callers: with no token configured, only loopback peers — the local
+    single-user setup the tokenless mode exists for — may call them.
+    """
+    if path not in ("/export", "/import") or auth_token is not None:
+        return True
+    try:
+        return ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        return False
+
+
 def _export(store: MemoryStore, m, q, b):
-    """Write a .ahkai archive to a server-side path. The path is resolved on the
-    server, so this route is only as safe as the token protecting it."""
+    """Write a .ahkai archive to a server-side path. The path is resolved on
+    the server; without a token these routes only answer loopback callers
+    (see _archive_route_allowed)."""
     summary = store.export(
         _require(b, "path"),
         include_vectors=_body_bool(b, "include_vectors", True),
@@ -1055,6 +1083,11 @@ def build_handler(
 
             if not self._authorized(path):
                 self._send(401, {"error": "unauthorized"})
+                return
+
+            if not _archive_route_allowed(path, auth_token,
+                                          self.client_address[0]):
+                self._send(403, {"error": _ARCHIVE_DENIED})
                 return
 
             # HEAD is GET without a body (_send suppresses it) — without this

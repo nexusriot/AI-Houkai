@@ -31,10 +31,12 @@ dependencies = [
     "chromadb>=0.5.0",
     # Upper-bounded deliberately: mcp 2.0.0 deleted `mcp.server.fastmcp` (the
     # FastMCP server was renamed to `mcp.server.mcpserver`), so an unbounded
-    # `mcp>=1.2.0` makes every fresh install resolve to a version this code
-    # cannot import. Lift the cap in the same change that ports
-    # ai_houkai/mcp_server/server.py to the 2.x API.
-    "mcp>=1.2.0,<2",
+    # floor makes every fresh install resolve to a version this code cannot
+    # import. Lift the cap in the same change that ports
+    # ai_houkai/mcp_server/server.py to the 2.x API. The floor is the version
+    # the suite actually runs against — FastMCP's API churned considerably
+    # across 1.x, and older floors claimed compatibility nobody verified.
+    "mcp>=1.28.1,<2",
     # config.toml parsing. tomllib landed in the 3.11 stdlib; on 3.10 the
     # config loader falls back to its backport, and the loader is reached from
     # the MCP server as well as the CLI, so this belongs in the core deps.

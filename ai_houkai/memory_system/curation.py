@@ -22,9 +22,15 @@ import gzip
 import json
 import time
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — non-POSIX platforms degrade to no lock
+    fcntl = None  # type: ignore[assignment]
 
 from .trust import worst_trust
 
@@ -350,6 +356,28 @@ class CurationMixin:
         """Where soft-deleted memories are parked."""
         return Path(self.path).parent / TRASH_FILENAME
 
+    @contextmanager
+    def _trash_lock(self) -> Iterator[None]:
+        """Exclusive flock over a lock file beside the trash file.
+
+        The trash is a shared read-modify-write file: two stores (one per
+        collection on the same path — a supported layout, or two processes)
+        mutating it concurrently would lose whichever rewrite lands first.
+        Degrades to no locking where fcntl is unavailable — the lock is
+        protection, not a prerequisite.
+        """
+        if fcntl is None:
+            yield
+            return
+        lock_path = self.trash_path.with_name(self.trash_path.name + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
     def trash(self, memory_id: str) -> bool:
         """Soft-delete: park the memory in the trash, then remove it.
 
@@ -365,7 +393,8 @@ class CurationMixin:
                            actor=self._actor, memory=mem.to_dict(),
                            collection=self.collection_name)
         self.trash_path.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(self.trash_path, "at", encoding="utf-8") as f:
+        with self._trash_lock(), \
+                gzip.open(self.trash_path, "at", encoding="utf-8") as f:
             f.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
         with self.as_actor("trash"):
             self.forget(mem.id)
@@ -395,6 +424,13 @@ class CurationMixin:
         entries for one id (trash → import → trash), the newest snapshot is
         restored and older ones stay recoverable.
         """
+        # The read-filter-rewrite below is atomic against other stores sharing
+        # the trash file (one per collection, or another process) — unlocked,
+        # two concurrent mutations lose whichever rewrite lands first.
+        with self._trash_lock():
+            return self._trash_restore_locked(memory_id)
+
+    def _trash_restore_locked(self, memory_id: str) -> "Any":
         entries = self._read_trash()
         mine = [e for e in entries
                 if self._trash_visible(e) and e.memory_id == memory_id]
@@ -422,16 +458,17 @@ class CurationMixin:
         data, which is why it is separate from ``trash``. Other collections'
         entries in the shared trash file are untouched.
         """
-        entries = self._read_trash()
-        if memory_id is None:
-            keep = [e for e in entries if not self._trash_visible(e)]
-        else:
-            keep = [e for e in entries
-                    if not (self._trash_visible(e)
-                            and e.memory_id == memory_id)]
-        purged = len(entries) - len(keep)
-        if purged:
-            self._write_trash(keep)
+        with self._trash_lock():
+            entries = self._read_trash()
+            if memory_id is None:
+                keep = [e for e in entries if not self._trash_visible(e)]
+            else:
+                keep = [e for e in entries
+                        if not (self._trash_visible(e)
+                                and e.memory_id == memory_id)]
+            purged = len(entries) - len(keep)
+            if purged:
+                self._write_trash(keep)
         return purged
 
     def trash_purge_expired(self, ttl_days: float, *,
@@ -449,12 +486,13 @@ class CurationMixin:
         if ttl_days <= 0:
             return 0
         cutoff = (now if now is not None else time.time()) - ttl_days * 86_400
-        entries = self._read_trash()
-        keep = [e for e in entries
-                if not (self._trash_visible(e) and e.deleted_at < cutoff)]
-        purged = len(entries) - len(keep)
-        if purged:
-            self._write_trash(keep)
+        with self._trash_lock():
+            entries = self._read_trash()
+            keep = [e for e in entries
+                    if not (self._trash_visible(e) and e.deleted_at < cutoff)]
+            purged = len(entries) - len(keep)
+            if purged:
+                self._write_trash(keep)
         return purged
 
     def _read_trash(self) -> list[TrashEntry]:

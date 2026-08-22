@@ -581,6 +581,14 @@ def _mem_dict(mem: Any) -> dict[str, Any]:
         "superseded_by": mem.superseded_by or None,
         "superseded_at": mem.superseded_at or None,
         "expires_at": mem.expires_at or None,
+        # Carried explicitly — including their defaults — like the HTTP
+        # serializer: an agent that pins, re-labels trust, or retires a fact
+        # must be able to verify it afterwards.
+        "pinned": mem.pinned,
+        "trust": mem.trust,
+        "content_hash": mem.content_hash,
+        "valid_from": mem.valid_from,
+        "valid_until": mem.valid_until,
         "links": [{"to": lnk.to, "rel": lnk.rel} for lnk in mem.links],
     }
 
@@ -674,6 +682,11 @@ def edit(
         "polarity": mem.polarity,
         "source": mem.source,
         "expires_at": mem.expires_at or None,
+        "pinned": mem.pinned,
+        "trust": mem.trust,
+        "content_hash": mem.content_hash,
+        "valid_from": mem.valid_from,
+        "valid_until": mem.valid_until,
     }
 
 

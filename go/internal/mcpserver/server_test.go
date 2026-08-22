@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/nexusriot/ai-houkai/internal/maintenance"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 	"github.com/nexusriot/ai-houkai/internal/vector"
 )
@@ -58,6 +59,69 @@ func newTestStore(t *testing.T) *memory.MemoryStore {
 	cfg := memory.DefaultStoreConfig(dir, "test")
 	cfg.JournalEnabled = false
 	return memory.NewMemoryStore(backend, &hashEmbedder{dim: 16}, cfg)
+}
+
+// newJournaledStore builds a store with the journal ON (the shared newTestStore
+// disables it) so history/state_at have a log to replay.
+func newJournaledStore(t *testing.T) *memory.MemoryStore {
+	t.Helper()
+	dir := t.TempDir()
+	backend, err := vector.NewChromem(filepath.Join(dir, "s"), "test", 16)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	cfg := memory.DefaultStoreConfig(dir, "test")
+	cfg.JournalEnabled = true
+	cfg.JournalPath = filepath.Join(dir, "journal.log")
+	return memory.NewMemoryStore(backend, &hashEmbedder{dim: 16}, cfg)
+}
+
+func toolResultJSON(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	if len(res.Content) == 0 {
+		t.Fatal("empty tool result")
+	}
+	txt, ok := res.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("content[0] is %T, want TextContent", res.Content[0])
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(txt.Text), &out); err != nil {
+		t.Fatalf("result not JSON: %v (%q)", err, txt.Text)
+	}
+	return out
+}
+
+// callToolArray invokes a tool whose payload is a JSON array.
+func callToolArray(t *testing.T, s interface {
+	HandleMessage(context.Context, json.RawMessage) mcp.JSONRPCMessage
+}, name string, args map[string]any) []map[string]any {
+	t.Helper()
+	req := map[string]any{
+		"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+		"params": map[string]any{"name": name, "arguments": args},
+	}
+	raw, _ := json.Marshal(req)
+	rb, _ := json.Marshal(s.HandleMessage(context.Background(), raw))
+	var envelope struct {
+		Result struct {
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rb, &envelope); err != nil {
+		t.Fatalf("unmarshal %s response: %v", name, err)
+	}
+	if len(envelope.Result.Content) == 0 {
+		t.Fatalf("tool %s returned no content: %s", name, rb)
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(envelope.Result.Content[0].Text), &rows); err != nil {
+		t.Fatalf("unmarshal %s array %q: %v", name, envelope.Result.Content[0].Text, err)
+	}
+	return rows
 }
 
 func TestNewRegistersServer(t *testing.T) {
@@ -370,5 +434,137 @@ func TestRememberMissingTextErrors(t *testing.T) {
 	}
 	if _, ok := out["stored"]; ok {
 		t.Fatalf("remember(no text) unexpectedly reported stored: %v", out)
+	}
+}
+
+// journal_tail must clamp a negative n instead of slicing with a negative index.
+func TestMCPJournalTailNegativeNDoesNotPanic(t *testing.T) {
+	store := newJournaledStore(t)
+	ctx := context.Background()
+	store.Remember(ctx, "one journaled write", memory.RememberOpts{})
+
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{"n": float64(-1)}
+	res, err := journalTailHandler(store)(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txt := res.Content[0].(mcp.TextContent).Text
+	if txt != "[]" {
+		t.Fatalf("n=-1 → %q, want []", txt)
+	}
+}
+
+func TestMaintenanceTickGatedOnSchedule(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	// Both jobs recorded as freshly run: with day/week gates nothing is due.
+	if err := (maintenance.State{LastDecayAt: 1, LastReflectAt: 1}).Save(statePath); err != nil {
+		t.Fatal(err)
+	}
+	// Pretend "now" is close to the recorded runs by gating with an enormous
+	// interval instead of faking the clock.
+	SetMaintenance(maintenance.Config{
+		DecayRate: 0.1, MinScore: 0.05, Reflect: true,
+		DecayEvery: 1e12, ReflectEvery: 1e12,
+	}, statePath)
+	t.Cleanup(func() {
+		maintOpts = struct {
+			cfg       maintenance.Config
+			statePath string
+			set       bool
+		}{}
+	})
+
+	out := callTool(t, s, "maintenance_tick", map[string]any{})
+	if ran, _ := out["ran_decay"].(bool); ran {
+		t.Errorf("ran_decay = true, want false (gated by decay_every)")
+	}
+	if ran, _ := out["ran_reflect"].(bool); ran {
+		t.Errorf("ran_reflect = true, want false (gated by reflect_every)")
+	}
+
+	// Ungate → both jobs run and the state file is stamped.
+	SetMaintenance(maintenance.Config{
+		DecayRate: 0.1, MinScore: 0.05, Reflect: true,
+		DecayEvery: 0, ReflectEvery: 0,
+	}, statePath)
+	out = callTool(t, s, "maintenance_tick", map[string]any{})
+	if ran, _ := out["ran_decay"].(bool); !ran {
+		t.Errorf("ran_decay = false, want true (ungated)")
+	}
+	if ran, _ := out["ran_reflect"].(bool); !ran {
+		t.Errorf("ran_reflect = false, want true (ungated)")
+	}
+	st := maintenance.LoadState(statePath)
+	if st.LastDecayAt <= 1 || st.LastReflectAt <= 1 {
+		t.Errorf("state not stamped after ungated tick: %+v", st)
+	}
+}
+
+// docs/DESIGN.md documents maintenance_tick as returning ran_purge and purged;
+// this port dropped both, so a client could not tell whether TTL reclamation
+// ran. trash_purged reports the retention sweep that rides the same job.
+func TestMaintenanceTickReportsPurgeCounts(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+
+	m, _, _, err := store.Remember(ctx, "bin me", memory.RememberOpts{})
+	if err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := store.Trash(ctx, m.ID); err != nil {
+		t.Fatalf("Trash: %v", err)
+	}
+
+	SetMaintenance(maintenance.Config{
+		DecayRate: 0.1, MinScore: 0.05,
+		DecayEvery: -1, ReflectEvery: -1, PurgeEvery: 0,
+		TrashTTLDays: 30,
+	}, "")
+	t.Cleanup(func() {
+		maintOpts = struct {
+			cfg       maintenance.Config
+			statePath string
+			set       bool
+		}{}
+	})
+
+	out := callTool(t, s, "maintenance_tick", map[string]any{})
+	for _, key := range []string{"ran_purge", "purged", "trash_purged"} {
+		if _, ok := out[key]; !ok {
+			t.Errorf("maintenance_tick result missing documented key %q: %v", key, out)
+		}
+	}
+	if ran, _ := out["ran_purge"].(bool); !ran {
+		t.Errorf("ran_purge = false, want true (purge_every=0 → always due)")
+	}
+	// The entry is seconds old, so a 30-day retention must keep it: the tick
+	// enforces retention, it does not empty the bin. (The sweep itself is
+	// covered in maintenance, which controls the clock.)
+	if n, _ := out["trash_purged"].(float64); n != 0 {
+		t.Errorf("trash_purged = %v, want 0 — entry is inside retention", n)
+	}
+	entries, err := store.TrashList()
+	if err != nil {
+		t.Fatalf("TrashList: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("trash = %d entries, want the one we binned", len(entries))
+	}
+}
+
+func TestMetricsTool(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+	callTool(t, s, "remember", map[string]any{"text": "counted memory"})
+	callToolArray(t, s, "recall", map[string]any{"query": "counted", "k": float64(2)})
+	out := callTool(t, s, "metrics", map[string]any{})
+	calls := out["calls"].(map[string]any)
+	if calls["remember"].(float64) != 1 || calls["recall"].(float64) != 1 {
+		t.Errorf("metrics calls = %v", calls)
 	}
 }

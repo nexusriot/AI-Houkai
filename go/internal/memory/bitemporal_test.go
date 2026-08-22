@@ -298,3 +298,39 @@ func TestRememberManyCarriesPerItemValidity(t *testing.T) {
 		t.Errorf("item 1 = %v..%v", mems[1].ValidFrom, mems[1].ValidUntil)
 	}
 }
+
+func TestRecallFastPathValidityShortfall(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	from, until := 1.0, 2.0
+	retired, _, _, err := store.Remember(ctx, "quarterly revenue target details",
+		RememberOpts{ValidFrom: &from, ValidUntil: &until})
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, _, _, _ := store.Remember(ctx, "quarterly revenue target", RememberOpts{})
+
+	// The retired row ranks first (exact text match); the fast path fetches
+	// exactly k=1, the validity filter drops it, and pre-fix the result was
+	// empty while the live row was never fetched.
+	hits, err := store.Recall(ctx, "quarterly revenue target details", 1, RecallOpts{
+		Mode: ModeSemantic, IncludeSuperseded: true, IncludeExpired: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Memory.ID != live.ID {
+		t.Fatalf("hits = %+v, want exactly the live memory", hits)
+	}
+	_ = retired
+
+	// With every row retired the result is legitimately empty.
+	store.Forget(ctx, live.ID)
+	hits, err = store.Recall(ctx, "quarterly revenue target details", 1, RecallOpts{
+		Mode: ModeSemantic, IncludeSuperseded: true, IncludeExpired: true,
+	})
+	if err != nil || len(hits) != 0 {
+		t.Fatalf("hits = %+v err=%v, want empty", hits, err)
+	}
+}

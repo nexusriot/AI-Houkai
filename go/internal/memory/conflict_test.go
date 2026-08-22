@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -163,5 +165,53 @@ func TestDetectConflictsKeepsUnexpired(t *testing.T) {
 	got := detectConflicts(a, []MemoryWithScore{{Memory: live, Score: 1.0}}, 0.8, nil)
 	if len(got) != 1 {
 		t.Errorf("a future TTL is still a live conflict, got %d", len(got))
+	}
+}
+
+func TestRememberPerCallOnConflictOverridesStorePolicy(t *testing.T) {
+	// Store policy is ignore; the per-call raise must still detect + roll back.
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+
+	first, stored, _, err := store.Remember(ctx, "the API gateway is nginx", RememberOpts{Type: Semantic})
+	if err != nil || !stored {
+		t.Fatalf("first Remember: %v", err)
+	}
+	_, stored, conflicts, err := store.Remember(ctx, "the API gateway is nginx",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise})
+	var ce *ConflictError
+	if stored || !errors.As(err, &ce) || len(conflicts) == 0 {
+		t.Fatalf("per-call raise: stored=%v err=%v conflicts=%d, want rejection", stored, err, len(conflicts))
+	}
+	// Rollback: only the first memory remains, untouched.
+	if c, _ := store.Count(ctx); c != 1 {
+		t.Errorf("count after rollback = %d, want 1", c)
+	}
+	got, _ := store.GetByID(ctx, first.ID)
+	if got.SupersededBy != "" || len(got.Links) != 0 {
+		t.Errorf("raise rollback disturbed the existing memory: %+v", got)
+	}
+}
+
+func TestRememberConflictSupersedeLinksNewToOld(t *testing.T) {
+	store := newConflictStore(t, PolicySupersede, 0.1)
+	ctx := context.Background()
+	oldMem, _, _, err := store.Remember(ctx, "the primary region is us-east-1", RememberOpts{Type: Semantic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newMem, stored, _, err := store.Remember(ctx, "the primary region is us-east-1", RememberOpts{Type: Semantic})
+	if err != nil || !stored {
+		t.Fatalf("supersede policy Remember: stored=%v err=%v", stored, err)
+	}
+	// The NEW memory carries the supersedes edge; the old one carries none —
+	// possible only because the new memory is added BEFORE doSupersede runs.
+	gotNew, _ := store.GetByID(ctx, newMem.ID)
+	gotOld, _ := store.GetByID(ctx, oldMem.ID)
+	if len(gotNew.Links) != 1 || gotNew.Links[0].To != oldMem.ID || gotNew.Links[0].Rel != RelSupersedes {
+		t.Errorf("new memory links = %v, want [{%s supersedes}]", gotNew.Links, oldMem.ID)
+	}
+	if len(gotOld.Links) != 0 {
+		t.Errorf("old memory should carry no links, got %v", gotOld.Links)
 	}
 }

@@ -49,7 +49,9 @@
 //
 // Optional bearer-token auth: pass a token (or set AI_HOUKAI_HTTP_TOKEN) and
 // every request must carry "Authorization: Bearer <token>". /health and /ready
-// stay reachable so liveness/readiness probes work without the secret.
+// stay reachable so liveness/readiness probes work without the secret. With
+// no token, /export and /import (which read/write server-side paths) only
+// answer loopback peers.
 package httpserver
 
 import (
@@ -1083,9 +1085,34 @@ func (s *Server) journalTail(r *http.Request) (int, any, error) {
 	return 200, map[string]any{"count": len(out), "entries": out}, nil
 }
 
-// export writes a .ahkai archive to a server-side path. The path is resolved on
-// the server, so this route is only as safe as the token protecting it.
+// archiveRouteAllowed gates /export and /import: they reach past the store
+// onto the server's filesystem (arbitrary read into the store / arbitrary .gz
+// write), so unlike the store-scoped routes they are not offered to
+// unauthenticated REMOTE callers — with no token configured, only loopback
+// peers (the local single-user setup the tokenless mode exists for) may call
+// them.
+func (s *Server) archiveRouteAllowed(r *http.Request) error {
+	if s.token != "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return errStatus(403, "archive routes read/write server-side paths; "+
+		"configure an auth token (or call from loopback) to use /export and /import")
+}
+
+// export writes a .ahkai archive to a server-side path. The path is resolved
+// on the server; without a token this route only answers loopback callers
+// (see archiveRouteAllowed).
 func (s *Server) export(r *http.Request) (int, any, error) {
+	if err := s.archiveRouteAllowed(r); err != nil {
+		return 0, nil, err
+	}
 	b, err := readBody(r)
 	if err != nil {
 		return 0, nil, err
@@ -1116,6 +1143,9 @@ func (s *Server) export(r *http.Request) (int, any, error) {
 }
 
 func (s *Server) importArchive(r *http.Request) (int, any, error) {
+	if err := s.archiveRouteAllowed(r); err != nil {
+		return 0, nil, err
+	}
 	b, err := readBody(r)
 	if err != nil {
 		return 0, nil, err
@@ -1144,7 +1174,6 @@ func (s *Server) importArchive(r *http.Request) (int, any, error) {
 	}
 	return 200, summary, nil
 }
-
 
 // recallParams pulls recall arguments from a JSON body (POST) or query (GET).
 func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, error) {

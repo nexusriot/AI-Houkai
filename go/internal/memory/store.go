@@ -279,19 +279,22 @@ func ContentHash(text string) string {
 //
 // Superseded and expired rows are skipped — re-asserting a fact that was
 // explicitly replaced should create a new memory, not resurrect the old.
-func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Memory, bool) {
+func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Memory, bool, error) {
 	if digest == "" {
-		return Memory{}, false
+		return Memory{}, false, nil
 	}
-	items, err := s.backend.All(ctx)
+	// An indexed metadata lookup, not backend.All: this runs on every
+	// idempotent write, and a full-collection scan made the dedup check the
+	// most expensive part of storing a memory. The small over-fetch leaves
+	// room for superseded/expired rows sharing the digest. Errors propagate —
+	// treating a transient backend failure as "no match" silently inserted a
+	// duplicate instead of surfacing the problem.
+	items, err := s.backend.SearchMetadata(ctx, map[string]string{"content_hash": digest}, 16)
 	if err != nil {
-		return Memory{}, false
+		return Memory{}, false, err
 	}
 	now := nowFloat()
 	for _, it := range items {
-		if it.Metadata["content_hash"] != digest {
-			continue
-		}
 		m := MetadataToMemory(it.ID, it.Content, it.Metadata)
 		if m.SupersededBy != "" {
 			continue
@@ -299,14 +302,18 @@ func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Mem
 		if m.ExpiresAt > 0 && m.ExpiresAt <= now {
 			continue
 		}
-		return m, true
+		return m, true, nil
 	}
-	return Memory{}, false
+	return Memory{}, false, nil
 }
 
 func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOpts) (Memory, bool, []Conflict, error) {
 	if opts.Idempotent {
-		if existing, ok := s.findByContentHash(ctx, ContentHash(strings.TrimSpace(text))); ok {
+		existing, ok, err := s.findByContentHash(ctx, ContentHash(strings.TrimSpace(text)))
+		if err != nil {
+			return Memory{}, false, nil, err
+		}
+		if ok {
 			if err := s.touchMany(ctx, []*Memory{&existing}); err != nil {
 				return existing, false, nil, err
 			}
@@ -491,7 +498,11 @@ func (s *MemoryStore) RememberMany(ctx context.Context, items []RememberItem, ba
 				result = append(result, prev)
 				continue
 			}
-			if existing, ok := s.findByContentHash(ctx, digest); ok {
+			existing, ok, err := s.findByContentHash(ctx, digest)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
 				firstSeen[digest] = existing
 				result = append(result, existing)
 				touch = append(touch, &existing)

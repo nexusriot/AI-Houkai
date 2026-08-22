@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -74,6 +75,46 @@ func decode(t *testing.T, resp *http.Response) map[string]any {
 		t.Fatalf("decode: %v", err)
 	}
 	return m
+}
+
+// doJSON issues an arbitrary-method JSON request.
+func doJSON(t *testing.T, method, url, path, payload string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(method, url+path, bytes.NewReader([]byte(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func postObj(t *testing.T, url string, body any) (int, map[string]any) {
+	t.Helper()
+	data, _ := json.Marshal(body)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
+}
+
+func getObj(t *testing.T, url string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
 }
 
 func TestHealthIsOpen(t *testing.T) {
@@ -508,5 +549,113 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 	items, _ := m["memories"].([]any)
 	if len(items) != n {
 		t.Errorf("stored %d memories, want %d (lost or duplicated writes)", len(items), n)
+	}
+}
+
+func TestMistypedDryRunMustNotPurge(t *testing.T) {
+	ts, store := newTestServer(t, "")
+	ctx := context.Background()
+	exp := 1.0
+	m, _, _, err := store.Remember(ctx, "expired but recoverable",
+		memory.RememberOpts{ExpiresAt: &exp})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-fix, bodyBool silently coerced the string to false → a REAL purge.
+	resp := postJSON(t, ts.URL, "/purge_expired", `{"dry_run":"true"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("purge_expired = %d, want 200", resp.StatusCode)
+	}
+	if _, err := store.GetByID(ctx, m.ID); err != nil {
+		t.Fatal("dry_run:\"true\" performed a real purge — memory gone")
+	}
+
+	resp = postJSON(t, ts.URL, "/purge_expired", `{"dry_run":[1]}`)
+	if resp.StatusCode != 400 {
+		t.Fatalf("garbage dry_run = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestMistypedNumbersAre400(t *testing.T) {
+	ts, _ := newTestServer(t, "")
+	cases := []struct{ name, path, payload string }{
+		{"string k garbage", "/recall", `{"query":"x","k":"lots"}`},
+		{"bool importance", "/memories", `{"text":"x","importance":true}`},
+		{"garbage importance", "/memories", `{"text":"x","importance":"very"}`},
+	}
+	for _, c := range cases {
+		resp := postJSON(t, ts.URL, c.path, c.payload)
+		if resp.StatusCode != 400 {
+			t.Errorf("%s: status = %d, want 400", c.name, resp.StatusCode)
+		}
+	}
+	// Numeric strings coerce instead of silently dropping (mirrors Python).
+	resp := postJSON(t, ts.URL, "/memories", `{"text":"coerced importance","importance":"0.9"}`)
+	if resp.StatusCode != 201 {
+		t.Fatalf("numeric-string importance = %d, want 201", resp.StatusCode)
+	}
+	if imp := decode(t, resp)["importance"].(float64); imp != 0.9 {
+		t.Errorf("importance = %v, want 0.9 (coerced, not defaulted)", imp)
+	}
+}
+
+func TestLoneStringTagsWrapsIntoList(t *testing.T) {
+	ts, store := newTestServer(t, "")
+	resp := postJSON(t, ts.URL, "/memories", `{"text":"tagged once","tags":"prod"}`)
+	if resp.StatusCode != 201 {
+		t.Fatalf("lone-string tags = %d, want 201", resp.StatusCode)
+	}
+	id := decode(t, resp)["id"].(string)
+	m, _ := store.GetByID(context.Background(), id)
+	if len(m.Tags) != 1 || m.Tags[0] != "prod" {
+		t.Fatalf("tags = %v, want [prod]", m.Tags)
+	}
+
+	resp = postJSON(t, ts.URL, "/memories", `{"text":"bad tags","tags":{"a":1}}`)
+	if resp.StatusCode != 400 {
+		t.Fatalf("garbage tags = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestArchiveRoutesRefuseTokenlessRemoteCallers(t *testing.T) {
+	// /export and /import reach past the store onto the server filesystem, so
+	// with no token configured they must only answer loopback peers.
+	_, store := newTestServer(t, "")
+	srv := httpserver.New(store, "/p", "test", "")
+	h := srv.Handler()
+
+	for _, path := range []string{"/export", "/import"} {
+		req := httptest.NewRequest("POST", path,
+			strings.NewReader(`{"path":"/tmp/x.ahkai"}`))
+		req.RemoteAddr = "203.0.113.9:4444"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 403 {
+			t.Errorf("tokenless remote POST %s = %d, want 403", path, rec.Code)
+		}
+	}
+
+	// A loopback peer keeps the documented tokenless local workflow.
+	req := httptest.NewRequest("POST", "/export",
+		strings.NewReader(`{"path":"`+t.TempDir()+`/ok.ahkai"}`))
+	req.RemoteAddr = "127.0.0.1:5555"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("tokenless loopback export = %d, want 200 (%s)", rec.Code, rec.Body)
+	}
+
+	// With a token configured the trust model is the token, wherever the
+	// caller is.
+	authed := httpserver.New(store, "/p", "test", "sekrit")
+	req = httptest.NewRequest("POST", "/export",
+		strings.NewReader(`{"path":"`+t.TempDir()+`/ok2.ahkai"}`))
+	req.RemoteAddr = "203.0.113.9:4444"
+	req.Header.Set("Authorization", "Bearer sekrit")
+	rec = httptest.NewRecorder()
+	authed.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("tokened remote export = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
 }

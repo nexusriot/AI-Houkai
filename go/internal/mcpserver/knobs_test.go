@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -148,5 +149,247 @@ func TestAutoContextTouchFalseIsReadOnly(t *testing.T) {
 	callTool(t, s, "auto_context", map[string]any{"task": "read-only fan-out subject"})
 	if got := callTool(t, s, "get", map[string]any{"memory_id": id}); got["access_count"].(float64) == 0 {
 		t.Error("default auto_context should bump access_count")
+	}
+}
+
+// The bitemporal write path: valid_from/valid_until must reach the store.
+func TestMCPRememberValidityInterval(t *testing.T) {
+	store := newTestStore(t)
+	handler := rememberHandler(store)
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{
+		"text":        "true only in january",
+		"valid_from":  float64(100),
+		"valid_until": float64(200),
+	}
+	res, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := toolResultJSON(t, res)
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatalf("remember failed: %v", out)
+	}
+	m, err := store.GetByID(context.Background(), id)
+	if err != nil || m.ValidFrom != 100 || m.ValidUntil != 200 {
+		t.Fatalf("validity = [%v, %v) err=%v, want [100, 200)",
+			m.ValidFrom, m.ValidUntil, err)
+	}
+}
+
+// The pinned/trust/valid-time edit knobs must all be applied.
+func TestMCPEditPinnedTrustValidity(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	m, _, _, _ := store.Remember(ctx, "edit all the new knobs", memory.RememberOpts{})
+
+	handler := editHandler(store)
+	var req mcp.CallToolRequest
+	req.Params.Arguments = map[string]any{
+		"memory_id":   m.ID,
+		"pinned":      true,
+		"trust":       "untrusted",
+		"valid_from":  float64(10),
+		"valid_until": float64(20),
+	}
+	res, err := handler(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := toolResultJSON(t, res)
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("edit failed: %v", out)
+	}
+	got, _ := store.GetByID(ctx, m.ID)
+	if !got.Pinned {
+		t.Error("pinned not applied")
+	}
+	if got.Trust != memory.TrustLevel("untrusted") {
+		t.Errorf("trust = %q, want untrusted", got.Trust)
+	}
+	if got.ValidFrom != 10 || got.ValidUntil != 20 {
+		t.Errorf("validity = [%v, %v), want [10, 20)", got.ValidFrom, got.ValidUntil)
+	}
+}
+
+func TestRememberToolWiresOnConflict(t *testing.T) {
+	store := newTestStore(t) // store policy: ignore
+	s := New(store, "/store", "test")
+	ctx := context.Background()
+
+	first := callTool(t, s, "remember", map[string]any{
+		"text": "the ingress controller is traefik", "type": "semantic",
+	})
+	if stored, _ := first["stored"].(bool); !stored {
+		t.Fatalf("first remember: %v", first)
+	}
+
+	// The per-call on_conflict must reach the store: with the store's own
+	// policy (ignore) this duplicate would be stored silently.
+	second := callTool(t, s, "remember", map[string]any{
+		"text": "the ingress controller is traefik", "type": "semantic",
+		"on_conflict": "raise",
+	})
+	if stored, _ := second["stored"].(bool); stored {
+		t.Fatalf("on_conflict=raise stored the duplicate: %v", second)
+	}
+	if second["conflicts"] == nil {
+		t.Errorf("on_conflict=raise should report conflicts, got %v", second)
+	}
+	if c, _ := store.Count(ctx); c != 1 {
+		t.Errorf("count after rejected duplicate = %d, want 1 (rolled back)", c)
+	}
+}
+
+func TestRememberToolExplicitZeroImportance(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+
+	out := callTool(t, s, "remember", map[string]any{
+		"text": "explicitly worthless", "importance": float64(0),
+	})
+	if imp, ok := out["importance"].(float64); !ok || imp != 0 {
+		t.Errorf("importance = %v, want 0 (explicit zero must not fall back to 0.5)", out["importance"])
+	}
+
+	// And omitting importance still yields the store default.
+	out = callTool(t, s, "remember", map[string]any{"text": "default importance"})
+	if imp, ok := out["importance"].(float64); !ok || imp != 0.5 {
+		t.Errorf("default importance = %v, want 0.5", out["importance"])
+	}
+}
+
+func TestRememberToolDefaultsTypeSemantic(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+	ctx := context.Background()
+
+	out := callTool(t, s, "remember", map[string]any{"text": "untyped memory"})
+	id, _ := out["id"].(string)
+	if id == "" {
+		t.Fatalf("remember payload: %v", out)
+	}
+	m, err := store.GetByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Type != memory.Semantic {
+		t.Errorf("default type = %q, want semantic", m.Type)
+	}
+}
+
+func TestEditTool(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+	ctx := context.Background()
+
+	created := callTool(t, s, "remember", map[string]any{
+		"text": "MCP edit target", "tags": []any{"orig"},
+	})
+	id, _ := created["id"].(string)
+
+	out := callTool(t, s, "edit", map[string]any{
+		"memory_id":  id,
+		"text":       "MCP edit target, revised",
+		"importance": float64(0),
+		"tags":       []any{"newtag"},
+		"source":     "review",
+	})
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("edit failed: %v", out)
+	}
+	m, err := store.GetByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Text != "MCP edit target, revised" || m.Importance != 0 || m.Source != "review" {
+		t.Errorf("edited memory = %+v", m)
+	}
+	if len(m.Tags) != 1 || m.Tags[0] != "newtag" {
+		t.Errorf("tags = %v, want [newtag]", m.Tags)
+	}
+
+	// Validation errors surface as ok:false, not a transport error.
+	bad := callTool(t, s, "edit", map[string]any{"memory_id": id, "type": "opinions"})
+	if ok, _ := bad["ok"].(bool); ok {
+		t.Errorf("edit with bad type should fail, got %v", bad)
+	}
+	missing := callTool(t, s, "edit", map[string]any{"memory_id": "no-such-id", "text": "x"})
+	if ok, _ := missing["ok"].(bool); ok {
+		t.Errorf("edit of missing id should fail, got %v", missing)
+	}
+}
+
+// An idempotent repeat reported {stored:false, conflicts:[]} — an agent reading
+// that sees a rejected write with no reason given, when in fact the store found
+// the existing row and bumped it. Report the row and say nothing was created.
+func TestMCPIdempotentRepeatReportsTheExistingRow(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+
+	first := callTool(t, s, "remember",
+		map[string]any{"text": "repeat me", "idempotent": true})
+	if first["stored"] != true {
+		t.Fatalf("first write = %v, want stored:true", first)
+	}
+
+	second := callTool(t, s, "remember",
+		map[string]any{"text": "repeat me", "idempotent": true})
+	if second["stored"] != false {
+		t.Errorf("repeat stored = %v, want false", second["stored"])
+	}
+	if second["id"] != first["id"] {
+		t.Errorf("repeat id = %v, want the existing %v", second["id"], first["id"])
+	}
+	if c, ok := second["conflicts"]; ok {
+		t.Errorf("repeat reported conflicts: %v", c)
+	}
+}
+
+func TestRememberTTLAndPurgeTool(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+	rem := callTool(t, s, "remember", map[string]any{"text": "ephemeral mcp", "expires_at": float64(1.0)})
+	id := rem["id"].(string)
+	if rem["expires_at"] == nil {
+		t.Error("remember response missing expires_at")
+	}
+	// Hidden from recall.
+	for _, r := range callToolArray(t, s, "recall", map[string]any{"query": "ephemeral", "k": float64(5)}) {
+		if r["id"] == id {
+			t.Error("expired memory should be hidden from recall")
+		}
+	}
+	// Visible with include_expired.
+	found := false
+	for _, r := range callToolArray(t, s, "recall", map[string]any{"query": "ephemeral", "k": float64(5), "include_expired": true}) {
+		if r["id"] == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("include_expired should surface the expired memory")
+	}
+	// Purgeable.
+	purged := callTool(t, s, "purge_expired", map[string]any{})
+	if purged["purged"].(float64) != 1 {
+		t.Errorf("purge removed %v, want 1", purged["purged"])
+	}
+}
+
+func TestRecallExplainTool(t *testing.T) {
+	store := newTestStore(t)
+	s := New(store, "/store", "test")
+	callTool(t, s, "remember", map[string]any{"text": "explain this via mcp"})
+	rows := callToolArray(t, s, "recall", map[string]any{
+		"query": "explain", "k": float64(1), "mode": "hybrid", "explain": true,
+	})
+	if len(rows) == 0 {
+		t.Fatal("no results")
+	}
+	expl, ok := rows[0]["explain"].(map[string]any)
+	if !ok || expl["mode"] != "hybrid" {
+		t.Fatalf("hit missing hybrid explain: %v", rows[0])
 	}
 }
