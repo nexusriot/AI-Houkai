@@ -2,6 +2,7 @@ package httpserver_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"path/filepath"
@@ -37,6 +38,39 @@ func newJournaledServer(t *testing.T) (*httptest.Server, *memory.MemoryStore, st
 }
 
 // post sends a JSON body and returns (status, decoded body).
+// newTokenedServer is newJournaledServer with a bearer token — the archive
+// routes require one.
+func newTokenedServer(t *testing.T) (*httptest.Server, *memory.MemoryStore, string) {
+	t.Helper()
+	dir := t.TempDir()
+	backend, err := vector.NewChromem(filepath.Join(dir, "s"), "test", 16)
+	if err != nil {
+		t.Fatalf("NewChromem: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	cfg := memory.DefaultStoreConfig(dir, "test")
+	cfg.JournalEnabled = true
+	cfg.JournalPath = filepath.Join(dir, "journal.log")
+	store := memory.NewMemoryStore(backend, &stubEmbedder{dim: 16}, cfg)
+	ts := httptest.NewServer(httpserver.New(store, dir, "test", "s3cret").Handler())
+	t.Cleanup(ts.Close)
+	return ts, store, dir
+}
+
+// postAuthed is post with the bearer token attached.
+func postAuthed(t *testing.T, url string, body any) (int, map[string]any) {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	return resp.StatusCode, decode(t, resp)
+}
+
 func post(t *testing.T, url string, body any) (int, map[string]any) {
 	t.Helper()
 	raw, _ := json.Marshal(body)
@@ -181,17 +215,22 @@ func TestJournalRoute(t *testing.T) {
 }
 
 func TestExportImportRoundtripRoutes(t *testing.T) {
-	ts, store, dir := newJournaledServer(t)
-	remember(t, ts.URL, "http archive subject")
+	// Archive routes require a configured token (see
+	// TestArchiveRoutesRequireAToken for the refusal side).
+	ts, store, dir := newTokenedServer(t)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "http archive subject", memory.RememberOpts{}); err != nil {
+		t.Fatal(err)
+	}
 	archive := filepath.Join(dir, "dump.ahkai")
 
-	status, body := post(t, ts.URL+"/export", map[string]any{"path": archive})
+	status, body := postAuthed(t, ts.URL+"/export", map[string]any{"path": archive})
 	if status != 200 || body["count"].(float64) != 1 {
 		t.Fatalf("export = %d %v", status, body)
 	}
-	post(t, ts.URL+"/nuke", map[string]any{"confirm": "DELETE ALL"})
+	postAuthed(t, ts.URL+"/nuke", map[string]any{"confirm": "DELETE ALL"})
 
-	status, body = post(t, ts.URL+"/import", map[string]any{"path": archive})
+	status, body = postAuthed(t, ts.URL+"/import", map[string]any{"path": archive})
 	if status != 200 || body["imported"].(float64) != 1 {
 		t.Fatalf("import = %d %v", status, body)
 	}
@@ -202,8 +241,8 @@ func TestExportImportRoundtripRoutes(t *testing.T) {
 }
 
 func TestImportMissingArchiveIs404(t *testing.T) {
-	ts, _, dir := newJournaledServer(t)
-	status, _ := post(t, ts.URL+"/import",
+	ts, _, dir := newTokenedServer(t)
+	status, _ := postAuthed(t, ts.URL+"/import",
 		map[string]any{"path": filepath.Join(dir, "absent.ahkai")})
 	if status != 404 {
 		t.Errorf("status = %d, want 404", status)

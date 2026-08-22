@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager
@@ -44,6 +45,10 @@ __all__ = [
 
 # Where trashed memories are parked, relative to the store's parent directory.
 TRASH_FILENAME = "trash.jsonl.gz"
+
+# Process-wide floor of the trash lock (see _trash_lock): covers every store
+# in this process on every platform; POSIX adds a cross-process flock on top.
+_TRASH_MUTEX = threading.Lock()
 
 
 class MergeError(ValueError):
@@ -358,25 +363,31 @@ class CurationMixin:
 
     @contextmanager
     def _trash_lock(self) -> Iterator[None]:
-        """Exclusive flock over a lock file beside the trash file.
+        """Serialize trash mutations.
 
         The trash is a shared read-modify-write file: two stores (one per
         collection on the same path — a supported layout, or two processes)
         mutating it concurrently would lose whichever rewrite lands first.
-        Degrades to no locking where fcntl is unavailable — the lock is
-        protection, not a prerequisite.
+        A process-wide mutex is the floor on every platform; on POSIX an
+        exclusive flock on a lock file beside the trash extends the exclusion
+        across processes (its errors propagate — proceeding unlocked risks
+        exactly the corruption the lock exists to prevent). Without fcntl,
+        cross-PROCESS sharing of one trash file is unsynchronized — a
+        documented limitation; in-process multi-store use is covered.
         """
-        if fcntl is None:
-            yield
-            return
-        lock_path = self.trash_path.with_name(self.trash_path.name + ".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "a") as lf:
-            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
-            try:
+        with _TRASH_MUTEX:
+            if fcntl is None:
                 yield
-            finally:
-                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+                return
+            lock_path = self.trash_path.with_name(
+                self.trash_path.name + ".lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "a") as lf:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
 
     def trash(self, memory_id: str) -> bool:
         """Soft-delete: park the memory in the trash, then remove it.

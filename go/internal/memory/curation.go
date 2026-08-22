@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Curation operations: merge, versions, tag management, path-finding, trash.
@@ -27,6 +28,11 @@ import (
 // TrashFilename is where soft-deleted memories are parked, relative to the
 // store directory's parent.
 const TrashFilename = "trash.jsonl.gz"
+
+// trashMu is the process-wide floor of the trash lock (see lockTrash): it
+// covers every store in this process regardless of platform; the unix build
+// adds a cross-process flock on top.
+var trashMu sync.Mutex
 
 // ErrSelfMerge is returned when Merge is asked to fold a memory into itself.
 var ErrSelfMerge = errors.New("cannot merge a memory with itself")
@@ -450,7 +456,10 @@ func (s *MemoryStore) Trash(ctx context.Context, memoryID string) (bool, error) 
 		MemoryID: mem.ID, DeletedAt: nowFloat(), Actor: s.actor,
 		Memory: mem.ToDict(), Collection: s.cfg.Collection,
 	}
-	unlock := s.lockTrash()
+	unlock, err := s.lockTrash()
+	if err != nil {
+		return false, err
+	}
 	err = s.appendTrash(entry)
 	unlock()
 	if err != nil {
@@ -529,7 +538,11 @@ func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory
 	// The read-filter-rewrite below must be atomic against other stores
 	// sharing the trash file (one per collection, or another process) —
 	// unlocked, two concurrent mutations lose whichever rewrite lands first.
-	defer s.lockTrash()()
+	unlock, err := s.lockTrash()
+	if err != nil {
+		return Memory{}, false, err
+	}
+	defer unlock()
 	entries, err := s.readTrash()
 	if err != nil {
 		return Memory{}, false, err
@@ -569,7 +582,11 @@ func (s *MemoryStore) TrashRestore(ctx context.Context, memoryID string) (Memory
 // operation that loses data. Other collections' entries in the shared trash
 // file are untouched.
 func (s *MemoryStore) TrashPurge(memoryID string) (int, error) {
-	defer s.lockTrash()()
+	unlock, err := s.lockTrash()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err
@@ -605,7 +622,11 @@ func (s *MemoryStore) TrashPurgeExpired(ttlDays float64, now float64) (int, erro
 	if now == 0 {
 		now = nowFloat()
 	}
-	defer s.lockTrash()()
+	unlock, err := s.lockTrash()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
 	entries, err := s.readTrash()
 	if err != nil {
 		return 0, err

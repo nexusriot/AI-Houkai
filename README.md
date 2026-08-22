@@ -777,7 +777,7 @@ Endpoints (all JSON in / JSON out):
 | `GET /journal?n=&op=&since=` | audit-journal tail |
 | `POST /undo` | reverse a journaled mutation (`{ts?, memory_id?}`) |
 | `POST /nuke` | delete every memory — guarded by `{"confirm": "DELETE ALL"}` |
-| `POST /export` · `POST /import` | `.ahkai` archives (server-side paths). Because they reach past the store onto the filesystem, a tokenless server answers them for **loopback callers only** — configure a token to use them remotely |
+| `POST /export` · `POST /import` | `.ahkai` archives (server-side paths). Because they reach past the store onto the filesystem, they **require a configured auth token** — a tokenless server refuses them (use `houkai export` / `houkai import` locally instead) |
 
 ```bash
 curl -s localhost:8077/health

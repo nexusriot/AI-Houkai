@@ -30,6 +30,21 @@ func rememberHTTP(t *testing.T, url, payload string) string {
 	return id
 }
 
+func postJSONAuthed(t *testing.T, url, path, payload, token string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, url+path, strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 func postJSON(t *testing.T, url, path, payload string) *http.Response {
 	t.Helper()
 	resp, err := http.Post(url+path, "application/json", bytes.NewReader([]byte(payload)))
@@ -306,6 +321,7 @@ func TestPatchPinnedOnlyIsAValidEdit(t *testing.T) {
 	id := rememberHTTP(t, ts.URL, `{"text":"pin me later"}`)
 
 	resp := doJSON(t, "PATCH", ts.URL, "/memories/"+id, `{"pinned":true}`)
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("pinned-only PATCH = %d, want 200", resp.StatusCode)
 	}
@@ -320,6 +336,7 @@ func TestPatchValidUntilOnlyRetiresAFact(t *testing.T) {
 	id := rememberHTTP(t, ts.URL, `{"text":"retire me via validity"}`)
 
 	resp := doJSON(t, "PATCH", ts.URL, "/memories/"+id, `{"valid_until": 2.0}`)
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("valid_until-only PATCH = %d, want 200", resp.StatusCode)
 	}
@@ -334,6 +351,7 @@ func TestPatchTrustOnly(t *testing.T) {
 	id := rememberHTTP(t, ts.URL, `{"text":"downgrade my origin"}`)
 
 	resp := doJSON(t, "PATCH", ts.URL, "/memories/"+id, `{"trust":"untrusted"}`)
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("trust-only PATCH = %d, want 200", resp.StatusCode)
 	}
@@ -378,7 +396,8 @@ func TestGetRecallTouchFalse(t *testing.T) {
 }
 
 func TestImportConflictIs409(t *testing.T) {
-	ts, store := newTestServer(t, "")
+	// Tokened: the archive routes refuse tokenless servers outright.
+	ts, store := newTestServer(t, "s3cret")
 	ctx := context.Background()
 	m, _, _, _ := store.Remember(ctx, "collision subject", memory.RememberOpts{})
 	dir := t.TempDir()
@@ -387,14 +406,14 @@ func TestImportConflictIs409(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := postJSON(t, ts.URL, "/import",
-		fmt.Sprintf(`{"path":%q,"on_conflict":"error"}`, out))
+	resp := postJSONAuthed(t, ts.URL, "/import",
+		fmt.Sprintf(`{"path":%q,"on_conflict":"error"}`, out), "s3cret")
 	if resp.StatusCode != 409 {
 		t.Fatalf("conflicting import = %d, want 409", resp.StatusCode)
 	}
 	_ = m
 
-	resp = postJSON(t, ts.URL, "/import", `{"path":"/nonexistent/x.ahkai"}`)
+	resp = postJSONAuthed(t, ts.URL, "/import", `{"path":"/nonexistent/x.ahkai"}`, "s3cret")
 	if resp.StatusCode != 404 {
 		t.Fatalf("missing archive = %d, want 404", resp.StatusCode)
 	}

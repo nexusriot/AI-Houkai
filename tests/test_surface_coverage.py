@@ -7,6 +7,7 @@ differentiator and undo was reachable only from a local shell.
 from __future__ import annotations
 
 import json
+import time
 import threading
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
@@ -45,6 +46,33 @@ def http(tmp_path):
         data = json.dumps(body).encode() if body is not None else None
         req = Request(f"{base}{path}", data=data, method=method,
                       headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    yield call, store
+    server.shutdown()
+    server.server_close()
+    store.client.close()
+
+
+@pytest.fixture()
+def http_tokened(tmp_path):
+    """Like ``http``, but with a bearer token — the archive routes need one."""
+    store = MemoryStore(path=str(tmp_path / "chroma"), collection="surface_http")
+    server = ThreadingHTTPServer(("127.0.0.1", 0),
+                                 build_handler(store, auth_token="s3cret"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def call(method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = Request(f"{base}{path}", data=data, method=method,
+                      headers={"Content-Type": "application/json",
+                               "Authorization": "Bearer s3cret"})
         try:
             with urlopen(req) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
@@ -193,8 +221,10 @@ class TestHttpSurface:
         _, filtered = call("GET", "/journal?op=forget")
         assert filtered["count"] == 0
 
-    def test_export_then_import_roundtrip(self, http, tmp_path):
-        call, store = http
+    def test_export_then_import_roundtrip(self, http_tokened, tmp_path):
+        # Archive routes require a configured token — see TestArchiveRouteGate
+        # in test_http_server.py for the refusal side.
+        call, store = http_tokened
         call("POST", "/memories", {"text": "http archive subject", "tags": ["a"]})
         archive = str(tmp_path / "dump.ahkai")
 
@@ -207,8 +237,8 @@ class TestHttpSurface:
         assert status == 200 and imported["imported"] == 1
         assert store.count() == 1
 
-    def test_import_missing_archive_is_404(self, http, tmp_path):
-        call, _ = http
+    def test_import_missing_archive_is_404(self, http_tokened, tmp_path):
+        call, _ = http_tokened
         status, _ = call("POST", "/import", {"path": str(tmp_path / "absent.ahkai")})
         assert status == 404
 
@@ -299,3 +329,44 @@ class TestCliRegressionFixes:
         assert res.exit_code == 0 and "Undone." in res.stdout
         listing = self._run(tmp_path, "list", "--format", "json")
         assert [m["id"] for m in json.loads(listing.stdout)] == [mid]
+
+
+class TestTimeTravelPrefixResolution:
+    """history / get-at exist precisely for memories that may no longer be
+    live, so their id prefixes resolve against the journal (archives
+    included), falling back to the live store only when the journal has no
+    match."""
+
+    def _run(self, tmp_path, *args):
+        return CliRunner().invoke(
+            app, ["--store", str(tmp_path / "chroma"), *args])
+
+    def test_history_by_prefix_after_forget(self, tmp_path):
+        self._run(tmp_path, "remember", "historied then deleted")
+        listing = self._run(tmp_path, "list", "--format", "json")
+        mid = json.loads(listing.stdout)[0]["id"]
+        self._run(tmp_path, "forget", mid, "-y")
+
+        res = self._run(tmp_path, "history", mid[:8], "--json")
+        assert res.exit_code == 0, res.stdout + (res.stderr or "")
+        ops = [e["op"] for e in json.loads(res.stdout)]
+        assert ops == ["remember", "forget"]
+
+    def test_get_at_by_prefix_after_forget(self, tmp_path):
+        self._run(tmp_path, "remember", "reconstruct me later")
+        listing = self._run(tmp_path, "list", "--format", "json")
+        mem = json.loads(listing.stdout)[0]
+        # An instant strictly between the journaled remember and the forget —
+        # created_at can precede the remember entry's own journal ts.
+        between = time.time()
+        self._run(tmp_path, "forget", mem["id"], "-y")
+
+        res = self._run(tmp_path, "get-at", mem["id"][:8], str(between),
+                        "--json")
+        assert res.exit_code == 0, res.stdout + (res.stderr or "")
+        assert json.loads(res.stdout)["id"] == mem["id"]
+
+    def test_unknown_prefix_still_errors(self, tmp_path):
+        self._run(tmp_path, "remember", "anchor row")
+        res = self._run(tmp_path, "history", "deadbeef")
+        assert res.exit_code == 1

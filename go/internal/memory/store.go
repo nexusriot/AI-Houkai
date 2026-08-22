@@ -285,11 +285,12 @@ func (s *MemoryStore) findByContentHash(ctx context.Context, digest string) (Mem
 	}
 	// An indexed metadata lookup, not backend.All: this runs on every
 	// idempotent write, and a full-collection scan made the dedup check the
-	// most expensive part of storing a memory. The small over-fetch leaves
-	// room for superseded/expired rows sharing the digest. Errors propagate —
-	// treating a transient backend failure as "no match" silently inserted a
-	// duplicate instead of surfacing the problem.
-	items, err := s.backend.SearchMetadata(ctx, map[string]string{"content_hash": digest}, 16)
+	// most expensive part of storing a memory. Limit 0 = every row matching
+	// the exact-hash filter (still tiny) — a fixed cap could hide the one
+	// live row behind enough superseded/expired ones sharing the digest.
+	// Errors propagate — treating a transient backend failure as "no match"
+	// silently inserted a duplicate instead of surfacing the problem.
+	items, err := s.backend.SearchMetadata(ctx, map[string]string{"content_hash": digest}, 0)
 	if err != nil {
 		return Memory{}, false, err
 	}

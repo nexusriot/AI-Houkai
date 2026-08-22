@@ -49,8 +49,8 @@ Routes (all JSON in / JSON out):
 Optional bearer-token auth: pass ``auth_token`` (or set ``AI_HOUKAI_HTTP_TOKEN``)
 and every request must carry ``Authorization: Bearer <token>``.  ``/health`` and
 ``/ready`` stay reachable so liveness/readiness probes work without the secret.
-With no token, ``/export`` and ``/import`` (which read/write server-side paths)
-only answer loopback peers.
+``/export`` and ``/import`` (which read/write server-side paths) additionally
+require a token to be configured at all; a tokenless server refuses them.
 
 The handler is intentionally framework-free: a single regex routing table maps
 ``(method, path)`` to small functions taking ``(store, match, query, body)``.
@@ -59,7 +59,6 @@ The handler is intentionally framework-free: a single regex routing table maps
 from __future__ import annotations
 
 import hmac
-import ipaddress
 import json
 import os
 import re
@@ -778,33 +777,31 @@ def _str_list(b: dict[str, Any], key: str) -> "list[str] | None":
 
 
 _ARCHIVE_DENIED = (
-    "archive routes read/write server-side paths; configure an auth token "
-    "(or call from loopback) to use /export and /import"
+    "archive routes read/write server-side paths and require a configured "
+    "auth token; use the `houkai export` / `houkai import` CLI commands for "
+    "tokenless local use"
 )
 
 
-def _archive_route_allowed(path: str, auth_token: str | None,
-                           client_ip: str) -> bool:
+def _archive_route_allowed(path: str, auth_token: str | None) -> bool:
     """Whether /export & /import may run for this caller.
 
     These two routes reach past the store onto the server's filesystem
     (arbitrary read into the store / arbitrary .gz write), so unlike the
-    store-scoped routes they are not offered to unauthenticated REMOTE
-    callers: with no token configured, only loopback peers — the local
-    single-user setup the tokenless mode exists for — may call them.
+    store-scoped routes they are never offered without a configured token.
+    A peer-address check is not a substitute: the stdlib handler accepts any
+    Content-Type, so even a loopback bind is reachable by a drive-by
+    cross-origin POST from a browser, and localhost proxies forward remote
+    callers with a loopback peer address. Local tokenless workflows use the
+    CLI, which talks to the store directly.
     """
-    if path not in ("/export", "/import") or auth_token is not None:
-        return True
-    try:
-        return ipaddress.ip_address(client_ip).is_loopback
-    except ValueError:
-        return False
+    return path not in ("/export", "/import") or auth_token is not None
 
 
 def _export(store: MemoryStore, m, q, b):
     """Write a .ahkai archive to a server-side path. The path is resolved on
-    the server; without a token these routes only answer loopback callers
-    (see _archive_route_allowed)."""
+    the server; these routes require a configured auth token (see
+    _archive_route_allowed)."""
     summary = store.export(
         _require(b, "path"),
         include_vectors=_body_bool(b, "include_vectors", True),
@@ -1085,8 +1082,7 @@ def build_handler(
                 self._send(401, {"error": "unauthorized"})
                 return
 
-            if not _archive_route_allowed(path, auth_token,
-                                          self.client_address[0]):
+            if not _archive_route_allowed(path, auth_token):
                 self._send(403, {"error": _ARCHIVE_DENIED})
                 return
 

@@ -42,6 +42,56 @@ func printJSON(v any) error {
 	return nil
 }
 
+// journalIDMatches collects every full memory id among entries matching
+// prefix — the primary id plus the link/supersede/restore counterparts
+// recorded only in meta.
+func journalIDMatches(entries []memory.JournalEntry, prefix string) map[string]bool {
+	ids := map[string]bool{}
+	for _, e := range entries {
+		if strings.HasPrefix(e.ID, prefix) {
+			ids[e.ID] = true
+		}
+		for _, key := range []string{"dst_id", "new_id", "superseder_id"} {
+			if v, _ := e.Meta[key].(string); v != "" && strings.HasPrefix(v, prefix) {
+				ids[v] = true
+			}
+		}
+	}
+	return ids
+}
+
+// resolveJournalID resolves a memory-id prefix for the time-travel commands.
+//
+// Resolved against the JOURNAL first (archives included): history and get-at
+// exist precisely for memories that may no longer be live, so the live store
+// cannot be the primary universe. The live resolver only fills in when the
+// journal has no match (journaling disabled, or history pruned past
+// keep_days).
+func resolveJournalID(cmd *cobra.Command, prefix string) (string, error) {
+	if len(prefix) == 36 {
+		return prefix, nil
+	}
+	store := storeFromCtx(cmd.Context())
+	if j := store.Journal(); j != nil {
+		entries, err := j.Read(memory.ReadOpts{IncludeArchives: true})
+		if err != nil {
+			return "", err
+		}
+		ids := journalIDMatches(entries, prefix)
+		if len(ids) > 1 {
+			return "", fmt.Errorf("%q is ambiguous (%d matches)", prefix, len(ids))
+		}
+		for id := range ids {
+			return id, nil
+		}
+	}
+	mem, err := store.GetByID(cmd.Context(), prefix)
+	if err != nil {
+		return "", err
+	}
+	return mem.ID, nil
+}
+
 func newHistoryCmd() *cobra.Command {
 	var includeArchives bool
 	cmd := &cobra.Command{
@@ -52,11 +102,11 @@ func newHistoryCmd() *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
-			mem, err := store.GetByID(cmd.Context(), args[0])
+			fullID, err := resolveJournalID(cmd, args[0])
 			if err != nil {
 				return err
 			}
-			entries, err := store.History(cmd.Context(), mem.ID, includeArchives)
+			entries, err := store.History(cmd.Context(), fullID, includeArchives)
 			if err != nil {
 				return err
 			}
@@ -137,11 +187,15 @@ func newGetAtCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			store := storeFromCtx(cmd.Context())
+			fullID, err := resolveJournalID(cmd, args[0])
+			if err != nil {
+				return err
+			}
 			ts, err := requireTS(args[1])
 			if err != nil {
 				return err
 			}
-			mem, err := store.GetAt(cmd.Context(), args[0], ts)
+			mem, err := store.GetAt(cmd.Context(), fullID, ts)
 			if err != nil {
 				return err
 			}
@@ -188,6 +242,22 @@ func newJournalUndoLastCmd() *cobra.Command {
 			entries, err := j.Read(memory.ReadOpts{})
 			if err != nil {
 				return err
+			}
+			// Resolve an --id prefix against the same (active) journal the
+			// entry is picked from: EntryTouches compares exact ids, and the
+			// memory being undone is often already forgotten, so the live
+			// store cannot resolve it.
+			if memID != "" && len(memID) != 36 {
+				ids := journalIDMatches(entries, memID)
+				if len(ids) == 0 {
+					return fmt.Errorf("no journal entry for id prefix %q", memID)
+				}
+				if len(ids) > 1 {
+					return fmt.Errorf("%q is ambiguous (%d matches)", memID, len(ids))
+				}
+				for id := range ids {
+					memID = id
+				}
 			}
 			var entry *memory.JournalEntry
 			for i := len(entries) - 1; i >= 0; i-- {

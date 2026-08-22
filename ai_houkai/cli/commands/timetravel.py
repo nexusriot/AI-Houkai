@@ -20,25 +20,10 @@ from ai_houkai.cli import output as out
 from ai_houkai.timeparse import parse_timestamp
 
 
-def _resolve(store, id_or_prefix: str) -> str:
-    try:
-        return out.resolve_id_prefix(store, id_or_prefix)
-    except ValueError as e:
-        typer.echo(f"Error: {e}", err=True)
-        raise typer.Exit(1)
-
-
-def _resolve_undo_id(prefix: str, entries) -> str:
-    """Resolve an id prefix against the journal, not the live store.
-
-    Undo only ever targets journaled entries, and the newest entry for a
-    memory is often the ``forget`` that removed it — exactly the change an
-    operator wants undone — so resolving against live memories would fail in
-    the primary scenario.
-    """
-    if len(prefix) == 36:
-        return prefix
-    ids = set()
+def _journal_id_matches(entries, prefix: str) -> set[str]:
+    """Every full memory id in *entries* matching *prefix* — the primary id
+    plus the link/supersede/restore counterparts recorded only in meta."""
+    ids: set[str] = set()
     for e in entries:
         if e.id.startswith(prefix):
             ids.add(e.id)
@@ -47,6 +32,47 @@ def _resolve_undo_id(prefix: str, entries) -> str:
             v = m.get(key)
             if v and v.startswith(prefix):
                 ids.add(v)
+    return ids
+
+
+def _resolve(store, id_or_prefix: str) -> str:
+    """Resolve a memory-id prefix for the time-travel commands.
+
+    Resolved against the JOURNAL first (archives included): history and
+    get-at exist precisely for memories that may no longer be live, so the
+    live store cannot be the primary universe. The live resolver only fills
+    in when the journal has no match (journaling disabled, or the history
+    pruned past keep_days).
+    """
+    if len(id_or_prefix) == 36:
+        return id_or_prefix
+    ids = _journal_id_matches(store.journal.read(include_archives=True),
+                              id_or_prefix)
+    if len(ids) > 1:
+        typer.echo(f"Error: {id_or_prefix!r} is ambiguous "
+                   f"({len(ids)} matches)", err=True)
+        raise typer.Exit(1)
+    if ids:
+        return next(iter(ids))
+    try:
+        return out.resolve_id_prefix(store, id_or_prefix)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1)
+
+
+def _resolve_undo_id(prefix: str, entries) -> str:
+    """Resolve an id prefix against the journal entries undo-last searches.
+
+    Undo only ever targets journaled entries, and the newest entry for a
+    memory is often the ``forget`` that removed it — exactly the change an
+    operator wants undone — so resolving against live memories would fail in
+    the primary scenario. Scoped to the ACTIVE journal (the same universe
+    undo-last picks its entry from), unlike ``_resolve``.
+    """
+    if len(prefix) == 36:
+        return prefix
+    ids = _journal_id_matches(entries, prefix)
     if not ids:
         typer.echo(f"Error: no journal entry for id prefix {prefix!r}",
                    err=True)

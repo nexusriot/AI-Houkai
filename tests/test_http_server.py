@@ -763,28 +763,41 @@ class TestRecallScalarKnobs:
 
 class TestArchiveRouteGate:
     """/export and /import reach past the store onto the server filesystem, so
-    with no token configured they must only answer loopback peers."""
+    they require a configured token outright — a peer-address check is no
+    substitute (any-Content-Type parsing makes even a loopback bind reachable
+    by a drive-by cross-origin POST, and localhost proxies forward remote
+    callers with a loopback peer)."""
 
     def test_predicate(self):
         allowed = http_mod._archive_route_allowed
-        assert allowed("/export", None, "127.0.0.1")
-        assert allowed("/import", None, "::1")
-        assert not allowed("/export", None, "203.0.113.9")
-        assert not allowed("/import", None, "not-an-ip")
-        # A configured token restores the documented trust model.
-        assert allowed("/export", "sekrit", "203.0.113.9")
-        # Store-scoped routes are unaffected.
-        assert allowed("/recall", None, "203.0.113.9")
+        assert not allowed("/export", None)
+        assert not allowed("/import", None)
+        assert allowed("/export", "sekrit")
+        assert allowed("/import", "sekrit")
+        # Store-scoped routes are unaffected by the gate.
+        assert allowed("/recall", None)
 
-    def test_dispatch_enforces_the_gate(self, server, store, monkeypatch):
-        monkeypatch.setattr(http_mod, "_archive_route_allowed",
-                            lambda *a: False)
-        status, body = _req(server, "POST", "/export", {"path": "/tmp/x.ahkai"})
-        assert status == 403
-        assert "server-side paths" in body["error"]
+    def test_tokenless_server_refuses_archive_routes(self, server, tmp_path):
+        for path in ("/export", "/import"):
+            status, body = _req(server, "POST", path,
+                                {"path": str(tmp_path / "x.ahkai")})
+            assert status == 403, (path, status)
+            assert "server-side paths" in body["error"]
 
-    def test_loopback_tokenless_export_still_works(self, server, store, tmp_path):
+    def test_tokened_server_allows_archive_routes(self, store, tmp_path):
         store.remember("archive gate subject")
-        status, body = _req(server, "POST", "/export",
-                            {"path": str(tmp_path / "gate.ahkai")})
-        assert status == 200 and body["count"] >= 1
+        httpd = make_server(host="127.0.0.1", port=0, store=store,
+                            auth_token="s3cret")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        host, port = httpd.server_address
+        try:
+            status, body = _req(
+                f"http://{host}:{port}", "POST", "/export",
+                {"path": str(tmp_path / "gate.ahkai")},
+                headers={"Authorization": "Bearer s3cret"})
+            assert status == 200 and body["count"] >= 1
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)

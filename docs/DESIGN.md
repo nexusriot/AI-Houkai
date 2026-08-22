@@ -2357,10 +2357,13 @@ own (entries written before the field existed stay visible everywhere).
 `trash_restore` also refuses an id that is live again (an export→import can
 resurrect one — restoring over it would be silently ignored by the backend
 while the snapshot was destroyed), and with several entries for one id it
-restores the newest snapshot, leaving older ones recoverable. Mutations take
-an exclusive flock on a lock file beside the trash (both ports): the file is
-shared read-modify-write state, and two stores rewriting it concurrently
-would lose whichever rewrite landed first.
+restores the newest snapshot, leaving older ones recoverable. Mutations are
+serialized (both ports) by a process-wide mutex plus, on POSIX, an exclusive
+flock on a lock file beside the trash: the file is shared read-modify-write
+state, and two stores rewriting it concurrently would lose whichever rewrite
+landed first. A failure to take the flock fails the mutation rather than
+silently proceeding unlocked; without flock(2), cross-process sharing of one
+trash file is unsynchronized (documented limitation).
 
 `trash_purge_expired(ttl_days)` supplies retention, and the maintenance
 scheduler drives it on the same tick as the TTL purge (`trash_ttl_days`,

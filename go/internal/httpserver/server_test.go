@@ -618,44 +618,38 @@ func TestLoneStringTagsWrapsIntoList(t *testing.T) {
 	}
 }
 
-func TestArchiveRoutesRefuseTokenlessRemoteCallers(t *testing.T) {
+func TestArchiveRoutesRequireAToken(t *testing.T) {
 	// /export and /import reach past the store onto the server filesystem, so
-	// with no token configured they must only answer loopback peers.
+	// they require a configured token outright — a loopback peer address is
+	// no substitute (any-Content-Type parsing makes even a loopback bind
+	// reachable by a drive-by cross-origin POST, and localhost proxies
+	// forward remote callers with a loopback peer).
 	_, store := newTestServer(t, "")
 	srv := httpserver.New(store, "/p", "test", "")
 	h := srv.Handler()
 
 	for _, path := range []string{"/export", "/import"} {
-		req := httptest.NewRequest("POST", path,
-			strings.NewReader(`{"path":"/tmp/x.ahkai"}`))
-		req.RemoteAddr = "203.0.113.9:4444"
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		if rec.Code != 403 {
-			t.Errorf("tokenless remote POST %s = %d, want 403", path, rec.Code)
+		for _, peer := range []string{"127.0.0.1:5555", "203.0.113.9:4444"} {
+			req := httptest.NewRequest("POST", path,
+				strings.NewReader(`{"path":"/tmp/x.ahkai"}`))
+			req.RemoteAddr = peer
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != 403 {
+				t.Errorf("tokenless POST %s from %s = %d, want 403", path, peer, rec.Code)
+			}
 		}
 	}
 
-	// A loopback peer keeps the documented tokenless local workflow.
-	req := httptest.NewRequest("POST", "/export",
-		strings.NewReader(`{"path":"`+t.TempDir()+`/ok.ahkai"}`))
-	req.RemoteAddr = "127.0.0.1:5555"
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 200 {
-		t.Errorf("tokenless loopback export = %d, want 200 (%s)", rec.Code, rec.Body)
-	}
-
-	// With a token configured the trust model is the token, wherever the
-	// caller is.
+	// With a token configured the trust model is the token.
 	authed := httpserver.New(store, "/p", "test", "sekrit")
-	req = httptest.NewRequest("POST", "/export",
+	req := httptest.NewRequest("POST", "/export",
 		strings.NewReader(`{"path":"`+t.TempDir()+`/ok2.ahkai"}`))
 	req.RemoteAddr = "203.0.113.9:4444"
 	req.Header.Set("Authorization", "Bearer sekrit")
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	authed.Handler().ServeHTTP(rec, req)
 	if rec.Code != 200 {
-		t.Errorf("tokened remote export = %d, want 200 (%s)", rec.Code, rec.Body)
+		t.Errorf("tokened export = %d, want 200 (%s)", rec.Code, rec.Body)
 	}
 }

@@ -326,7 +326,9 @@ func TestRecallFastPathValidityShortfall(t *testing.T) {
 	_ = retired
 
 	// With every row retired the result is legitimately empty.
-	store.Forget(ctx, live.ID)
+	if _, err := store.Forget(ctx, live.ID); err != nil {
+		t.Fatal(err)
+	}
 	hits, err = store.Recall(ctx, "quarterly revenue target details", 1, RecallOpts{
 		Mode: ModeSemantic, IncludeSuperseded: true, IncludeExpired: true,
 	})

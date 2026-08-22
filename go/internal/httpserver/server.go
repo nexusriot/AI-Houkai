@@ -49,9 +49,9 @@
 //
 // Optional bearer-token auth: pass a token (or set AI_HOUKAI_HTTP_TOKEN) and
 // every request must carry "Authorization: Bearer <token>". /health and /ready
-// stay reachable so liveness/readiness probes work without the secret. With
-// no token, /export and /import (which read/write server-side paths) only
-// answer loopback peers.
+// stay reachable so liveness/readiness probes work without the secret.
+// /export and /import (which read/write server-side paths) additionally
+// require a token to be configured at all; a tokenless server refuses them.
 package httpserver
 
 import (
@@ -1087,28 +1087,24 @@ func (s *Server) journalTail(r *http.Request) (int, any, error) {
 
 // archiveRouteAllowed gates /export and /import: they reach past the store
 // onto the server's filesystem (arbitrary read into the store / arbitrary .gz
-// write), so unlike the store-scoped routes they are not offered to
-// unauthenticated REMOTE callers — with no token configured, only loopback
-// peers (the local single-user setup the tokenless mode exists for) may call
-// them.
-func (s *Server) archiveRouteAllowed(r *http.Request) error {
+// write), so unlike the store-scoped routes they require a configured token
+// outright. A peer-address check is no substitute: the handler accepts any
+// Content-Type, so even a loopback bind is reachable by a drive-by
+// cross-origin POST from a browser, and localhost proxies forward remote
+// callers with a loopback peer address. Local tokenless workflows use the
+// CLI (`houkai export` / `houkai import`), which talks to the store directly.
+func (s *Server) archiveRouteAllowed(_ *http.Request) error {
 	if s.token != "" {
 		return nil
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return nil
-	}
-	return errStatus(403, "archive routes read/write server-side paths; "+
-		"configure an auth token (or call from loopback) to use /export and /import")
+	return errStatus(403, "archive routes read/write server-side paths and "+
+		"require a configured auth token; use the `houkai export` / "+
+		"`houkai import` CLI commands for tokenless local use")
 }
 
 // export writes a .ahkai archive to a server-side path. The path is resolved
-// on the server; without a token this route only answers loopback callers
-// (see archiveRouteAllowed).
+// on the server; this route requires a configured auth token (see
+// archiveRouteAllowed).
 func (s *Server) export(r *http.Request) (int, any, error) {
 	if err := s.archiveRouteAllowed(r); err != nil {
 		return 0, nil, err
