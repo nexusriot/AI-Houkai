@@ -772,10 +772,32 @@ class TestArchiveRouteGate:
         allowed = http_mod._archive_route_allowed
         assert not allowed("/export", None)
         assert not allowed("/import", None)
+        # An empty token is unconfigured, not a credential — its "Bearer "
+        # header carries no secret.
+        assert not allowed("/export", "")
         assert allowed("/export", "sekrit")
         assert allowed("/import", "sekrit")
         # Store-scoped routes are unaffected by the gate.
         assert allowed("/recall", None)
+        assert allowed("/recall", "")
+
+    def test_empty_token_server_refuses_archive_routes(self, store, tmp_path):
+        httpd = make_server(host="127.0.0.1", port=0, store=store,
+                            auth_token="")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        host, port = httpd.server_address
+        try:
+            status, body = _req(
+                f"http://{host}:{port}", "POST", "/export",
+                {"path": str(tmp_path / "empty-token.ahkai")},
+                headers={"Authorization": "Bearer "})
+            assert status == 403
+            assert "server-side paths" in body["error"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
 
     def test_tokenless_server_refuses_archive_routes(self, server, tmp_path):
         for path in ("/export", "/import"):

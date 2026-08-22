@@ -39,8 +39,13 @@ func TestHistoryAndGetAtResolvePrefixOfForgottenMemory(t *testing.T) {
 func TestUndoLastResolvesPrefixOfForgottenMemory(t *testing.T) {
 	store := newCmdTestStore(t)
 	ctx := context.Background()
-	m, _, _, _ := store.Remember(ctx, "undo me by prefix", memory.RememberOpts{})
-	store.Forget(ctx, m.ID)
+	m, _, _, err := store.Remember(ctx, "undo me by prefix", memory.RememberOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Forget(ctx, m.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := runCmd(t, store, newJournalUndoLastCmd(), "--id", m.ID[:8], "-y"); err != nil {
 		t.Fatalf("undo-last --id prefix after forget: %v", err)

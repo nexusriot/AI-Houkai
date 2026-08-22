@@ -793,9 +793,10 @@ def _archive_route_allowed(path: str, auth_token: str | None) -> bool:
     Content-Type, so even a loopback bind is reachable by a drive-by
     cross-origin POST from a browser, and localhost proxies forward remote
     callers with a loopback peer address. Local tokenless workflows use the
-    CLI, which talks to the store directly.
+    CLI, which talks to the store directly. An EMPTY token counts as
+    unconfigured — its "Bearer " header carries no secret.
     """
-    return path not in ("/export", "/import") or auth_token is not None
+    return path not in ("/export", "/import") or bool(auth_token)
 
 
 def _export(store: MemoryStore, m, q, b):
@@ -989,6 +990,10 @@ def build_handler(
     auth_token: str | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Return a request-handler class bound to *store* and an optional token."""
+    # An empty token is a misconfiguration, not a credential: it would make
+    # every route "protected" by a forgeable bare "Bearer " header (and count
+    # as configured for the archive gate). Normalize it to no-auth.
+    auth_token = auth_token or None
 
     # ThreadingHTTPServer dispatches each request on its own thread, but
     # MemoryStore mutations (link/unlink/supersede and the access-count bump in

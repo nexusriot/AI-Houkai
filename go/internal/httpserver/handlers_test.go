@@ -411,12 +411,14 @@ func TestImportConflictIs409(t *testing.T) {
 	if resp.StatusCode != 409 {
 		t.Fatalf("conflicting import = %d, want 409", resp.StatusCode)
 	}
+	resp.Body.Close()
 	_ = m
 
 	resp = postJSONAuthed(t, ts.URL, "/import", `{"path":"/nonexistent/x.ahkai"}`, "s3cret")
 	if resp.StatusCode != 404 {
 		t.Fatalf("missing archive = %d, want 404", resp.StatusCode)
 	}
+	resp.Body.Close()
 }
 
 func TestRememberExplicitZeroImportance(t *testing.T) {
