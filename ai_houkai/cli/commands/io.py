@@ -19,6 +19,33 @@ from ai_houkai.cli import output as out
 from ai_houkai.memory_system.store import ImportConflictError
 
 
+def rebuild_vectors_cmd(
+    ctx: typer.Context,
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip the confirmation"),
+) -> None:
+    """Rebuild the collection's vector index by re-embedding every memory.
+
+    Repairs a collection whose vectors were lost while its text survived —
+    Chroma keeps the two in separate segments, so losing the vector files
+    leaves memories that still list and count but match nothing. Also the way
+    to re-embed after changing embedding models. Ids, text, tags, links,
+    importance and timestamps are preserved; only the embeddings change.
+    """
+    store = ctx.obj["store"]
+    count = store.count()
+    if not yes:
+        typer.confirm(
+            f"Re-embed {count} memories in {store.collection_name!r}? "
+            f"The collection is replaced (its memories are archived first)",
+            abort=True,
+        )
+    summary = store.rebuild_vectors()
+    typer.echo(
+        f"Rebuilt the vector index of {store.collection_name!r}: "
+        f"{summary.count} memories re-embedded in {summary.elapsed:.2f}s"
+    )
+
+
 def export_cmd(
     ctx: typer.Context,
     path: str = typer.Argument(..., help="Output .ahkai file"),

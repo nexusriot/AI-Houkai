@@ -285,6 +285,80 @@ def test_vectorless_import_same_model_reports_regenerated(
         target.client.close()
 
 
+class _BrokenVectorSegment:
+    """Wraps a Chroma collection so any get() asking for embeddings raises the
+    way a missing/corrupt HNSW segment does in production."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def get(self, *args, **kwargs):
+        if "embeddings" in (kwargs.get("include") or []):
+            raise RuntimeError(
+                "Error executing plan: Internal error: Error creating hnsw "
+                "segment reader: Nothing found on disk")
+        return self._inner.get(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_export_degrades_to_vectorless_on_broken_vector_segment(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    """Chroma's HNSW files can go missing on disk, making every embeddings
+    read raise. Export must fall back to an honest include_vectors=False
+    archive (which import_ re-embeds) instead of failing the whole backup."""
+    store.remember(text="survives a broken vector segment")
+    orig = store.collection
+    store.collection = _BrokenVectorSegment(orig)
+    out = tmp_path / "broken.ahkai"
+    try:
+        with pytest.warns(UserWarning, match="exporting without vectors"):
+            summary = store.export(out, include_superseded=True)
+    finally:
+        store.collection = orig
+    assert summary.count == 1
+    assert summary.vectors_included is False
+
+    with gzip.open(out, "rt") as f:
+        header = json.loads(f.readline())
+        row = json.loads(f.readline())
+    assert header["options"]["include_vectors"] is False
+    assert header["source"]["embedding_dim"] == 0
+    assert "vector" not in row
+
+    target = _new_store(tmp_path, "brk")
+    try:
+        res = target.import_(out)               # no regenerate_vectors needed
+        assert res.imported == 1
+        assert res.vectors_regenerated is True
+        hits = target.recall("broken vector segment", k=1)
+        assert hits and hits[0][0].text == "survives a broken vector segment"
+    finally:
+        target.client.close()
+
+
+def test_export_vectorless_request_still_raises_on_get_failure(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    """The fallback only covers the embeddings read: a store whose metadata
+    segment is broken too must surface the error, not write an empty file."""
+    store.remember(text="anything")
+    orig = store.collection
+
+    class _AllBroken(_BrokenVectorSegment):
+        def get(self, *args, **kwargs):
+            raise RuntimeError("Nothing found on disk")
+
+    store.collection = _AllBroken(orig)
+    try:
+        with pytest.raises(RuntimeError):
+            store.export(tmp_path / "nope.ahkai", include_vectors=False)
+    finally:
+        store.collection = orig
+
+
 def test_rename_repoints_links_between_imported_rows(
         store: MemoryStore, tmp_path: Path) -> None:
     """on_conflict="rename" gives a colliding row a fresh id — but the rest

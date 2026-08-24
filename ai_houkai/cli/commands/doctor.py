@@ -52,22 +52,33 @@ def doctor(
         error=probe.get("error"),
     )
 
-    # 4. Embed-dim guardrail: the probe's dimension must match the vectors
-    #    already stored, or cosine similarity is silently meaningless.
-    if probe.get("ok") and count:
-        stored_dim: int | None = None
+    # 4. Vector index readable, and its dimension matching the probe's — a
+    #    mismatch makes cosine similarity silently meaningless, and an index
+    #    that cannot be read at all makes every query answer with nothing
+    #    while the collection still counts and lists its memories. Reading one
+    #    row's embedding settles both. This used to swallow the read error and
+    #    skip the check, so a collection that could not answer a single query
+    #    was diagnosed "OK — ready".
+    stored_dim: int | None = None
+    if count:
+        hint = "run `houkai rebuild-vectors` to rebuild it from the stored text"
         try:
             res = store.collection.get(limit=1, include=["embeddings"])
             embs = res.get("embeddings")
-            if embs is not None and len(embs):
+            if embs is None or len(embs) == 0:
+                add("vector_index", False, memories=count,
+                    error=f"the collection holds text but no vectors — {hint}")
+            else:
                 stored_dim = len(embs[0])
-        except Exception:  # noqa: BLE001
-            stored_dim = None
-        if stored_dim is not None:
-            add(
-                "embed_dim", stored_dim == probe.get("dim"),
-                probe_dim=probe.get("dim"), stored_dim=stored_dim,
-            )
+                add("vector_index", True, memories=count)
+        except Exception as exc:  # noqa: BLE001 — report, don't crash the diagnosis
+            add("vector_index", False, memories=count,
+                error=f"{type(exc).__name__}: {exc} — {hint}")
+    if stored_dim is not None and probe.get("ok"):
+        add(
+            "embed_dim", stored_dim == probe.get("dim"),
+            probe_dim=probe.get("dim"), stored_dim=stored_dim,
+        )
 
     # 5. Audit journal readable + freshness.
     jp = store.journal.path

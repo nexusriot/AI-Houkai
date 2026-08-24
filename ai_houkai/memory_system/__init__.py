@@ -23,8 +23,10 @@ from .store import (
     PackedMemory,
     PackResult,
     RECALL_MODES,
+    RebuildSummary,
     RememberItem,
     Reranker,
+    VectorIndexError,
     extract_key_phrases,
 )
 from .async_store import AsyncMemoryStore
@@ -63,9 +65,11 @@ __all__ = [
     "PackResult",
     "PackedMemory",
     "RECALL_MODES",
+    "RebuildSummary",
     "ReflectionEngine",
     "RememberItem",
     "Reranker",
+    "VectorIndexError",
     "build_summarizer",
     "extract_key_phrases",
     "score_importance",

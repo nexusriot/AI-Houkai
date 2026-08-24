@@ -44,6 +44,7 @@ from .store import (
     MemoryStore,
     MemoryType,
     PackResult,
+    RebuildSummary,
     RememberItem,
     Reranker,
     TrustLevel,
@@ -507,6 +508,21 @@ class AsyncMemoryStore:
             types=types,
             tags=tags,
             since=since,
+        )
+
+    async def vector_index_ok(self) -> bool:
+        return await self.run(self.sync.vector_index_ok)
+
+    async def rebuild_vectors(
+        self,
+        *,
+        batch_size: int = 128,
+        backup_path: str | None = None,
+    ) -> RebuildSummary:
+        return await self.run(
+            self.sync.rebuild_vectors,
+            batch_size=batch_size,
+            backup_path=backup_path,
         )
 
     async def import_(

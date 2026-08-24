@@ -29,7 +29,8 @@ from ai_houkai.cli.commands.curation import (
 )
 from ai_houkai.cli.commands.decay import prune, purge
 from ai_houkai.cli.commands.reflect import reflect
-from ai_houkai.cli.commands.io import export_cmd, import_cmd, info_cmd, backup
+from ai_houkai.cli.commands.io import (backup, export_cmd, import_cmd, info_cmd,
+                                       rebuild_vectors_cmd)
 from ai_houkai.cli.commands.stats import stats
 from ai_houkai.cli.commands.doctor import doctor
 from ai_houkai.cli.commands.eval_cmd import eval_cmd
@@ -127,6 +128,7 @@ def _register() -> None:
     app.command("reflect")(reflect)
     app.command("export")(export_cmd)
     app.command("import")(import_cmd)
+    app.command("rebuild-vectors")(rebuild_vectors_cmd)
     app.command("info")(info_cmd)
     app.command("backup")(backup)
     app.command("stats")(stats)

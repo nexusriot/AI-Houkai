@@ -24,7 +24,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Literal
@@ -336,12 +336,39 @@ class ImportConflictError(Exception):
         self.collisions = collisions
 
 
+class VectorIndexError(RuntimeError):
+    """The collection's vector index is missing or out of sync with its text.
+
+    Chroma stores documents and metadata in a sqlite segment and the vectors
+    in a separate HNSW segment of files on disk. Losing only the vector
+    segment — deleted files, an interrupted flush, a data directory copied
+    while running — leaves a collection whose text is entirely intact but
+    whose every vector read either fails or, worse, quietly answers with
+    nothing. This error marks that recoverable state, distinguishing it from
+    a genuine backend outage; :meth:`MemoryStore.rebuild_vectors` repairs it
+    by re-embedding the surviving text.
+    """
+
+
 @dataclass
 class ExportSummary:
     path:    Path
     count:   int
     bytes:   int
     elapsed: float
+    # False when the archive carries no vectors — either by request or because
+    # the vector segment was unreadable and export degraded to text+metadata.
+    vectors_included: bool = True
+
+
+@dataclass
+class RebuildSummary:
+    count:    int
+    elapsed:  float
+    # Where the rows were archived before the rebuild. Deleted once the
+    # rebuild succeeds, so this path is only still on disk when the rebuild
+    # failed part-way — in which case rebuild_vectors raises and names it.
+    backup:   Path | None = None
 
 
 @dataclass
@@ -1416,6 +1443,22 @@ class MemoryStore(CurationMixin):
                 include=include,
             )
 
+            # A nearest-neighbour query over a non-empty collection has
+            # neighbours to return, so zero rows means either a where-clause
+            # excluded everything or the vector index no longer covers the
+            # stored text. Chroma does not raise on the latter — it answers
+            # from an empty index — so without this check a collection whose
+            # vector segment was lost reports "nothing matches" for every
+            # query, which reads as data loss rather than as the repairable
+            # index problem it is.
+            if not (res.get("ids") or [[]])[0] and self._vector_index_lost():
+                raise VectorIndexError(
+                    f"collection {self.collection_name!r} holds {count} "
+                    f"memories but its vector index returned no candidates; "
+                    f"the index is missing or out of sync — call "
+                    f"rebuild_vectors() to rebuild it from the stored text"
+                )
+
             # Full-corpus lexical recall — see _lexical_candidates.
             if lexical_index == "corpus" and mode == "hybrid":
                 res = self._union_lexical(res, query, n_fetch, where, include)
@@ -2180,7 +2223,8 @@ class MemoryStore(CurationMixin):
             return self._check_conflicts(mem, thr)
 
         # Global pairwise scan
-        res = self.collection.get(include=["embeddings", "documents", "metadatas"])
+        res = self._get_with_vectors(
+            include=["embeddings", "documents", "metadatas"])
         ids   = res.get("ids") or []
         docs  = res.get("documents") or []
         metas = res.get("metadatas") or []
@@ -2501,9 +2545,30 @@ class MemoryStore(CurationMixin):
         include = ["documents", "metadatas"]
         if include_vectors:
             include = ["documents", "metadatas", "embeddings"]
-        res = self.collection.get(include=include) if total else {
-            "ids": [], "documents": [], "metadatas": [], "embeddings": None,
-        }
+        if not total:
+            res = {"ids": [], "documents": [], "metadatas": [], "embeddings": None}
+        else:
+            try:
+                res = self.collection.get(include=include)
+            except Exception as exc:  # noqa: BLE001 — degrade, don't lose the backup
+                # Asking for embeddings makes Chroma open its HNSW vector
+                # segment, which fails outright when the segment files are
+                # corrupt or missing on disk ("Error creating hnsw segment
+                # reader: Nothing found on disk"). Documents and metadata live
+                # in the separate sqlite segment and are the source of truth —
+                # vectors are derived — so retry without vectors and write an
+                # honest include_vectors=False archive that import_ re-embeds.
+                if not include_vectors:
+                    raise
+                warnings.warn(
+                    f"export(): could not read vectors from collection "
+                    f"{self.collection_name!r} ({exc}); exporting without "
+                    f"vectors — import will re-embed",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                include_vectors = False
+                res = self.collection.get(include=["documents", "metadatas"])
 
         ids   = res.get("ids") or []
         docs  = res.get("documents") or []
@@ -2566,8 +2631,79 @@ class MemoryStore(CurationMixin):
         })
         return ExportSummary(
             path=out_path, count=len(kept), bytes=size,
-            elapsed=time.time() - t0,
+            elapsed=time.time() - t0, vectors_included=include_vectors,
         )
+
+    def rebuild_vectors(
+        self,
+        *,
+        batch_size: int = 128,
+        backup_path: str | Path | None = None,
+    ) -> "RebuildSummary":
+        """Re-embed every memory, rebuilding the collection's vector index.
+
+        This repairs a :class:`VectorIndexError`. Documents and metadata come
+        from Chroma's sqlite segment, which survives the loss of the vector
+        segment, so ids, text, tags, links, importance, timestamps and
+        supersession are all carried over unchanged — only the embeddings are
+        regenerated, with whatever embedder this store is configured with. A
+        rebuild is therefore also how you re-embed a collection after changing
+        embedding models.
+
+        Rebuilding replaces the Chroma collection, so the surviving rows are
+        first written to a vectorless ``.ahkai`` archive (defaulting to beside
+        the store) and that archive is deleted only once the rebuild
+        succeeds. If the rebuild fails part-way the archive is kept and named
+        on the returned summary, so the text is never left with nowhere to be
+        recovered from.
+        """
+        t0 = time.time()
+        rows = self.collection.get(include=["documents", "metadatas"])
+        ids   = list(rows.get("ids") or [])
+        docs  = list(rows.get("documents") or [])
+        metas = list(rows.get("metadatas") or [])
+
+        bpath = Path(backup_path) if backup_path is not None else (
+            Path(self.path).parent / f"{self.collection_name}.rebuild.ahkai")
+        # include_vectors=False both keeps the archive readable when the
+        # vectors are exactly what is unreadable, and makes import_ re-embed
+        # if this archive is ever the thing a recovery has to fall back on.
+        self.export(bpath, include_vectors=False, include_superseded=True)
+
+        name = self.collection_name
+        try:
+            self.client.delete_collection(name)
+            self.collection = self.client.get_or_create_collection(
+                name=name,
+                embedding_function=as_chroma_embedding_function(self._embed_fn),
+                metadata={"hnsw:space": "cosine"},
+            )
+            step = max(batch_size, 1)
+            for start in range(0, len(ids), step):
+                self.collection.add(
+                    ids=ids[start:start + step],
+                    documents=docs[start:start + step],
+                    metadatas=metas[start:start + step],
+                )
+        except Exception as exc:
+            # The archive is now the only copy of anything the rebuild dropped.
+            raise VectorIndexError(
+                f"rebuilding the vector index of {name!r} failed part-way; "
+                f"the memories were archived first and that archive was kept "
+                f"at {bpath} — restore it with "
+                f"import_({str(bpath)!r}, on_conflict='overwrite')"
+            ) from exc
+
+        with suppress(OSError):
+            bpath.unlink()
+        # Content is unchanged, so this is journaled as its own op rather than
+        # as a wipe-and-rewrite: `nuke` would make state_at() clear its
+        # reconstructed state, and per-row entries would fabricate a history
+        # of writes that never happened. Replay ignores an op it does not
+        # know, which is exactly right for one that preserves every row.
+        self._journal("rebuild_vectors", "", meta={"count": len(ids)})
+        return RebuildSummary(count=len(ids), elapsed=time.time() - t0,
+                              backup=bpath)
 
     def import_(
         self,
@@ -3014,13 +3150,64 @@ class MemoryStore(CurationMixin):
         return {ids[i]: list(embs[i]) for i in range(len(ids))
                 if i < len(embs) and embs[i] is not None}
 
+    def vector_index_ok(self) -> bool:
+        """True when this collection's vector index can still answer queries.
+
+        A collection that lost its vector segment counts and lists its
+        memories exactly as before, so asking is the only cheap way to learn
+        that :meth:`recall` would raise :class:`VectorIndexError` before
+        putting a query to it — which is what makes a sweep over many
+        collections possible without re-embedding the healthy ones. An empty
+        collection is healthy: there is nothing to index.
+        """
+        return not self._vector_index_lost()
+
+    def _vector_index_lost(self) -> bool:
+        """True when the collection holds text but has no readable vectors —
+        the signature of a vector segment that went missing.
+
+        Only consulted after a query came back empty, so it costs nothing on
+        the path that found results. Asking for one row's embedding is
+        deliberately not a second nearest-neighbour query: it needs no
+        embedding of the query text, and it distinguishes a where-clause that
+        legitimately matched nothing (the row comes back) from an index that
+        can no longer match anything (the read fails, or answers with no
+        vector at all).
+        """
+        if self.collection.count() == 0:
+            return False
+        try:
+            probe = self.collection.get(limit=1, include=["embeddings"])
+        except Exception:  # noqa: BLE001 — an unreadable vector segment is the answer
+            return True
+        embeddings = probe.get("embeddings")
+        return embeddings is None or len(embeddings) == 0
+
+    def _get_with_vectors(self, *, include: list[str], **kwargs: Any) -> dict[str, Any]:
+        """``collection.get`` for a read that needs embeddings.
+
+        Only the vector segment can be missing while the text is fine, so a
+        failure here says something specific — the index needs rebuilding, not
+        that the store is down. Raise that rather than letting Chroma's
+        internal error reach the caller unlabelled.
+        """
+        try:
+            return self.collection.get(include=include, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — any backend failure here is the index
+            raise VectorIndexError(
+                f"could not read vectors from collection "
+                f"{self.collection_name!r} ({exc}); the vector index is "
+                f"missing or out of sync — call rebuild_vectors() to rebuild "
+                f"it from the stored text"
+            ) from exc
+
     def _emb_for_ids(self, ids: list[str]) -> dict[str, list[float]]:
         """Fetch stored embeddings for specific ids — used to run MMR / dedup
         over graph-expanded nodes that were not part of the query result and so
         carry no embedding from it."""
         if not ids:
             return {}
-        res = self.collection.get(ids=ids, include=["embeddings"])
+        res = self._get_with_vectors(ids=ids, include=["embeddings"])
         got = res.get("ids") or []
         embs = res.get("embeddings")
         if embs is None:
