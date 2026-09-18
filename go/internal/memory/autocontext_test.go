@@ -9,7 +9,10 @@ import (
 func TestExtractKeyPhrases(t *testing.T) {
 	// Stop words ("the", "is", "a", "of") and short tokens (<=2 chars) drop out;
 	// bigrams come before unigrams; result is capped at maxPhrases.
-	got := ExtractKeyPhrases("the deployment pipeline is a source of failures", 3)
+	got, err := ExtractKeyPhrases("the deployment pipeline is a source of failures", 3)
+	if err != nil {
+		t.Fatalf("ExtractKeyPhrases: %v", err)
+	}
 	if len(got) != 3 {
 		t.Fatalf("want 3 phrases, got %d: %v", len(got), got)
 	}
@@ -111,5 +114,91 @@ func TestAutoContextPackRejectsAnInvalidTrustLevel(t *testing.T) {
 	if _, err := store.AutoContextPack(context.Background(), "anything",
 		AutoContextOpts{MinTrust: TrustLevel("somewhat")}); err == nil {
 		t.Error("an unrecognised trust level must error, not be ignored")
+	}
+}
+
+func mustFanout(t *testing.T, task string, maxPhrases int) []string {
+	t.Helper()
+	got, err := FanoutQueries(task, maxPhrases)
+	if err != nil {
+		t.Fatalf("FanoutQueries(%q, %d): %v", task, maxPhrases, err)
+	}
+	return got
+}
+
+// FanoutQueries is what AutoContextPack actually searches. The plain
+// append(task, ExtractKeyPhrases(task)...) it replaced searched a task that
+// equals its own top phrase twice — every one-word task does — burning an
+// embed and a recall per call and reporting the query twice to the surfaces.
+
+func TestFanoutQueriesKeepsTheTaskFirst(t *testing.T) {
+	got := mustFanout(t, "deploy the API to production", 3)
+	if len(got) == 0 || got[0] != "deploy the API to production" {
+		t.Fatalf("FanoutQueries = %v, want the task first", got)
+	}
+}
+
+func TestFanoutQueriesDoesNotSearchAOneWordTaskTwice(t *testing.T) {
+	got := mustFanout(t, "deploy", 3)
+	if len(got) != 1 || got[0] != "deploy" {
+		t.Errorf("FanoutQueries(\"deploy\") = %v, want [deploy]", got)
+	}
+}
+
+func TestFanoutQueriesDropsAPhraseEqualToTheTask(t *testing.T) {
+	got := mustFanout(t, "android client", 3)
+	want := []string{"android client", "android", "client"}
+	if len(got) != len(want) {
+		t.Fatalf("FanoutQueries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("FanoutQueries = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFanoutQueriesIgnoresCaseAndSpacingWhenDeduping(t *testing.T) {
+	got := mustFanout(t, "Android   Client", 3)
+	if got[0] != "Android   Client" {
+		t.Errorf("got[0] = %q, want the caller's own spelling", got[0])
+	}
+	seen := map[string]int{}
+	for _, q := range got {
+		seen[strings.ToLower(strings.Join(strings.Fields(q), " "))]++
+	}
+	if seen["android client"] != 1 {
+		t.Errorf("FanoutQueries = %v, want \"android client\" exactly once", got)
+	}
+}
+
+func TestFanoutQueriesKeepsABlankTaskSoTheFanOutIsNeverEmpty(t *testing.T) {
+	if got := mustFanout(t, "", 3); len(got) != 1 || got[0] != "" {
+		t.Errorf("FanoutQueries(\"\") = %v, want [\"\"]", got)
+	}
+}
+
+func TestFanoutQueriesKeepsAnAllStopWordTask(t *testing.T) {
+	if got := mustFanout(t, "the is a to", 3); len(got) != 1 {
+		t.Errorf("FanoutQueries = %v, want the task alone", got)
+	}
+}
+
+// A negative cap used to mean "no cap" here and "drop the last |n| phrases" in
+// Python — a public function answering the same input two different ways.
+func TestNegativeMaxPhrasesIsRejectedNotReinterpreted(t *testing.T) {
+	if _, err := ExtractKeyPhrases("deploy the service", -1); err == nil {
+		t.Error("ExtractKeyPhrases(-1) must error, not silently mean something")
+	}
+	if _, err := FanoutQueries("deploy the service", -1); err == nil {
+		t.Error("FanoutQueries(-1) must error")
+	}
+}
+
+func TestAutoContextPackRejectsANegativeMaxPhrases(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.AutoContextPack(context.Background(), "deploy the service",
+		AutoContextOpts{MaxPhrases: -1}); err == nil {
+		t.Error("a negative max_phrases must surface, not be clamped away")
 	}
 }

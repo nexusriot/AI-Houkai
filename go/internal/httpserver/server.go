@@ -857,7 +857,13 @@ func (s *Server) autoContext(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	out := packResponse(res)
-	out["queries"] = append([]string{task}, memory.ExtractKeyPhrases(task, maxPhrases)...)
+	// The list the packer really searched — not a second derivation of it.
+	// AutoContextPack already accepted maxPhrases, so this cannot fail.
+	queries, err := memory.FanoutQueries(task, maxPhrases)
+	if err != nil {
+		return 0, nil, err
+	}
+	out["queries"] = queries
 	return 200, out, nil
 }
 

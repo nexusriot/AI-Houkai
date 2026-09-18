@@ -259,7 +259,11 @@ func TestEstimateTokensBankersRounding(t *testing.T) {
 }
 
 func TestExtractKeyPhrasesZeroHonored(t *testing.T) {
-	if got := ExtractKeyPhrases("the deployment pipeline failed", 0); len(got) != 0 {
+	got, err := ExtractKeyPhrases("the deployment pipeline failed", 0)
+	if err != nil {
+		t.Fatalf("ExtractKeyPhrases: %v", err)
+	}
+	if len(got) != 0 {
 		t.Errorf("max_phrases=0 should yield no phrases, got %v", got)
 	}
 }

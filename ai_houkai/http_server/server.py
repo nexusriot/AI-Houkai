@@ -74,7 +74,7 @@ from ai_houkai.memory_system.curation import MergeError
 from ai_houkai.memory_system.store import (
     ConflictError,
     ImportConflictError,
-    extract_key_phrases,
+    fanout_queries,
 )
 from ai_houkai.timeparse import parse_timestamp
 
@@ -661,8 +661,8 @@ def _auto_context(store: MemoryStore, m, q, b):
         min_trust=b.get("min_trust") or None,
     )
     payload = _pack_payload(res)
-    payload["queries"] = [task] + extract_key_phrases(
-        task, _body_int(b, "max_phrases", 3))
+    # The list the packer really searched — not a second derivation of it.
+    payload["queries"] = fanout_queries(task, _body_int(b, "max_phrases", 3))
     return 200, payload
 
 

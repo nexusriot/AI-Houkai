@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"sort"
+	"strings"
 )
 
 // stopWords mirrors Python's _STOP_WORDS: common function words filtered out of
@@ -27,7 +28,16 @@ var stopWords = map[string]bool{
 // NLP library: it filters stop words and short tokens, then prefers bigrams
 // (more specific) over single words. Used by AutoContextPack to fan out recall
 // over several query angles derived from one task description.
-func ExtractKeyPhrases(task string, maxPhrases int) []string {
+//
+// maxPhrases must be >= 0 (0 = the task alone); a negative returns an error.
+// It used to mean "no cap" here while Python fed the same value to a list slice
+// and silently dropped the LAST |n| phrases — a different answer per task
+// length, and the opposite of this one. Two ports disagreeing on a public
+// function is worse than either answer, so both now reject it.
+func ExtractKeyPhrases(task string, maxPhrases int) ([]string, error) {
+	if maxPhrases < 0 {
+		return nil, validationErrorf("max_phrases must be >= 0 — got %d", maxPhrases)
+	}
 	var words []string
 	for _, w := range tokenize(task) {
 		if !stopWords[w] && len([]rune(w)) > 2 {
@@ -48,10 +58,46 @@ func ExtractKeyPhrases(task string, maxPhrases int) []string {
 			unique = append(unique, p)
 		}
 	}
-	if maxPhrases >= 0 && len(unique) > maxPhrases {
+	if len(unique) > maxPhrases {
 		unique = unique[:maxPhrases]
 	}
-	return unique
+	return unique, nil
+}
+
+// FanoutQueries returns the queries AutoContextPack actually fans out over:
+// the task itself, then its key phrases, with duplicates dropped.
+//
+// A short task is frequently identical to its own top phrase — a one-word task
+// always is, and "android client" tokenizes to exactly that bigram — so the
+// plain append(task, ExtractKeyPhrases(task)...) searched the same query twice:
+// a wasted embed and recall per call, and a fan-out report that listed it twice.
+//
+// Matching is case-insensitive over collapsed whitespace, but the spelling that
+// survives is the first one seen, so the caller's own wording leads. The task is
+// always kept, even when blank, so an empty task still recalls exactly once
+// rather than not at all.
+//
+// Exported so the remote surfaces report the list the packer really searched
+// instead of each re-deriving it and drifting.
+func FanoutQueries(task string, maxPhrases int) ([]string, error) {
+	phrases, err := ExtractKeyPhrases(task, maxPhrases)
+	if err != nil {
+		return nil, err
+	}
+	key := func(q string) string {
+		return strings.ToLower(strings.Join(strings.Fields(q), " "))
+	}
+	out := []string{task}
+	seen := map[string]bool{key(task): true}
+	for _, phrase := range phrases {
+		k := key(phrase)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, phrase)
+	}
+	return out, nil
 }
 
 // AutoContextOpts holds optional AutoContextPack parameters.
@@ -88,10 +134,8 @@ func (s *MemoryStore) AutoContextPack(ctx context.Context, task string, opts Aut
 	}
 	// MaxPhrases is honored as-is (including an explicit 0 = task-only, matching
 	// Python). Callers/handlers apply the default of 3 for an *absent* value; a
-	// negative value is treated as "no cap" by ExtractKeyPhrases below, so clamp.
-	if opts.MaxPhrases < 0 {
-		opts.MaxPhrases = 0
-	}
+	// negative one is rejected by FanoutQueries below rather than quietly
+	// meaning something, so there is nothing to clamp here.
 	if opts.Mode == "" {
 		opts.Mode = ModeHybrid
 	}
@@ -104,7 +148,10 @@ func (s *MemoryStore) AutoContextPack(ctx context.Context, task string, opts Aut
 		header = *opts.Header
 	}
 
-	queries := append([]string{task}, ExtractKeyPhrases(task, opts.MaxPhrases)...)
+	queries, err := FanoutQueries(task, opts.MaxPhrases)
+	if err != nil {
+		return PackResult{}, err
+	}
 
 	best := map[string]MemoryWithScore{}
 	var order []string // first-seen order, for deterministic stable sorting

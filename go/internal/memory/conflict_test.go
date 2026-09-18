@@ -215,3 +215,112 @@ func TestRememberConflictSupersedeLinksNewToOld(t *testing.T) {
 		t.Errorf("old memory should carry no links, got %v", gotOld.Links)
 	}
 }
+
+func readJournal(t *testing.T, store *MemoryStore) []JournalEntry {
+	t.Helper()
+	entries, err := store.Journal().Read(ReadOpts{})
+	if err != nil {
+		t.Fatalf("journal read: %v", err)
+	}
+	return entries
+}
+
+// PolicyRaise must decide before anything is written. It used to Add the row,
+// journal a "remember", notice the clash, Forget it (journaling that too) and
+// only then return the error: the caller was told the write did not happen
+// while the audit journal said it happened and was deleted — and Undo of that
+// phantom forget re-created exactly the memory the store had just refused.
+
+func TestRaiseLeavesNoJournalEntries(t *testing.T) {
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "the api key rotates monthly",
+		RememberOpts{Type: Semantic}); err != nil {
+		t.Fatalf("seed Remember: %v", err)
+	}
+	before := len(readJournal(t, store))
+
+	_, _, _, err := store.Remember(ctx, "the api key rotates monthly",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise})
+	var ce *ConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("want ConflictError, got %v", err)
+	}
+	if after := len(readJournal(t, store)); after != before {
+		t.Errorf("a refused write journaled %d entr(ies); want none", after-before)
+	}
+}
+
+func TestRaiseIsNotUndoableIntoExistence(t *testing.T) {
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "the api key rotates monthly",
+		RememberOpts{Type: Semantic}); err != nil {
+		t.Fatalf("seed Remember: %v", err)
+	}
+	if _, _, _, err := store.Remember(ctx, "the api key rotates weekly",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise}); err == nil {
+		t.Fatal("want a conflict")
+	}
+	for _, e := range readJournal(t, store) {
+		_, _ = store.Undo(ctx, e)
+	}
+	mems, err := store.ListRecent(ctx, 50, false, false)
+	if err != nil {
+		t.Fatalf("ListRecent: %v", err)
+	}
+	for _, m := range mems {
+		if m.Text == "the api key rotates weekly" {
+			t.Fatal("undo resurrected a memory the store refused to write")
+		}
+	}
+}
+
+func TestRaiseDoesNotCountAsAWrite(t *testing.T) {
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "the api key rotates monthly",
+		RememberOpts{Type: Semantic}); err != nil {
+		t.Fatalf("seed Remember: %v", err)
+	}
+	if _, _, _, err := store.Remember(ctx, "the api key rotates weekly",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise}); err == nil {
+		t.Fatal("want a conflict")
+	}
+	m, err := store.Metrics(ctx)
+	if err != nil {
+		t.Fatalf("Metrics: %v", err)
+	}
+	calls := m["calls"].(map[string]int)
+	if calls["remember"] != 1 || calls["forget"] != 0 {
+		t.Errorf("calls = %v; a refused write must count as neither remember nor forget", calls)
+	}
+}
+
+func TestRaiseAgainstTheOnlyOtherMemoryIsStillCaught(t *testing.T) {
+	// The pre-write scan sees one fewer row than the post-write one did, so a
+	// store holding exactly one other memory must not be waved through.
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+	if _, _, _, err := store.Remember(ctx, "the only memory in here",
+		RememberOpts{Type: Semantic}); err != nil {
+		t.Fatalf("seed Remember: %v", err)
+	}
+	if _, _, _, err := store.Remember(ctx, "another memory in here",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise}); err == nil {
+		t.Fatal("a clash against the single existing memory must be caught")
+	}
+}
+
+func TestRaiseIntoAnEmptyStoreIsNeverAConflict(t *testing.T) {
+	store := newConflictStore(t, PolicyIgnore, 0.1)
+	ctx := context.Background()
+	_, stored, _, err := store.Remember(ctx, "first ever memory",
+		RememberOpts{Type: Semantic, OnConflict: PolicyRaise})
+	if err != nil || !stored {
+		t.Fatalf("first write into an empty store: stored=%v err=%v", stored, err)
+	}
+	if c, _ := store.Count(ctx); c != 1 {
+		t.Errorf("count = %d, want 1", c)
+	}
+}

@@ -341,10 +341,31 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 		return Memory{}, false, nil, err
 	}
 
-	// Add FIRST, then detect conflicts (matching Python): PolicySupersede can
-	// link the stored memories both ways, and PolicyRaise rolls the insert
-	// back so a failed Add can never leave old memories superseded_by an id
-	// that was never created.
+	// Conflict policy. A per-call OnConflict overrides the store default.
+	policy := s.cfg.ConflictPolicy
+	if opts.OnConflict != "" {
+		policy = opts.OnConflict
+	}
+
+	// PolicyRaise REJECTS the write, so it is decided BEFORE anything is
+	// stored (matching Python). Scanning after the Add and rolling back with
+	// Forget left a remember+forget pair in the journal for a memory that was
+	// never stored: a misleading audit trail, remember/forget metrics counting
+	// a write that did not happen, and — the real damage — Undo of that forget
+	// re-creating exactly the memory the store had just refused. The scan
+	// matches on the embedding, so it does not need the row to be present;
+	// detectConflicts skips the self-match either way.
+	if policy == PolicyRaise {
+		hits, err := s.backend.Query(ctx, vecs[0], 12)
+		if err != nil {
+			return Memory{}, false, nil, fmt.Errorf("conflict scan: %w", err)
+		}
+		conflicts := detectConflicts(m, hitsToMemoriesWithScore(hits), s.cfg.ConflictThreshold, s.cfg.ConflictFn)
+		if len(conflicts) > 0 {
+			return Memory{}, false, conflicts, &ConflictError{Conflicts: conflicts}
+		}
+	}
+
 	err = s.backend.Add(ctx, []vector.Item{{
 		ID:        m.ID,
 		Content:   m.Text,
@@ -357,12 +378,9 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 	s.recordCall("remember")
 	s.journalEntry("remember", m.ID, nil, m.ToDict(), nil)
 
-	// Conflict check. A per-call OnConflict overrides the store default.
-	policy := s.cfg.ConflictPolicy
-	if opts.OnConflict != "" {
-		policy = opts.OnConflict
-	}
-	if policy != PolicyIgnore {
+	// warn/supersede resolve AFTER the write: supersede has to point the older
+	// memories at an id that exists, and warn names the stored row.
+	if policy == PolicyWarn || policy == PolicySupersede {
 		hits, err := s.backend.Query(ctx, vecs[0], 12)
 		if err != nil {
 			// The memory is stored; surface the scan failure (like Python,
@@ -383,11 +401,6 @@ func (s *MemoryStore) Remember(ctx context.Context, text string, opts RememberOp
 						return m, true, nil, fmt.Errorf("supersede conflict %s: %w", c.B.ID, err)
 					}
 				}
-			case PolicyRaise:
-				// Roll back the just-added memory — the caller is told it was
-				// not stored, so it must not linger in the backend.
-				_, _ = s.Forget(ctx, m.ID)
-				return Memory{}, false, conflicts, &ConflictError{Conflicts: conflicts}
 			}
 		}
 	}

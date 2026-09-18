@@ -473,6 +473,16 @@ off-topic task injects nothing rather than weak padding) but deliberately
 omits `fusion="rrf"`, whose pool-relative scores are not comparable across the
 different fan-out pools (see §14).
 
+The query list itself comes from `fanout_queries()` (`FanoutQueries` in Go),
+which is the task followed by its phrases **with duplicates dropped**, compared
+case-insensitively over collapsed whitespace. A short task is frequently
+identical to its own top phrase — a one-word task always is, and
+`"android client"` tokenizes to exactly that bigram — so the plain
+`[task] + extract_key_phrases(task)` embedded and recalled the same query twice.
+It is exported because the HTTP and MCP surfaces report the fan-out back to the
+caller: they call the same helper rather than re-deriving the list and drifting
+from what was actually searched.
+
 ---
 
 ## 6. Decay Engine
@@ -1058,7 +1068,7 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 1232 tests across 45 files
+### 1337 tests across 47 files
 
 | File | Tests | What it covers |
 |---|---|---|
@@ -1066,10 +1076,10 @@ LLM API  ──►  assistant reply to user
 | `test_http_server.py` | 65 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain`, POST-`/recall` advanced knobs (`graph` weight + `expand` rerank gating), and `POST /memories/batch` bulk write (`remember_many`) |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
-| `test_pack.py` | 54 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine` |
+| `test_pack.py` | 70 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine`, and `fanout_queries` (no duplicate fan-out query; a negative `max_phrases` is rejected, not reinterpreted) |
 | `test_validation.py` | 46 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
 | `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
-| `test_conflicts.py` | 39 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic, and that a **lapsed** candidate never clashes with a new write |
+| `test_conflicts.py` | 46 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic, that a **lapsed** candidate never clashes with a new write, and that a refused `raise` write leaves no row, no journal entry and no metric behind |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_reflection.py` | 27 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded **and lapsed** sources, polarity-cluster separation |
@@ -1252,7 +1262,18 @@ under `"supersede"` would re-label a row that is already on its way out.
 | `ignore` (default) | no check |
 | `warn` | `warnings.warn()` listing conflicts |
 | `supersede` | auto-supersede conflicting memories |
-| `raise` | raises `ConflictError(conflicts)` |
+| `raise` | raises `ConflictError(conflicts)` — **nothing is written** |
+
+`raise` is resolved *before* the insert; `warn` and `supersede` after it.
+That split is not cosmetic. `supersede` has to point the older memories at an id
+that already exists, so it cannot run first. `raise` must not run second: it
+used to insert, journal a `remember`, notice the clash, `forget()` the row
+(journaling that too) and only then raise — so the caller was told the write had
+not happened while the journal said it had happened and been deleted, the
+`remember`/`forget` metrics counted a write that never landed, and `undo()` of
+that phantom `forget` re-created the very memory the store had refused. The scan
+matches on text/embedding, not on the row's presence, so checking first costs
+nothing but the count floor moves by one (`_check_conflicts(..., stored=False)`).
 
 Any other value raises `ValueError` (see `CONFLICT_POLICIES`, §3) — both in
 the constructor's `conflict_policy` and per-call `on_conflict`.

@@ -67,7 +67,7 @@ from ai_houkai.memory_system.store import (
     ExpandSpec,
     HybridWeights,
     ImportConflictError,
-    extract_key_phrases,
+    fanout_queries,
 )
 from ai_houkai.memory_system.summarizers import build_summarizer
 from ai_houkai.timeparse import parse_timestamp
@@ -520,7 +520,8 @@ def auto_context(
     without choosing a query, so it is the one most likely to pull scraped
     material into a context block unattended.
     """
-    queries = [task] + extract_key_phrases(task, max_phrases)
+    # The list the packer really searched — not a second derivation of it.
+    queries = fanout_queries(task, max_phrases)
     pack = get_store().auto_context_pack(
         task=task,
         token_budget=token_budget,

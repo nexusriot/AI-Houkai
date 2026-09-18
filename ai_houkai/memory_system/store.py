@@ -647,7 +647,16 @@ def extract_key_phrases(task: str, max_phrases: int = 3) -> list[str]:
     Filters stop words, then prefers bigrams (more specific) over single words.
     Used by :meth:`MemoryStore.auto_context_pack` to fan out recall over multiple
     query angles derived from the same task description.
+
+    ``max_phrases`` must be >= 0 (0 = the task alone). A negative cap used to be
+    fed straight to a list slice, so it silently dropped the *last* ``|n|``
+    phrases — a different result for every task length, and the opposite of what
+    the Go port did with the same input (it read a negative as "no cap"). Two
+    ports disagreeing on a public function is worse than either answer, so it is
+    now rejected on both, like every other out-of-range scalar here.
     """
+    if max_phrases < 0:
+        raise ValueError(f"max_phrases must be >= 0 — got {max_phrases}")
     words = [w for w in _tokenize(task) if w not in _STOP_WORDS and len(w) > 2]
     phrases: list[str] = []
     for i in range(len(words) - 1):
@@ -660,6 +669,37 @@ def extract_key_phrases(task: str, max_phrases: int = 3) -> list[str]:
             seen.add(p)
             unique.append(p)
     return unique[:max_phrases]
+
+
+def fanout_queries(task: str, max_phrases: int = 3) -> list[str]:
+    """The queries :meth:`MemoryStore.auto_context_pack` actually fans out over.
+
+    The task itself, then its key phrases, with duplicates dropped. A short task
+    is frequently identical to its own top phrase — a one-word task always is,
+    and "android client" tokenizes to exactly that bigram — so the plain
+    ``[task] + extract_key_phrases(task)`` searched the same query twice: a
+    wasted embed and recall per call, and a fan-out report that listed it twice.
+
+    Matching is case-insensitive over collapsed whitespace, but the spelling
+    that survives is the first one seen, so the caller's own wording leads. The
+    task is always kept, even when blank, so an empty task still recalls exactly
+    once rather than not at all.
+
+    Exported so the remote surfaces report the list the packer really searched
+    instead of each re-deriving it and drifting.
+    """
+    def key(q: str) -> str:
+        return " ".join(q.split()).casefold()
+
+    out = [task]
+    seen = {key(task)}
+    for phrase in extract_key_phrases(task, max_phrases):
+        k = key(phrase)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(phrase)
+    return out
 
 
 def _jaccard_sim(a: str, b: str) -> float:
@@ -981,6 +1021,23 @@ class MemoryStore(CurationMixin):
             pinned=pinned, trust=trust,
             valid_from=valid_from, valid_until=valid_until,
         )
+        policy = on_conflict if on_conflict is not None else self._conflict_policy
+        cfn = contradiction_fn or self._contradiction_fn
+
+        # "raise" REJECTS the write, so it is decided BEFORE anything is stored.
+        # Scanning after the add and rolling back with forget() used to leave a
+        # remember+forget pair in the journal for a memory that was never
+        # stored: a misleading audit trail, remember/forget metrics counting a
+        # write that did not happen, and — the real damage — undo() of that
+        # forget re-creating exactly the memory the store had just refused.
+        # The scan matches on TEXT, so it does not need the row to be present;
+        # only the count floor shifts (see _check_conflicts' `stored`).
+        if policy == "raise":
+            conflicts = self._check_conflicts(
+                mem, self._conflict_threshold, cfn, stored=False)
+            if conflicts:
+                raise ConflictError(conflicts)
+
         self.collection.add(
             ids=[mem.id],
             documents=[mem.text],
@@ -989,9 +1046,9 @@ class MemoryStore(CurationMixin):
         self._metric_calls["remember"] += 1
         self._journal("remember", mem.id, after=mem.to_dict())
 
-        policy = on_conflict if on_conflict is not None else self._conflict_policy
-        if policy != "ignore":
-            cfn = contradiction_fn or self._contradiction_fn
+        # warn/supersede resolve AFTER the write: supersede has to point the
+        # older memories at an id that exists, and warn names the stored row.
+        if policy in ("warn", "supersede"):
             conflicts = self._check_conflicts(mem, self._conflict_threshold, cfn)
             if conflicts:
                 if policy == "warn":
@@ -1002,14 +1059,9 @@ class MemoryStore(CurationMixin):
                         UserWarning,
                         stacklevel=2,
                     )
-                elif policy == "supersede":
+                else:
                     for c in conflicts:
                         self.supersede(old_id=c.b.id, new_id=mem.id)
-                elif policy == "raise":
-                    # Roll back the just-added doc — the caller is told the
-                    # memory was not stored, so it must not linger in Chroma.
-                    self.forget(mem.id)
-                    raise ConflictError(conflicts)
 
         return mem
 
@@ -1186,7 +1238,9 @@ class MemoryStore(CurationMixin):
         reopen an end.
 
         Raises KeyError if *memory_id* does not exist, ValueError on a bad
-        type / polarity / importance.
+        type or polarity. ``importance`` is *clamped* to [0, 1] rather than
+        rejected — the same thing :meth:`remember` does with it, so a value
+        does not mean one thing on write and another on edit.
         """
         mem = self.get(memory_id)
         if mem is None:
@@ -1923,7 +1977,7 @@ class MemoryStore(CurationMixin):
         candidate pool, so they cannot be compared across the fan-out queries.
         """
         count_fn = token_counter or _estimate_tokens
-        queries = [task] + extract_key_phrases(task, max_phrases)
+        queries = fanout_queries(task, max_phrases)
 
         best: dict[str, tuple[Memory, float]] = {}
         for q in queries:
@@ -3279,9 +3333,21 @@ class MemoryStore(CurationMixin):
         mem: Memory,
         threshold: float,
         contradiction_fn: ConflictFn | None = None,
+        *,
+        stored: bool = True,
     ) -> list[Conflict]:
+        """Conflicts between *mem* and what is already in the collection.
+
+        The scan matches on ``mem.text``, not on its id, so it works whether or
+        not *mem* has been written yet. ``stored`` says which: it is True for
+        every post-write scan (the self-match is skipped below), and False for
+        the pre-write check that ``on_conflict="raise"`` runs. The floor moves
+        with it — counting *mem* itself, "only me" is 1; not counting it, an
+        empty store is 0, and a store holding exactly one other memory must
+        still be scanned rather than waved through.
+        """
         count = self.collection.count()
-        if count <= 1:
+        if count <= (1 if stored else 0):
             return []
         n_query = min(count, 12)
         res = self.collection.query(

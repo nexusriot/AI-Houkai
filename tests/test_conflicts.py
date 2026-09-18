@@ -342,3 +342,115 @@ class TestExpiredCandidatesAreNotConflicts:
                                on_conflict="raise")
         finally:
             store.client.close()
+
+
+class TestRaiseRejectsBeforeWriting:
+    """`on_conflict="raise"` must decide before anything is stored.
+
+    It used to add the row, journal a `remember`, notice the clash, `forget()`
+    it (journaling that too) and only then raise. The caller was told the write
+    did not happen while the audit journal said it happened and was deleted —
+    and `undo()` of that phantom `forget` re-created exactly the memory the
+    store had just refused.
+    """
+
+    @staticmethod
+    def _one_vector_embedder():
+        """Every text on one vector, so the clash is guaranteed and the test is
+        about the write path rather than about similarity."""
+        def emb(texts):
+            return [[1.0, 0.0] for _ in texts]
+        return emb
+
+    def _store(self, tmp_path, name):
+        return MemoryStore(path=str(tmp_path / "chroma"), collection=name,
+                           embedding_function=self._one_vector_embedder())
+
+    def test_a_rejected_write_leaves_no_journal_entries(self, tmp_path):
+        store = self._store(tmp_path, "raise_journal")
+        try:
+            store.remember("the api key rotates monthly", type="semantic")
+            before = [(e.op, e.id) for e in store.journal.read()]
+            with pytest.raises(ConflictError):
+                store.remember("the api key rotates weekly", type="semantic",
+                               on_conflict="raise")
+            assert [(e.op, e.id) for e in store.journal.read()] == before
+        finally:
+            store.client.close()
+
+    def test_a_rejected_write_is_not_undoable_into_existence(self, tmp_path):
+        """The bug's actual damage: undo could resurrect a refused memory."""
+        store = self._store(tmp_path, "raise_undo")
+        try:
+            store.remember("the api key rotates monthly", type="semantic")
+            with pytest.raises(ConflictError):
+                store.remember("the api key rotates weekly", type="semantic",
+                               on_conflict="raise")
+            for entry in store.journal.read():
+                store.undo(entry)
+            assert "weekly" not in " ".join(m.text for m in store.list_recent())
+        finally:
+            store.client.close()
+
+    def test_a_rejected_write_does_not_count_as_a_write(self, tmp_path):
+        store = self._store(tmp_path, "raise_metrics")
+        try:
+            store.remember("the api key rotates monthly", type="semantic")
+            with pytest.raises(ConflictError):
+                store.remember("the api key rotates weekly", type="semantic",
+                               on_conflict="raise")
+            calls = store.metrics()["calls"]
+            assert calls["remember"] == 1
+            assert calls["forget"] == 0
+        finally:
+            store.client.close()
+
+    def test_a_rejected_write_stores_nothing(self, tmp_path):
+        store = self._store(tmp_path, "raise_count")
+        try:
+            store.remember("the api key rotates monthly", type="semantic")
+            with pytest.raises(ConflictError):
+                store.remember("the api key rotates weekly", type="semantic",
+                               on_conflict="raise")
+            assert store.count() == 1
+        finally:
+            store.client.close()
+
+    def test_a_clash_against_the_only_other_memory_is_still_caught(self, tmp_path):
+        """The pre-write scan counts one fewer row than the post-write one did.
+
+        Checking before the add means the collection holds N-1 rows, so the
+        "nothing to clash with" floor has to drop with it — otherwise a store
+        holding exactly one other memory waves every write through.
+        """
+        store = self._store(tmp_path, "raise_floor")
+        try:
+            store.remember("the only memory in here", type="semantic")
+            with pytest.raises(ConflictError):
+                store.remember("another memory in here", type="semantic",
+                               on_conflict="raise")
+        finally:
+            store.client.close()
+
+    def test_the_first_write_into_an_empty_store_is_never_a_conflict(self, tmp_path):
+        store = self._store(tmp_path, "raise_empty")
+        try:
+            assert store.remember("first ever memory", type="semantic",
+                                  on_conflict="raise").id
+            assert store.count() == 1
+        finally:
+            store.client.close()
+
+    def test_warn_and_supersede_still_resolve_after_the_write(self, tmp_path):
+        """Both need the new row to exist: supersede points the old memories at
+        its id, and warn names it."""
+        store = self._store(tmp_path, "raise_siblings")
+        try:
+            old = store.remember("first fact", type="semantic")
+            new = store.remember("second fact", type="semantic",
+                                 on_conflict="supersede")
+            assert store.get(old.id).superseded_by == new.id
+            with pytest.warns(UserWarning, match="conflict"):
+                store.remember("third fact", type="semantic", on_conflict="warn")
+        finally:
+            store.client.close()

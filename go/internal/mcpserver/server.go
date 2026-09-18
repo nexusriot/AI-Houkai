@@ -625,7 +625,13 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 			return errResult(err), nil
 		}
 		out := packResultJSON(pack)
-		out["queries"] = append([]string{task}, memory.ExtractKeyPhrases(task, maxPhrases)...)
+		// The list the packer really searched — not a second derivation of it.
+		// AutoContextPack already accepted maxPhrases, so this cannot fail.
+		queries, err := memory.FanoutQueries(task, maxPhrases)
+		if err != nil {
+			return errResult(err), nil
+		}
+		out["queries"] = queries
 		return jsonText(out), nil
 	})
 }

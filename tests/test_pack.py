@@ -12,6 +12,7 @@ from ai_houkai.memory_system.store import (
     _jaccard_sim,
     _cluster_by_jaccard,
     extract_key_phrases,
+    fanout_queries,
 )
 
 
@@ -210,6 +211,79 @@ class TestExtractKeyPhrases:
         phrases = extract_key_phrases("Deploy API", max_phrases=5)
         for p in phrases:
             assert p == p.lower()
+
+
+class TestFanoutQueries:
+    """The queries auto_context_pack actually searches.
+
+    It used to be `[task] + extract_key_phrases(task)` with no de-duplication,
+    so a task that equals its own top phrase — every one-word task does — was
+    embedded and recalled twice per call, and the surfaces reported it twice.
+    """
+
+    def test_the_task_leads(self):
+        assert fanout_queries("deploy the API to production")[0] == "deploy the API to production"
+
+    def test_a_one_word_task_is_not_searched_twice(self):
+        assert fanout_queries("deploy") == ["deploy"]
+
+    def test_a_task_equal_to_its_own_bigram_is_not_searched_twice(self):
+        qs = fanout_queries("android client", max_phrases=3)
+        assert qs == ["android client", "android", "client"]
+
+    def test_case_and_spacing_do_not_smuggle_a_duplicate_back_in(self):
+        # extract_key_phrases lowercases, so the phrase would otherwise differ
+        # from the task by case alone and both would be searched.
+        qs = fanout_queries("Android   Client", max_phrases=3)
+        assert qs[0] == "Android   Client"          # the caller's spelling leads
+        keys = [" ".join(q.split()).casefold() for q in qs]
+        assert keys.count("android client") == 1    # the phrase was not re-added
+        assert len(keys) == len(set(keys))
+
+    def test_the_original_spelling_survives(self):
+        assert fanout_queries("Deploy API")[0] == "Deploy API"
+
+    def test_an_all_stop_word_task_still_recalls_once(self):
+        assert fanout_queries("the is a to") == ["the is a to"]
+
+    def test_a_blank_task_is_kept_so_the_fan_out_is_never_empty(self):
+        assert fanout_queries("") == [""]
+
+    def test_a_negative_cap_is_rejected_not_reinterpreted(self):
+        # It used to reach a list slice, so `-3` silently dropped the LAST three
+        # phrases — a different answer for every task length, and the opposite
+        # of what Go did with the same input ("no cap").
+        with pytest.raises(ValueError, match="max_phrases"):
+            extract_key_phrases("deploy the service", max_phrases=-1)
+        with pytest.raises(ValueError, match="max_phrases"):
+            fanout_queries("deploy the service", max_phrases=-3)
+
+    def test_zero_means_the_task_alone(self):
+        assert extract_key_phrases("deploy the service", max_phrases=0) == []
+        assert fanout_queries("deploy the service", max_phrases=0) == ["deploy the service"]
+
+    def test_auto_context_pack_rejects_a_negative_cap(self, store: MemoryStore):
+        store.remember("deploy the service tonight")
+        with pytest.raises(ValueError, match="max_phrases"):
+            store.auto_context_pack("deploy the service", max_phrases=-1)
+
+    def test_no_duplicates_for_a_repeated_word(self):
+        qs = fanout_queries("ruff ruff ruff", max_phrases=10)
+        assert len(qs) == len({q.casefold() for q in qs})
+
+    def test_auto_context_pack_searches_each_query_once(self, store: MemoryStore):
+        for i in range(3):
+            store.remember(f"deploy step number {i}")
+        searched = []
+        original = store.recall
+
+        def spy(*args, **kwargs):
+            searched.append(kwargs.get("query", args[0] if args else None))
+            return original(*args, **kwargs)
+
+        store.recall = spy  # type: ignore[method-assign]
+        store.auto_context_pack("deploy", token_budget=500)
+        assert searched == ["deploy"]
 
 
 class TestCompression:

@@ -135,7 +135,7 @@ AI-Houkai/
 │   ├── 06_claude_code.py         # Claude Code MCP integration
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 1094 tests across 44 files
+├── tests/                        # 1337 tests across 47 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -890,7 +890,7 @@ Forward-looking feature recommendations live in
 ## Run the tests
 
 ```bash
-pytest tests/ -q                       # 1094 tests across 44 files
+pytest tests/ -q                       # 1337 tests across 47 files
 pytest tests/ -q -m "not needs_model"  # the fast subset — no torch, no download
 pytest functional_tests -v             # 16 black-box e2e tests (needs an install)
 ```

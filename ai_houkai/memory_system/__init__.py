@@ -28,6 +28,7 @@ from .store import (
     Reranker,
     VectorIndexError,
     extract_key_phrases,
+    fanout_queries,
 )
 from .async_store import AsyncMemoryStore
 from .decay import DecayEngine
@@ -72,5 +73,6 @@ __all__ = [
     "VectorIndexError",
     "build_summarizer",
     "extract_key_phrases",
+    "fanout_queries",
     "score_importance",
 ]
