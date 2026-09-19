@@ -478,7 +478,7 @@ func (s *Server) remember(r *http.Request) (int, any, error) {
 		Tags:       bodyStrSlice(b, "tags"),
 		Importance: bodyFloatPtr(b, "importance"), // nil = unset → store default
 		Source:     bodyStr(b, "source", ""),
-		Polarity:   int(bodyFloat(b, "polarity", 0)),
+		Polarity:   bodyInt(b, "polarity", 0),
 		OnConflict: memory.ConflictPolicy(bodyStr(b, "on_conflict", "")),
 		Pinned:     bodyBool(b, "pinned"),
 		Trust:      memory.TrustLevel(bodyStr(b, "trust", "")),
@@ -552,7 +552,7 @@ func (s *Server) rememberMany(r *http.Request) (int, any, error) {
 				Tags:       bodyStrSlice(it, "tags"),
 				Importance: bodyFloatPtr(it, "importance"),
 				Source:     bodyStr(it, "source", ""),
-				Polarity:   int(bodyFloat(it, "polarity", 0)),
+				Polarity:   bodyInt(it, "polarity", 0),
 			},
 		}
 		if v, ok := it["expires_at"].(float64); ok {
@@ -563,10 +563,7 @@ func (s *Server) rememberMany(r *http.Request) (int, any, error) {
 		}
 		items = append(items, ri)
 	}
-	batchSize := 128
-	if v, ok := b["batch_size"].(float64); ok {
-		batchSize = int(v)
-	}
+	batchSize := bodyInt(b, "batch_size", 128)
 	started := float64(time.Now().UnixNano()) / 1e9
 	mems, err := s.store.RememberMany(
 		r.Context(), items, batchSize,
@@ -669,7 +666,7 @@ func (s *Server) edit(r *http.Request) (int, any, error) {
 		fields++
 	}
 	if raw, present := b["polarity"]; present && raw != nil {
-		n := int(bodyFloat(b, "polarity", 0))
+		n := bodyInt(b, "polarity", 0)
 		opts.Polarity = &n
 		fields++
 	}
@@ -710,15 +707,25 @@ func (s *Server) forget(r *http.Request) (int, any, error) {
 }
 
 func (s *Server) neighbors(r *http.Request) (int, any, error) {
+	id := r.PathValue("id")
 	hits, err := s.store.Neighbors(
 		r.Context(),
-		r.PathValue("id"),
+		id,
 		qsStr(r, "rel", ""),
 		qsStr(r, "direction", "both"),
 		qsInt(r, "depth", 1),
 	)
 	if err != nil {
 		return 0, nil, err
+	}
+	// Distinguish an unknown id from a real memory with no links — the same
+	// check /history and /versions make. Without it this was the only
+	// /memories/{id}/… route that answered 200 for an id that does not exist,
+	// leaving the client unable to tell "no neighbours" from "no memory".
+	if len(hits) == 0 {
+		if _, gerr := s.store.GetByID(r.Context(), id); errors.Is(gerr, memory.ErrNotFound) {
+			return 0, nil, errStatus(404, "memory not found")
+		}
 	}
 	out := make([]map[string]any, len(hits))
 	for i, h := range hits {
@@ -764,7 +771,7 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		return 0, nil, err
 	}
 	packOpts := memory.PackOpts{
-		TokenBudget:       int(bodyFloat(b, "token_budget", 800)),
+		TokenBudget:       bodyInt(b, "token_budget", memory.DefaultTokenBudget),
 		Type:              memory.MemoryType(bodyStr(b, "type", "")),
 		Tag:               bodyStr(b, "tag", ""),
 		MinImportance:     float32(bodyFloat(b, "min_importance", 0)),
@@ -772,7 +779,7 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Since:             since,
 		Until:             until,
 		Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeHybrid))),
-		MaxItems:          int(bodyFloat(b, "max_items", 50)),
+		MaxItems:          bodyInt(b, "max_items", 50),
 		IncludeSuperseded: bodyBool(b, "include_superseded"),
 		Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
 		Weights:           weightsFromBody(b),
@@ -782,7 +789,7 @@ func (s *Server) recallPack(r *http.Request) (int, any, error) {
 		Expand:            expandFromBody(b),
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
-		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		CompressMinGroup:  bodyInt(b, "compress_min_group", 2),
 		// Same gap as recall had: these were reachable through the MCP tool but
 		// not over HTTP, so an HTTP client could not set a trust floor on the
 		// one call whose output goes straight into a model's context.
@@ -841,15 +848,15 @@ func (s *Server) autoContext(r *http.Request) (int, any, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	maxPhrases := int(bodyFloat(b, "max_phrases", 3))
+	maxPhrases := bodyInt(b, "max_phrases", 3)
 	res, err := s.store.AutoContextPack(r.Context(), task, memory.AutoContextOpts{
-		TokenBudget:       int(bodyFloat(b, "token_budget", 800)),
+		TokenBudget:       bodyInt(b, "token_budget", memory.DefaultTokenBudget),
 		MaxPhrases:        maxPhrases,
 		Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeHybrid))),
 		MinCosine:         bodyFloatPtr(b, "min_cosine"),
 		Compress:          bodyBool(b, "compress"),
 		CompressThreshold: float32(bodyFloat(b, "compress_threshold", 0.30)),
-		CompressMinGroup:  int(bodyFloat(b, "compress_min_group", 2)),
+		CompressMinGroup:  bodyInt(b, "compress_min_group", 2),
 		LexicalIndex:      memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
 		MinTrust:          memory.TrustLevel(bodyStr(b, "min_trust", "")),
 	})
@@ -990,7 +997,7 @@ func (s *Server) subgraph(r *http.Request) (int, any, error) {
 	if len(ids) == 0 {
 		return 0, nil, errStatus(400, "missing required field: memory_ids")
 	}
-	graph, err := s.store.Subgraph(r.Context(), ids, int(bodyFloat(b, "depth", 1)))
+	graph, err := s.store.Subgraph(r.Context(), ids, bodyInt(b, "depth", 1))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1200,7 +1207,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			Since:             since,
 			Until:             until,
 			Mode:              memory.RecallMode(bodyStr(b, "mode", string(memory.ModeSemantic))),
-			Overfetch:         int(bodyFloat(b, "overfetch", 4)),
+			Overfetch:         bodyInt(b, "overfetch", 4),
 			IncludeSuperseded: bodyBool(b, "include_superseded"),
 			IncludeExpired:    bodyBool(b, "include_expired"),
 			Fusion:            memory.FusionMode(bodyStr(b, "fusion", "")),
@@ -1217,7 +1224,7 @@ func (s *Server) recallParams(r *http.Request) (string, memory.RecallOpts, int, 
 			MinTrust:     memory.TrustLevel(bodyStr(b, "min_trust", "")),
 			LexicalIndex: memory.LexicalIndexMode(bodyStr(b, "lexical_index", "")),
 			AsOf:         bodyFloat(b, "as_of", 0),
-		}, int(bodyFloat(b, "k", 5)), nil
+		}, bodyInt(b, "k", 5), nil
 	}
 
 	query := qsStr(r, "query", "")
@@ -1443,6 +1450,39 @@ func bodyFloat(b map[string]any, key string, def float64) float64 {
 		}
 	}
 	panic(errStatus(400, "%s: not a valid number", key))
+}
+
+// bodyInt reads an optional integer field, mirroring Python's _body_int.
+//
+// JSON has one number type, so an integer parameter arrives as a float64 and
+// the obvious int(bodyFloat(...)) TRUNCATES: `{"k": 2.7}` silently became
+// k=2, hiding the caller's bug, where the Python port answered 400. A value
+// that is not a whole number is a client error, not a rounding opportunity.
+func bodyInt(b map[string]any, key string, def int) int {
+	var f float64
+	switch v := b[key].(type) {
+	case nil:
+		return def
+	case bool:
+		// bool would coerce to 0/1 — reject explicitly, like Python.
+		panic(errStatus(400, "%s: not a valid integer", key))
+	case float64:
+		f = v
+	case json.Number:
+		f, _ = v.Float64()
+	case string:
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			panic(errStatus(400, "%s: not a valid integer", key))
+		}
+		return n
+	default:
+		panic(errStatus(400, "%s: not a valid integer", key))
+	}
+	if f != math.Trunc(f) {
+		panic(errStatus(400, "%s: not a valid integer", key))
+	}
+	return int(f)
 }
 
 func bodyBool(b map[string]any, key string) bool {

@@ -51,51 +51,28 @@ func DefaultCursorInstaller() CursorInstaller {
 	}
 }
 
-func (i CursorInstaller) mcpCommand() string {
-	if i.BinaryPath != "" {
-		return i.BinaryPath
-	}
-	return ResolveMCPCommand()
-}
-
 func (i CursorInstaller) buildMCPBlock() map[string]any {
-	env := map[string]any{
-		"AI_HOUKAI_PATH":       i.MemoryPath,
-		"AI_HOUKAI_COLLECTION": i.Collection,
+	return map[string]any{
+		"command": mcpCommand(i.BinaryPath),
+		"env":     serverEnv(i.MemoryPath, i.Collection, i.ExtraEnv),
 	}
-	for k, v := range i.ExtraEnv {
-		env[k] = v
-	}
-	return map[string]any{"command": i.mcpCommand(), "env": env}
 }
 
 // Install patches Cursor's mcp.json with the MCP server block and returns
 // the written path.
 func (i CursorInstaller) Install() (string, error) {
-	path := expandHome(i.SettingsPath)
-	config := loadJSONFile(path)
-	servers, _ := config["mcpServers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
-	servers[i.ServerName] = i.buildMCPBlock()
-	config["mcpServers"] = servers
-	return path, writeJSONFile(path, config)
+	return mergeServerBlock(i.SettingsPath, "mcpServers", i.ServerName,
+		i.buildMCPBlock(), nil)
 }
 
 // Verify returns true if the server entry exists in Cursor's mcp.json.
 func (i CursorInstaller) Verify() bool {
-	config := loadJSONFile(expandHome(i.SettingsPath))
-	servers, _ := config["mcpServers"].(map[string]any)
-	_, ok := servers[i.ServerName]
-	return ok
+	return hasServer(i.SettingsPath, "mcpServers", i.ServerName)
 }
 
 // PrintConfig prints the MCP block for manual pasting.
 func (i CursorInstaller) PrintConfig() {
-	block := map[string]any{
-		"mcpServers": map[string]any{i.ServerName: i.buildMCPBlock()},
-	}
-	fmt.Printf("\nPaste this into %s:\n\n%s\n", i.SettingsPath, printJSONBlock(block))
-	fmt.Printf("\nThen reload Cursor and open Settings → MCP to confirm %q is listed.\n\n", i.ServerName)
+	printPasteBlock(i.SettingsPath,
+		map[string]any{"mcpServers": map[string]any{i.ServerName: i.buildMCPBlock()}},
+		fmt.Sprintf("Then reload Cursor and open Settings → MCP to confirm %q is listed.", i.ServerName))
 }

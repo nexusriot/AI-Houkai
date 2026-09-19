@@ -51,10 +51,10 @@ class TestRecallFilters:
         new = store.remember("beta auth logout", source="repo-b")
         # Backdate one record so since/until can separate them.
         store.collection.update(ids=[old.id], metadatas=[{
-            **store._get_by_id(old.id).to_metadata(), "created_at": 1000.0,
+            **store.get(old.id).to_metadata(), "created_at": 1000.0,
         }])
         store.collection.update(ids=[new.id], metadatas=[{
-            **store._get_by_id(new.id).to_metadata(), "created_at": 9_000_000_000.0,
+            **store.get(new.id).to_metadata(), "created_at": 9_000_000_000.0,
         }])
         return old, new
 

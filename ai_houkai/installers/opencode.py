@@ -26,34 +26,42 @@ CLI use (also exposed as the `ai-houkai-install-opencode` console script):
     python -m ai_houkai.installers.opencode --project       # ./opencode.json
     python -m ai_houkai.installers.opencode --verify
     python -m ai_houkai.installers.opencode --agents
+
+Everything that is not OpenCode-specific — the merge-and-write install, the
+preview, verify, and the argparse front end — lives in
+:class:`ai_houkai.installers.common.JSONConfigInstaller`.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import sys
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import ClassVar, Optional
 
 from ai_houkai.installers.common import (
+    DEFAULT_MEMORY_PATH,
     MEMORY_GUIDE,
-    load_json,
-    resolve_mcp_command,
-    verify_server,
-    write_json,
+    SERVER_NAME,
+    JSONConfigInstaller,
 )
 
 GLOBAL_CONFIG_PATH  = os.path.expanduser("~/.config/opencode/opencode.json")
 PROJECT_CONFIG_PATH = "opencode.json"
-# `.chroma` leaf matches the CLI default (~/.ai_houkai/.chroma) so `houkai
-# list` sees installed-client memories, and the store's journal.log lands in
-# ~/.ai_houkai/ instead of $HOME (it is written to the store path's parent).
-DEFAULT_MEMORY_PATH = os.path.expanduser("~/.ai_houkai/.chroma")
 DEFAULT_COLLECTION  = "opencode"
-SERVER_NAME         = "ai-houkai"
 CONFIG_SCHEMA_URL   = "https://opencode.ai/config.json"
+
+# Re-exported from common so `from ai_houkai.installers.opencode import
+# DEFAULT_MEMORY_PATH` keeps working; the values are shared across clients.
+__all__ = [
+    "CONFIG_SCHEMA_URL",
+    "AGENTS_SNIPPET",
+    "DEFAULT_COLLECTION",
+    "DEFAULT_MEMORY_PATH",
+    "GLOBAL_CONFIG_PATH",
+    "OpenCodeInstaller",
+    "PROJECT_CONFIG_PATH",
+    "SERVER_NAME",
+]
 
 
 # OpenCode reads project/global instructions from AGENTS.md.
@@ -61,72 +69,34 @@ AGENTS_SNIPPET = f"## Memory (AI-Houkai MCP)\n\n{MEMORY_GUIDE}"
 
 
 @dataclass
-class OpenCodeInstaller:
+class OpenCodeInstaller(JSONConfigInstaller):
     """Register the AI-Houkai MCP server with OpenCode."""
 
-    memory_path:   str = DEFAULT_MEMORY_PATH
-    collection:    str = DEFAULT_COLLECTION
-    settings_path: str = GLOBAL_CONFIG_PATH
-    server_name:   str = SERVER_NAME
-    extra_env:     dict = field(default_factory=dict)
+    client_name:         ClassVar[str] = "OpenCode"
+    slug:                ClassVar[str] = "opencode"
+    config_key:          ClassVar[str] = "mcp"
+    default_collection:  ClassVar[str] = DEFAULT_COLLECTION
+    global_config_path:  ClassVar[str] = GLOBAL_CONFIG_PATH
+    project_config_path: ClassVar[str] = PROJECT_CONFIG_PATH
+    preview_hint:        ClassVar[str] = (
+        "Then restart OpenCode — '{server_name}' tools become available "
+        "to the agent.")
+    installed_hint:      ClassVar[str] = "Restart OpenCode to load the memory tools."
+    snippet_flag:        ClassVar[str] = "agents"
+    snippet_help:        ClassVar[str] = "Print an AGENTS.md memory-usage snippet"
+    snippet_heading:     ClassVar[str] = "AGENTS.md snippet"
+    snippet:             ClassVar[str] = AGENTS_SNIPPET
 
-    @property
-    def mcp_command(self) -> str:
-        return resolve_mcp_command()
+    def config_defaults(self) -> dict:
+        return {"$schema": CONFIG_SCHEMA_URL}
 
     def build_mcp_block(self) -> dict:
-        environment = {
-            "AI_HOUKAI_PATH":       self.memory_path,
-            "AI_HOUKAI_COLLECTION": self.collection,
-            **self.extra_env,
-        }
         return {
             "type":        "local",
             "command":     [self.mcp_command],
             "enabled":     True,
-            "environment": environment,
+            "environment": self.build_env(),
         }
-
-    def build_settings_block(self) -> dict:
-        return {
-            "$schema": CONFIG_SCHEMA_URL,
-            "mcp": {self.server_name: self.build_mcp_block()},
-        }
-
-    def install(self, *, overwrite_unparseable: bool = False) -> str:
-        """Patch opencode.json with the MCP server block. Returns the path."""
-        config = load_json(self.settings_path,
-                           overwrite_unparseable=overwrite_unparseable)
-        config.setdefault("$schema", CONFIG_SCHEMA_URL)
-        config.setdefault("mcp", {})
-        config["mcp"][self.server_name] = self.build_mcp_block()
-        return write_json(self.settings_path, config)
-
-    def print_config(self, *, stream=sys.stdout) -> None:
-        block = self.build_settings_block()
-        print(f"\nPaste this into {self.settings_path}:\n", file=stream)
-        print(json.dumps(block, indent=2), file=stream)
-        print(f"\nThen restart OpenCode — '{self.server_name}' tools become "
-              "available to the agent.\n", file=stream)
-
-    def verify(self, *, stream=sys.stdout) -> bool:
-        ok = verify_server(memory_path=self.memory_path,
-                           collection=self.collection, stream=stream)
-        if os.path.isfile(self.settings_path):
-            try:
-                cfg = load_json(self.settings_path)
-            except ValueError as exc:
-                print(f"  warn {exc}", file=stream)
-                cfg = {}
-            if self.server_name in cfg.get("mcp", {}):
-                print(f"  ok   registered in {self.settings_path}", file=stream)
-            else:
-                print(f"  warn not yet in {self.settings_path} — run --install",
-                      file=stream)
-        else:
-            print(f"  warn {self.settings_path} not found — run --install",
-                  file=stream)
-        return ok
 
     @staticmethod
     def agents_snippet() -> str:
@@ -134,62 +104,7 @@ class OpenCodeInstaller:
 
 
 def _main(argv: Optional[list] = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="ai-houkai-install-opencode",
-        description="Register the AI-Houkai MCP server with OpenCode.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ap.add_argument("--install", action="store_true",
-                    help="Write the MCP block to opencode.json")
-    ap.add_argument("--project", action="store_true",
-                    help=f"Target ./{PROJECT_CONFIG_PATH} instead of the global config")
-    ap.add_argument("--memory-path", default=DEFAULT_MEMORY_PATH, metavar="PATH",
-                    help=f"ChromaDB directory (default: {DEFAULT_MEMORY_PATH})")
-    ap.add_argument("--collection", default=DEFAULT_COLLECTION,
-                    help=f"Collection name (default: {DEFAULT_COLLECTION})")
-    ap.add_argument("--settings", default=None,
-                    help="Explicit path to opencode.json (overrides --project)")
-    ap.add_argument("--verify", action="store_true",
-                    help="Smoke-test the MCP server + check registration")
-    ap.add_argument("--agents", action="store_true",
-                    help="Print an AGENTS.md memory-usage snippet")
-    args = ap.parse_args(argv)
-
-    settings_path = (args.settings
-                     or (PROJECT_CONFIG_PATH if args.project else GLOBAL_CONFIG_PATH))
-
-    inst = OpenCodeInstaller(
-        memory_path=args.memory_path,
-        collection=args.collection,
-        settings_path=settings_path,
-    )
-
-    print("\nAI-Houkai · OpenCode installer")
-    print(f"  Config file : {inst.settings_path}")
-    print(f"  Memory path : {inst.memory_path}")
-    print(f"  MCP command : {inst.mcp_command}\n")
-
-    if args.verify:
-        if not inst.verify():
-            return 1
-
-    if args.agents:
-        print("\nAGENTS.md snippet\n")
-        print(inst.agents_snippet())
-        print("\n")
-
-    if args.install:
-        try:
-            path = inst.install()
-        except ValueError as exc:
-            print(f"  err  {exc}")
-            return 1
-        print(f"  written: {path}")
-        print("  Restart OpenCode to load the memory tools.\n")
-    elif not (args.verify or args.agents):
-        inst.print_config()
-        print("  Run with --install to write this automatically.\n")
-    return 0
+    return OpenCodeInstaller.main(argv)
 
 
 if __name__ == "__main__":

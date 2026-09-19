@@ -11,7 +11,6 @@ from ai_houkai.memory_system.decay import DecayEngine
 from ai_houkai.cli import output as out
 
 
-
 def prune(
     ctx: typer.Context,
     decay_rate: Optional[float] = typer.Option(

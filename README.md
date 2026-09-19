@@ -62,11 +62,17 @@ and periodic reflection that condenses experience into knowledge.
 AI-Houkai/
 ├── ai_houkai/
 │   ├── __init__.py               # convenience re-exports
+│   ├── embed.py                  # pluggable embedders (openai / ollama / local specs)
+│   ├── eval.py                   # retrieval-quality metrics + evaluate() harness
+│   ├── timeparse.py              # parse_timestamp — epoch / ISO-8601 / "7d"
+│   ├── testing.py                # FakeEmbedder — the fast suite's model-free seam
 │   ├── memory_system/
 │   │   ├── __init__.py
 │   │   ├── store.py              # MemoryStore + Memory dataclass (+ edit/export/import/undo)
 │   │   ├── async_store.py        # AsyncMemoryStore — coroutine wrapper (single-threaded executor)
 │   │   ├── journal.py            # Append-only audit journal (JSONL, gzipped on rotate)
+│   │   ├── curation.py           # merge / versions / tags / find_path / trash (store mixin)
+│   │   ├── trust.py              # provenance trust levels + worst-case propagation
 │   │   ├── decay.py              # DecayEngine — exponential forgetting
 │   │   ├── reflection.py         # ReflectionEngine — episodic → semantic
 │   │   ├── summarizers.py        # build_summarizer("ollama:…|openai:…|anthropic:…")
@@ -111,13 +117,16 @@ AI-Houkai/
 │   │       ├── collections.py    # houkai collections list/create/delete/copy
 │   │       ├── tui_cmd.py        # houkai tui
 │   │       ├── stats.py          # houkai stats
+│   │       ├── curation.py       # houkai merge / versions / tags / path / trash
+│   │       ├── timetravel.py     # houkai history / state-at / get-at / metrics
+│   │       ├── eval_cmd.py       # houkai eval — retrieval-quality scoring
 │   │       └── doctor.py         # houkai doctor — diagnostics / readiness
 │   ├── tui/
 │   │   ├── data.py               # view models: recent/search/neighbors + Navigator
 │   │   └── app.py                # HoukaiTui — Textual memory browser
 │   └── installers/
 │       ├── __init__.py
-│       ├── common.py             # shared command resolver / JSON patcher / memory guide
+│       ├── common.py             # JSONConfigInstaller base + JSON patcher / memory guide
 │       ├── claude_code.py        # ClaudeCodeInstaller — register MCP w/ Claude Code
 │       ├── cursor.py             # CursorInstaller   — register MCP w/ Cursor
 │       └── opencode.py           # OpenCodeInstaller — register MCP w/ OpenCode
@@ -133,9 +142,10 @@ AI-Houkai/
 │   ├── 04_openai.py              # OpenAI GPT-4o / gpt-4o-mini
 │   ├── 05_decay_reflection.py    # decay + reflection demo
 │   ├── 06_claude_code.py         # Claude Code MCP integration
+│   ├── 07_maintenance_daemon.py  # maintenance scheduler / detached daemon
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 1337 tests across 47 files
+├── tests/                        # 1412 tests across 48 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -890,13 +900,13 @@ Forward-looking feature recommendations live in
 ## Run the tests
 
 ```bash
-pytest tests/ -q                       # 1337 tests across 47 files
+pytest tests/ -q                       # 1412 tests across 48 files
 pytest tests/ -q -m "not needs_model"  # the fast subset — no torch, no download
 pytest functional_tests -v             # 16 black-box e2e tests (needs an install)
 ```
 
 Most of the suite runs against `ai_houkai.testing.FakeEmbedder`, a hash-based
-embedder that needs no model. Only the ~29 tests marked `needs_model` load real
+embedder that needs no model. Only the 30 tests marked `needs_model` load real
 sentence-transformers — their assertions depend on genuine semantic similarity
 (conflict thresholds, reflection clustering, ranking quality). To re-derive that
 marker set after a change, force the real model everywhere:

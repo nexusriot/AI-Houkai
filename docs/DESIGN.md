@@ -108,6 +108,10 @@ Claude Desktop, custom agents) can call them without Python glue code.
 ```
 ai_houkai/                        pip package name: ai-houkai
 ├── __init__.py                   convenience re-exports
+├── embed.py                      pluggable embedders — build_embedder("openai:…|ollama:…|local:…")
+├── eval.py                       retrieval-quality metrics + the evaluate() harness
+├── timeparse.py                  parse_timestamp — epoch / ISO-8601 / relative spans
+├── testing.py                    FakeEmbedder — the model-free seam the fast suite runs on
 ├── memory_system/
 │   ├── __init__.py               exports Memory, MemoryStore, MemoryType,
 │   │                             Link, Graph, HybridWeights, ExpandSpec,
@@ -124,6 +128,8 @@ ai_houkai/                        pip package name: ai-houkai
 │   ├── store.py                  MemoryStore + dataclasses + BM25 + conflict
 │   ├── async_store.py            AsyncMemoryStore — coroutine wrapper, single-threaded executor
 │   ├── journal.py                Journal — append-only JSONL audit log
+│   ├── curation.py               merge / versions / tags / find_path / trash (MemoryStore mixin)
+│   ├── trust.py                  provenance trust levels + worst-case propagation
 │   ├── decay.py                  DecayEngine
 │   ├── reflection.py             ReflectionEngine
 │   ├── summarizers.py            build_summarizer — LLM summarizer specs
@@ -169,12 +175,15 @@ ai_houkai/                        pip package name: ai-houkai
 │       ├── ingest.py             houkai ingest
 │       ├── serve.py              houkai serve  (HTTP/REST front-end)
 │       ├── stats.py              houkai stats
+│       ├── curation.py           houkai merge / versions / tags / path / trash
+│       ├── timetravel.py         houkai history / state-at / get-at / metrics
+│       ├── eval_cmd.py           houkai eval  (retrieval-quality scoring)
 │       ├── doctor.py             houkai doctor  (diagnostics / readiness)
 │       ├── tui_cmd.py            houkai tui  (Textual browser)
 │       └── collections.py        houkai collections (group)
 └── installers/
     ├── __init__.py               re-exports ClaudeCodeInstaller, CursorInstaller, OpenCodeInstaller
-    ├── common.py                 shared command resolver, JSON patcher, verify_server, memory guide
+    ├── common.py                 JSONConfigInstaller base, merge_server_block, verify_server, MEMORY_GUIDE
     ├── claude_code.py            ClaudeCodeInstaller — claude mcp add / ~/.claude.json / .mcp.json
     ├── cursor.py                 CursorInstaller — patches ~/.cursor/mcp.json
     └── opencode.py               OpenCodeInstaller — patches ~/.config/opencode/opencode.json
@@ -284,11 +293,56 @@ vocabulary; `polarity` is likewise restricted to `-1/0/+1`. `link()` also
 rejects a `dst_id` that does not resolve — graph walkers skip unresolvable
 targets, so a dangling edge would be stored but permanently unreachable.
 
+### Numeric parameters: a supplied zero means zero
+
+Every count, depth and budget a caller can set is taken **literally**. Zero
+means zero, and a negative value is a `ValueError` (a 400 over HTTP), never a
+silently substituted default:
+
+| Parameter | 0 | negative |
+|---|---|---|
+| `list_recent(limit=)`, `GET /memories?limit=`, `houkai list --limit` | no memories | `ValueError` / 400 |
+| `neighbors(depth=)`, `?depth=` | no neighbours | no neighbours |
+| `recall_pack(token_budget=)`, `auto_context_pack(token_budget=)` | empty pack | empty pack |
+| `auto_context_pack(max_phrases=)` | the task alone | `ValueError` |
+| `recall(k=)` | no results | no results |
+| `houkai journal tail -n` | no entries | `BadParameter` |
+
+The zero worth defending is the **computed** one — `limit = min(remaining,
+page_size)`, a depth budget walked down to nothing, a token budget with no
+room left. Every one of those reaches zero on the step where the correct
+answer is "nothing", and the failure mode of reading it as "unset" is to
+return *everything* instead.
+
+Two things made this easy to get wrong, and both were found by probing the
+two ports' HTTP servers side by side with the same requests:
+
+* **Go cannot tell an unset struct field from an explicit zero**, so
+  `PackOpts{TokenBudget: 0}` meant "use 800" and `?token_budget=0` packed a
+  full context block. The default now lives at the surfaces
+  (`memory.DefaultTokenBudget`), not inside the store, so an explicit 0 stays
+  a request to pack nothing.
+* **Python's slices are quietly wrong for a negative count.** `xs[:-1]` drops
+  the *last* item and `xs[-(-1):]` drops the *first*, so neither errors;
+  `xs[-0:]` is the whole list, which is why `houkai journal tail -n 0` used to
+  print the entire journal. `MemoryStore.list_recent` guards against this, and
+  `cli.output.non_negative()` now carries the same guard for the commands that
+  slice locally.
+
+Integer parameters are also **not rounded**: JSON has one number type, so
+`{"k": 2.7}` arrives as a float, and both ports answer 400 rather than
+truncating to 2 and hiding the caller's bug.
+
 ### Metadata serialisation
 
 ChromaDB metadata values must be scalar.  Tags are stored as a
 comma-joined string (which is why `remember()`/`edit()` reject a comma
-inside a tag — it would silently split into two tags on the next read);
+inside a tag — it would silently split into two tags on the next read, and
+why they also reject a *blank* one: `""` is swallowed by the same join and
+never seen again, and a tag of spaces reaches `houkai tags list` as an empty
+row nobody can select. The write path and the curation path apply the same
+two rules, or a caller could create a tag `rename_tag` then refused to
+touch. A tag that merely *contains* a space is ordinary);
 `links` are JSON-encoded:
 
 ```python
@@ -927,8 +981,10 @@ config path and patches the `mcpServers` block automatically.
 The `ai_houkai.installers` subpackage isolates the boilerplate needed to
 register the MCP server with various MCP clients.  Three installers ship
 today — **Claude Code**, **Cursor**, and **OpenCode** — all built on a
-shared `common.py` (command resolution, JSON load/patch/write,
-`verify_server()` smoke test, and the memory-guide snippet).  The logic
+shared `common.py`: command resolution, JSON load/patch/write, the
+`merge_server_block()` read-modify-write, the `verify_server()` smoke test,
+the one `MEMORY_GUIDE` all three snippets wrap, and the
+`JSONConfigInstaller` base that Cursor and OpenCode subclass outright.  The logic
 used to live inside `examples/06_claude_code.py`; promoting it to a real
 module means:
 
@@ -984,12 +1040,14 @@ class ClaudeCodeInstaller:
 - **Common shape**: all installers expose the same surface
   (`build_mcp_block` / `build_settings_block` / `install` / `print_config`
   / `verify` + a client-specific guidance snippet) so callers can dispatch
-  generically; future installers follow the same pattern.
+  generically. For a client that simply stores its servers in a JSON file,
+  that shape is now inherited rather than re-typed — subclass
+  `JSONConfigInstaller` (below) and declare the differences.
 
 ### `CursorInstaller` and `OpenCodeInstaller`
 
-Both mirror `ClaudeCodeInstaller` with client-specific defaults and
-guidance snippets:
+Both are **subclasses of `common.JSONConfigInstaller`** and declare only
+what differs:
 
 | | Cursor | OpenCode |
 |---|---|---|
@@ -998,6 +1056,47 @@ guidance snippets:
 | Default collection | `cursor` | `opencode` |
 | Guidance snippet | `rule_snippet()` → `.cursor/rules/*.mdc` | `agents_snippet()` → `AGENTS.md` |
 | Console script | `ai-houkai-install-cursor` | `ai-houkai-install-opencode` |
+
+These two started as one file copied to the other, and stayed that way:
+`_main()` (57 lines) and `verify()` (18) were character-for-character
+identical, and the rest differed only in the strings above. The shared base
+owns the identical parts —
+
+```python
+@dataclass
+class JSONConfigInstaller:
+    memory_path / collection / settings_path / server_name / extra_env
+    mcp_command, build_env, build_settings_block
+    install()        # merge-and-write, via common.merge_server_block
+    print_config()   # the paste-this-block preview
+    verify()         # smoke test + "is it registered in <file>"
+    main(argv)       # the whole argparse front end
+```
+
+— and a subclass supplies `build_mcp_block()` plus a handful of class
+attributes (`config_key`, `default_collection`, the config paths, the
+reload hints, and the instruction snippet). `config_defaults()` is the one
+extra hook, for OpenCode's top-level `$schema`. Each subclass is now under
+40 lines of its own.
+
+`ClaudeCodeInstaller` deliberately does **not** subclass it: it prefers the
+`claude mcp add` CLI and only falls back to writing a file, and its public
+field is `config_path`, not `settings_path`. It shares the file-level
+helpers instead — including `merge_server_block`, which replaced its
+hand-rolled copy of the same read-modify-write.
+
+### One memory guide, three wrappers
+
+`common.MEMORY_GUIDE` is the client-agnostic "when to use memory" text.
+Each installer wraps it in its client's instruction-file format — a
+`.cursor/rules/*.mdc` with YAML frontmatter, an `AGENTS.md` section, a
+`CLAUDE.md` section — and adds nothing else.
+
+It is shared because it did not used to be, and the copies drifted: the
+Claude Code snippet had lost the `edit()` bullet and its two table rows,
+and the Go port's `MemoryGuide` had lost them too. Both are now derived
+from the one source, and `test_memory_guide_is_shared_not_copied` (Python)
+and `TestSnippetsShareOneGuide` (Go) assert it.
 
 ### Console script wiring (`pyproject.toml`)
 
@@ -1068,54 +1167,57 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 1337 tests across 47 files
+### 1412 tests across 48 files
 
 | File | Tests | What it covers |
 |---|---|---|
 | `test_maintenance.py` | 74 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating, **TTL purge job** (gating, state persistence, disabled) |
-| `test_http_server.py` | 65 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain`, POST-`/recall` advanced knobs (`graph` weight + `expand` rerank gating), and `POST /memories/batch` bulk write (`remember_many`) |
+| `test_http_server.py` | 98 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain`, POST-`/recall` advanced knobs (`graph` weight + `expand` rerank gating), and `POST /memories/batch` bulk write (`remember_many`), plus the **surface boundaries** a cross-port probe turned up: a supplied 0 means zero on every count/depth/budget, a non-integer where an integer is required is 400 rather than truncated, and an empty batch is 200 (it created nothing) |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
 | `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
 | `test_pack.py` | 70 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine`, and `fanout_queries` (no duplicate fan-out query; a negative `max_phrases` is rejected, not reinterpreted) |
-| `test_validation.py` | 46 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors |
-| `test_cli.py` | 38 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`** |
+| `test_validation.py` | 56 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors, **zero-means-zero** for `limit`/`depth`/`token_budget`, and blank tags refused by the write path as well as the curation path |
+| `test_cli.py` | 59 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`**, `info` applying import's header checks, the store opened **lazily** (so `info` builds none), and the counts that slice locally (`list --limit`, `journal tail -n`, `eval -k`) refusing a negative and honouring a zero |
 | `test_conflicts.py` | 46 | Conflict/contradiction detection, `on_conflict` policies, supersede/restore, negation heuristic, that a **lapsed** candidate never clashes with a new write, and that a refused `raise` write leaves no row, no journal entry and no metric behind |
 | `test_memory.py` | 30 | `MemoryStore`: remember, forget, nuke, recall (filters, touch control), list_recent, `Memory` dataclass serialisation |
 | `test_links.py` | 28 | Typed links: `link`/`unlink`/`neighbors`/`subgraph`, direction, depth, cycles, dangling targets |
 | `test_reflection.py` | 27 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded **and lapsed** sources, polarity-cluster separation |
 | `test_async_store.py` | 51 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose, plus a mechanical signature check — walking the MRO, so the twelve curation methods inherited from `CurationMixin` are covered too — so a wrapper cannot quietly drop a parameter the sync method gained |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
-| `test_journal.py` | 22 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
+| `test_journal.py` | 28 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
 | `test_ingest.py` | 26 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips, and that splitting a long paragraph never loses a short fragment to the noise filter |
 | `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
+| `test_vector_index.py` | 16 | **Damaged vector index**: a real store stripped of its HNSW files still counts, lists and exports every memory — `vector_index_ok` detects it, recall refuses to answer rather than reporting a false empty, and `rebuild_vectors` re-embeds from the surviving text |
 | `test_edit.py` | 21 | `MemoryStore.edit()`: in-place update, re-embedding, journaling, undo, no-op detection, async wrapper, CLI edit/tag/bump, HTTP `PATCH` |
 | `test_decay.py` | 26 | `DecayEngine`: score formula, score_all sorting, prune (dry-run, protect, custom now, empty store, routing to the trash, and not counting a row whose removal failed), recall reinforcement (`frequency_weight`) |
-| `test_remember_many.py` | 20 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
-| `test_mcp_server.py` | 22 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
+| `test_remember_many.py` | 30 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
+| `test_mcp_server.py` | 28 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
-| `test_export_import.py` | 17 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen |
-| `test_tui.py` | 15 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search), parallel-link row collapse |
+| `test_export_import.py` | 31 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen, and every shape of **broken archive** (not gzipped, truncated, empty, unparseable header, foreign `format`, future `version`, one bad row) raising one error class without writing anything |
+| `test_tui.py` | 18 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search), parallel-link row collapse |
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
-| `test_installers.py` | 14 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
-| `test_eval.py` | 13 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
+| `test_installers.py` | 35 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
+| `test_eval.py` | 18 | Retrieval-quality metrics for `ai_houkai/eval.py`: recall/precision@k, MRR, (n)DCG, the `evaluate()` harness over a gold set |
 | `test_trust.py` | 13 | **Provenance trust** rules: `worst_trust` takes the worst case (so a derived memory cannot launder its sources), `trust_rank` separates an *absent* level — old rows, which read as trusted — from an *unrecognised* one, which fails safe as least-trusted so a hand-edited or future-version row is filtered out rather than crashing a `min_trust` recall (ranked pool and the `include_pinned` lane alike) |
 | `test_recall_filters.py` | 12 | `source`/`since`/`until` metadata filters pushed into ChromaDB `where` clauses |
 | `test_doctor.py` | 11 | **Diagnostics**: `probe_embedding`/`readiness` (incl. embedder-failure, cache TTL, no-cache-on-failure), `GET /ready` (200/503, auth-exempt, sanitized body), `houkai doctor` CLI (text + `--json`) |
 | `test_history.py` | 10 | **History / point-in-time**: `history()` timeline (incl. link/supersede counterparts), `state_at` / `get_at` replay, nuke reset, link-delta replay |
+| `test_bitemporal.py` | 27 | **Bi-temporal validity**: the half-open `[valid_from, valid_until)` interval a memory was true in the world, as distinct from the transaction time `state_at` replays; `recall(as_of=T)` admitting superseded rows so "what was true then" is not answered with today's beliefs |
 | `test_timeparse.py` | 8 | `parse_timestamp`: epoch, ISO-8601, relative spans (`7d`, `24h`), error cases |
 | `test_dispatch.py` | 24 | `_dispatch_tool` for all three providers × remember / recall / forget / unknown tool |
 | `test_reranker.py` | 7 | **Reranking**: reorders results, promotes below-top-k candidates, per-store + per-call hooks, explain `rerank` block, wrong-length error |
 | `test_metrics.py` | 7 | **Runtime metrics**: op counters (incl. link/unlink/restore/purge mutators), recall-latency recording + p50/p95/p99 percentiles, empty-recall counting, backend count |
-| `test_curation.py` | 49 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
+| `test_curation.py` | 68 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
 | `test_corpus_lexical.py` | 17 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, the merged pool keeping its embeddings so MMR/dedup still apply, and the Chroma-native `purge_expired` range query |
-| `test_working_set.py` | 36 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
+| `test_working_set.py` | 69 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
 | `test_mcp_retrieval_knobs.py` | 35 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour |
 | `test_embed.py` | 31 | **Pluggable embedder**: OpenAI-compatible + Ollama backends against a stub server (auth, batching, out-of-order reindexing, count mismatch, wrapped errors), `build_embedder` spec grammar, credentials never from the spec, the store seam + env var + precedence, `FakeEmbedder` determinism/normalisation, and a full store round-trip with no model |
 | `test_eval_wiring.py` | 23 | Gold-set parsing (comments, malformed lines, id-prefix resolution, unresolvable id is an error not a zero score), `houkai eval` scores + recorded config + read-only guarantee, the `eval_recall` MCP tool |
-| `test_surface_coverage.py` | 23 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands |
+| `test_surface_coverage.py` | 29 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands |
 | `test_code_style.py` | 31 | House rules enforced mechanically: no banner comments (trailing rules **and** dash-bookended labels, across .py/.go/.sh/.yml/.toml/Makefile/Dockerfile), no import below module top, plus the detectors' own discrimination cases |
+| `test_docs.py` | 7 | Documented numbers match what they describe: every test module has a row in the table above, every count in it is current, the headline totals and the `needs_model` figure agree with pytest's own collection, and neither **Python** doc quotes a tool or route count that disagrees with `parity.json`. The Go docs are checked by the same rule in `go/internal/parity/docs_test.go` — parity.json's own contract is that each port asserts against it in that port's suite, and the hermetic Python image has no `go/` tree to read |
 | `test_public_get.py` | 9 | `MemoryStore.get()` as public API: plain read (no touch, no journal), returns superseded/expired, async wrapper, deprecated `_get_by_id` alias, MCP `get` tool |
-| `test_parity.py` | 8 | The Python surface matches `parity.json` — MCP tool list, HTTP routes, recall knobs — and every tool/route appears in its module docstring |
+| `test_parity.py` | 9 | The Python surface matches `parity.json` — MCP tool list, HTTP routes, recall knobs — and every tool/route appears in its module docstring |
 | `test_fd_hygiene.py` | 1 | ChromaDB file-descriptor reclamation across many store open/close cycles |
 
 ### The embedder seam and the fast suite
@@ -1126,7 +1228,7 @@ text into a deterministic unit vector. An autouse `conftest.py` fixture patches
 store built during a test inherits it: the MCP server's lazy store, CLI runs
 under `CliRunner`, the HTTP fixtures, and direct constructions alike.
 
-Exactly **29 tests** are marked `needs_model` and opt back into real
+Exactly **30 tests** are marked `needs_model` and opt back into real
 sentence-transformers, because their assertions depend on genuine semantic
 similarity: conflict thresholds, reflection clustering, and ranking quality.
 Everything else is testing plumbing, where hash vectors are indistinguishable
@@ -1696,8 +1798,21 @@ houkai (bin)
 ```
 
 All command functions take `ctx: typer.Context` as their first
-parameter.  The shared callback stores `{"store": MemoryStore, "config":
-Config}` in `ctx.obj` before any subcommand runs.
+parameter.  The shared callback puts a `_CliContext` in `ctx.obj` carrying
+the resolved `config`, and **builds the store on first access** rather than
+before dispatch.
+
+Laziness matters because not every command has a store. `houkai info
+archive.ahkai` reads a gzip header, and eagerly constructing one cost it
+twelve seconds loading sentence-transformers, left a fresh `chroma.sqlite3`
+behind, and made it fail outright when the *default* store happened to be
+unopenable — on a command with nothing to do with it. `_CliContext` is a
+`dict` subclass with a `__missing__` hook so all fifty-odd
+`ctx.obj["store"]` call sites are unchanged and an explicitly assigned store
+(a test, or a caller embedding the app) still wins.
+
+`houkai list` applies the same principle to its flags: `--limit -1` is
+rejected before a collection is opened, not after.
 
 ### Command inventory
 
@@ -1708,7 +1823,7 @@ Config}` in `ctx.obj` before any subcommand runs.
 | `pack` | `pack.py` | `store.recall_pack()` |
 | `auto-context` | `pack.py` | `store.auto_context_pack()` — multi-angle fan-out packing |
 | `list` | `list_cmd.py` | `store.list_recent()` + Python filters |
-| `show` | `show.py` | `store._get_by_id()` |
+| `show` | `show.py` | `store.get()` |
 | `forget` | `forget.py` | `store.forget()` |
 | `nuke` | `nuke.py` | `store.nuke()` — deletes all memories; confirms unless `--yes` |
 | `edit` | `edit.py` | `store.edit()` in place (re-embeds when text changed; id + links preserved; journaled + undoable) |
@@ -1994,9 +2109,30 @@ options) followed by one memory per line.
 - **dry_run** previews counts without writing; all real imports are
   journalled with `actor="import"`.
 
-`houkai info dump.ahkai` prints the header without touching the store,
-and `houkai backup` snapshots the raw Chroma directory for
-disaster recovery (orthogonal to `.ahkai`, which is portable data).
+### A broken archive is one error, not six
+
+An `.ahkai` file is caller-supplied data, so every way it can be unusable
+raises `ImportError` naming the file — not gzipped, truncated mid-stream,
+empty, an unparseable header, a foreign `format`, or a `version` past
+`EXPORT_VERSION`. Decompression failures did not used to go through that
+door: gzip raises `OSError`/`EOFError`, so pointing `houkai import` at a
+plain `.json` printed a raw traceback where every sibling corruption printed
+one clean line, and the HTTP route answered 500 instead of 4xx. A *row* that
+will not parse is different and stays a reported error rather than a raised
+one — one bad line must not abandon the rest of the archive.
+
+`EXPORT_FORMAT` and `EXPORT_VERSION` are exported from
+`ai_houkai.memory_system`: the writer stamps them and the reader checks
+against them, because a reader and a writer can only disagree about the
+format they exchange if the marker is written twice.
+
+`houkai info dump.ahkai` prints the header **without opening a store** — it
+also applies those same two header checks, since its job is to answer "can I
+import this?". Without them any gzipped JSON object was reported as a valid
+archive with a memory count, and a file from a newer writer looked healthy
+right up until the import refused it. `houkai backup` snapshots the raw
+Chroma directory for disaster recovery (orthogonal to `.ahkai`, which is
+portable data).
 
 ---
 

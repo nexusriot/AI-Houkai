@@ -23,12 +23,14 @@ def tail(
     include_archives: bool = typer.Option(False, "--all", help="Include rotated archives"),
 ) -> None:
     """Show the most recent journal entries (newest first)."""
+    out.non_negative(n, "--number")
     store = ctx.obj["store"]
     entries = list(store.journal.read(
         op=op, actor=actor, memory_id=memory_id,
         include_archives=include_archives,
     ))
-    entries = entries[-n:][::-1]
+    # `entries[-0:]` is the whole list, so ask for none explicitly.
+    entries = entries[-n:][::-1] if n else []
     if not entries:
         typer.echo("(no journal entries)")
         return

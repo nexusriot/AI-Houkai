@@ -16,7 +16,7 @@ class TestLink:
         a = _mem(store, "procedural rule A")
         b = _mem(store, "example of rule A")
         store.link(a, b, rel="example_of")
-        src = store._get_by_id(a)
+        src = store.get(a)
         assert any(l.to == b and l.rel == "example_of" for l in src.links)
 
     def test_link_is_idempotent(self, store: MemoryStore):
@@ -24,7 +24,7 @@ class TestLink:
         b = _mem(store, "bar")
         store.link(a, b, rel="related")
         store.link(a, b, rel="related")
-        src = store._get_by_id(a)
+        src = store.get(a)
         assert sum(1 for l in src.links if l.to == b and l.rel == "related") == 1
 
     def test_link_self_raises(self, store: MemoryStore):
@@ -42,7 +42,7 @@ class TestLink:
         b = _mem(store, "child")
         store.link(a, b, rel="refines")
         store.link(a, b, rel="example_of")
-        src = store._get_by_id(a)
+        src = store.get(a)
         rels = {l.rel for l in src.links if l.to == b}
         assert rels == {"refines", "example_of"}
 
@@ -50,7 +50,7 @@ class TestLink:
         a = _mem(store, "a")
         b = _mem(store, "b")
         store.link(a, b)
-        src = store._get_by_id(a)
+        src = store.get(a)
         assert any(l.rel == "related" for l in src.links)
 
 
@@ -62,7 +62,7 @@ class TestUnlink:
         store.link(a, b, rel="related")
         removed = store.unlink(a, b, rel="refines")
         assert removed == 1
-        src = store._get_by_id(a)
+        src = store.get(a)
         assert not any(l.rel == "refines" for l in src.links)
         assert any(l.rel == "related" for l in src.links)
 
@@ -73,7 +73,7 @@ class TestUnlink:
         store.link(a, b, rel="related")
         removed = store.unlink(a, b, rel=None)
         assert removed == 2
-        src = store._get_by_id(a)
+        src = store.get(a)
         assert not any(l.to == b for l in src.links)
 
     def test_unlink_nonexistent_returns_zero(self, store: MemoryStore):
@@ -176,14 +176,14 @@ class TestLinkMetadataRoundtrip:
         b = _mem(store, "child")
         store.link(a, b, rel="derived_from")
         # reload from DB
-        reloaded = store._get_by_id(a)
+        reloaded = store.get(a)
         assert len(reloaded.links) == 1
         assert reloaded.links[0].to == b
         assert reloaded.links[0].rel == "derived_from"
 
     def test_memory_with_no_links_loads_empty_list(self, store: MemoryStore):
         a = _mem(store, "plain memory")
-        reloaded = store._get_by_id(a)
+        reloaded = store.get(a)
         assert reloaded.links == []
 
     def test_multiple_links_roundtrip(self, store: MemoryStore):
@@ -192,7 +192,7 @@ class TestLinkMetadataRoundtrip:
         c = _mem(store, "c")
         store.link(a, b, rel="refines")
         store.link(a, c, rel="example_of")
-        reloaded = store._get_by_id(a)
+        reloaded = store.get(a)
         link_map = {l.to: l.rel for l in reloaded.links}
         assert link_map[b] == "refines"
         assert link_map[c] == "example_of"

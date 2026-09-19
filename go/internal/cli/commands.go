@@ -201,13 +201,20 @@ func newListCmd() *cobra.Command {
 			if sortBy != "created" && sortBy != "importance" {
 				return fmt.Errorf("--sort must be 'created' or 'importance', got %q", sortBy)
 			}
+			// Checked with the other flags, before a store is opened: a bad
+			// flag is not worth loading a collection to discover.
+			if limit < 0 {
+				return fmt.Errorf("--limit must be >= 0 — got %d", limit)
+			}
 			sinceTS, _, err := timeparse.Parse(since)
 			if err != nil {
 				return err
 			}
 			store := storeFromCtx(cmd.Context())
 			// Fetch unbounded, then filter/sort/limit client-side (matching Python).
-			mems, err := store.ListRecent(cmd.Context(), 0, inclSup, inclExp)
+			mems, err := store.ListRecentPage(cmd.Context(), memory.ListRecentOpts{
+				IncludeSuperseded: inclSup, IncludeExpired: inclExp,
+			})
 			if err != nil {
 				return err
 			}
@@ -227,7 +234,10 @@ func newListCmd() *cobra.Command {
 			if sortBy == "importance" {
 				sortByImportance(filtered)
 			}
-			if limit > 0 && len(filtered) > limit {
+			// limit is literal, matching the Python CLI and the store:
+			// 0 lists nothing. Reading it as "unbounded" — which this did —
+			// handed the whole store to a caller whose page budget ran out.
+			if len(filtered) > limit {
 				filtered = filtered[:limit]
 			}
 			rows := make([]MemRow, len(filtered))
@@ -1229,7 +1239,7 @@ func newStatsCmd() *cobra.Command {
 				if cmd.Flags().Changed("frequency-weight") {
 					freqWeight = freqWeightFlag
 				}
-				active, err := store.ListRecent(cmd.Context(), 0, false, false)
+				active, err := store.ListRecentPage(cmd.Context(), memory.ListRecentOpts{})
 				if err != nil {
 					return err
 				}

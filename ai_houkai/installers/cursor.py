@@ -24,33 +24,40 @@ CLI use (also exposed as the `ai-houkai-install-cursor` console script):
     python -m ai_houkai.installers.cursor --project        # ./.cursor/mcp.json
     python -m ai_houkai.installers.cursor --verify
     python -m ai_houkai.installers.cursor --rule
+
+Everything that is not Cursor-specific — the merge-and-write install, the
+preview, verify, and the argparse front end — lives in
+:class:`ai_houkai.installers.common.JSONConfigInstaller`.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import sys
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+from typing import ClassVar, Optional
 
 from ai_houkai.installers.common import (
+    DEFAULT_MEMORY_PATH,
     MEMORY_GUIDE,
-    load_json,
-    resolve_mcp_command,
-    verify_server,
-    write_json,
+    SERVER_NAME,
+    JSONConfigInstaller,
 )
 
 GLOBAL_CONFIG_PATH  = os.path.expanduser("~/.cursor/mcp.json")
 PROJECT_CONFIG_PATH = os.path.join(".cursor", "mcp.json")
-# `.chroma` leaf matches the CLI default (~/.ai_houkai/.chroma) so `houkai
-# list` sees installed-client memories, and the store's journal.log lands in
-# ~/.ai_houkai/ instead of $HOME (it is written to the store path's parent).
-DEFAULT_MEMORY_PATH = os.path.expanduser("~/.ai_houkai/.chroma")
 DEFAULT_COLLECTION  = "cursor"
-SERVER_NAME         = "ai-houkai"
+
+# Re-exported from common so `from ai_houkai.installers.cursor import
+# DEFAULT_MEMORY_PATH` keeps working; the values are shared across clients.
+__all__ = [
+    "CursorInstaller",
+    "DEFAULT_COLLECTION",
+    "DEFAULT_MEMORY_PATH",
+    "GLOBAL_CONFIG_PATH",
+    "PROJECT_CONFIG_PATH",
+    "RULE_SNIPPET",
+    "SERVER_NAME",
+]
 
 
 # Cursor reads project rules from `.cursor/rules/*.mdc` — Markdown with a small
@@ -66,63 +73,28 @@ RULE_SNIPPET = (
 
 
 @dataclass
-class CursorInstaller:
+class CursorInstaller(JSONConfigInstaller):
     """Register the AI-Houkai MCP server with Cursor."""
 
-    memory_path:   str = DEFAULT_MEMORY_PATH
-    collection:    str = DEFAULT_COLLECTION
-    settings_path: str = GLOBAL_CONFIG_PATH
-    server_name:   str = SERVER_NAME
-    extra_env:     dict = field(default_factory=dict)
-
-    @property
-    def mcp_command(self) -> str:
-        return resolve_mcp_command()
+    client_name:         ClassVar[str] = "Cursor"
+    slug:                ClassVar[str] = "cursor"
+    config_key:          ClassVar[str] = "mcpServers"
+    default_collection:  ClassVar[str] = DEFAULT_COLLECTION
+    global_config_path:  ClassVar[str] = GLOBAL_CONFIG_PATH
+    project_config_path: ClassVar[str] = PROJECT_CONFIG_PATH
+    preview_hint:        ClassVar[str] = (
+        "Then reload Cursor and open Settings → MCP to confirm "
+        "'{server_name}' is listed.")
+    installed_hint:      ClassVar[str] = "Reload Cursor, then check Settings → MCP."
+    snippet_flag:        ClassVar[str] = "rule"
+    snippet_help:        ClassVar[str] = (
+        "Print a .cursor/rules/*.mdc memory-usage snippet")
+    snippet_heading:     ClassVar[str] = ".cursor/rules/ai-houkai-memory.mdc"
+    snippet:             ClassVar[str] = RULE_SNIPPET
+    snippet_trailer:     ClassVar[str] = "\n\n"
 
     def build_mcp_block(self) -> dict:
-        env = {
-            "AI_HOUKAI_PATH":       self.memory_path,
-            "AI_HOUKAI_COLLECTION": self.collection,
-            **self.extra_env,
-        }
-        return {"command": self.mcp_command, "env": env}
-
-    def build_settings_block(self) -> dict:
-        return {"mcpServers": {self.server_name: self.build_mcp_block()}}
-
-    def install(self, *, overwrite_unparseable: bool = False) -> str:
-        """Patch the Cursor mcp.json with the MCP server block. Returns the path."""
-        config = load_json(self.settings_path,
-                           overwrite_unparseable=overwrite_unparseable)
-        config.setdefault("mcpServers", {})
-        config["mcpServers"][self.server_name] = self.build_mcp_block()
-        return write_json(self.settings_path, config)
-
-    def print_config(self, *, stream=sys.stdout) -> None:
-        block = self.build_settings_block()
-        print(f"\nPaste this into {self.settings_path}:\n", file=stream)
-        print(json.dumps(block, indent=2), file=stream)
-        print("\nThen reload Cursor and open Settings → MCP to confirm "
-              f"'{self.server_name}' is listed.\n", file=stream)
-
-    def verify(self, *, stream=sys.stdout) -> bool:
-        ok = verify_server(memory_path=self.memory_path,
-                           collection=self.collection, stream=stream)
-        if os.path.isfile(self.settings_path):
-            try:
-                cfg = load_json(self.settings_path)
-            except ValueError as exc:
-                print(f"  warn {exc}", file=stream)
-                cfg = {}
-            if self.server_name in cfg.get("mcpServers", {}):
-                print(f"  ok   registered in {self.settings_path}", file=stream)
-            else:
-                print(f"  warn not yet in {self.settings_path} — run --install",
-                      file=stream)
-        else:
-            print(f"  warn {self.settings_path} not found — run --install",
-                  file=stream)
-        return ok
+        return {"command": self.mcp_command, "env": self.build_env()}
 
     @staticmethod
     def rule_snippet() -> str:
@@ -130,62 +102,7 @@ class CursorInstaller:
 
 
 def _main(argv: Optional[list] = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="ai-houkai-install-cursor",
-        description="Register the AI-Houkai MCP server with Cursor.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ap.add_argument("--install", action="store_true",
-                    help="Write the MCP block to Cursor's mcp.json")
-    ap.add_argument("--project", action="store_true",
-                    help=f"Target ./{PROJECT_CONFIG_PATH} instead of the global config")
-    ap.add_argument("--memory-path", default=DEFAULT_MEMORY_PATH, metavar="PATH",
-                    help=f"ChromaDB directory (default: {DEFAULT_MEMORY_PATH})")
-    ap.add_argument("--collection", default=DEFAULT_COLLECTION,
-                    help=f"Collection name (default: {DEFAULT_COLLECTION})")
-    ap.add_argument("--settings", default=None,
-                    help="Explicit path to mcp.json (overrides --project)")
-    ap.add_argument("--verify", action="store_true",
-                    help="Smoke-test the MCP server + check registration")
-    ap.add_argument("--rule", action="store_true",
-                    help="Print a .cursor/rules/*.mdc memory-usage snippet")
-    args = ap.parse_args(argv)
-
-    settings_path = (args.settings
-                     or (PROJECT_CONFIG_PATH if args.project else GLOBAL_CONFIG_PATH))
-
-    inst = CursorInstaller(
-        memory_path=args.memory_path,
-        collection=args.collection,
-        settings_path=settings_path,
-    )
-
-    print("\nAI-Houkai · Cursor installer")
-    print(f"  Config file : {inst.settings_path}")
-    print(f"  Memory path : {inst.memory_path}")
-    print(f"  MCP command : {inst.mcp_command}\n")
-
-    if args.verify:
-        if not inst.verify():
-            return 1
-
-    if args.rule:
-        print("\n.cursor/rules/ai-houkai-memory.mdc\n")
-        print(inst.rule_snippet())
-        print("\n\n")
-
-    if args.install:
-        try:
-            path = inst.install()
-        except ValueError as exc:
-            print(f"  err  {exc}")
-            return 1
-        print(f"  written: {path}")
-        print("  Reload Cursor, then check Settings → MCP.\n")
-    elif not (args.verify or args.rule):
-        inst.print_config()
-        print("  Run with --install to write this automatically.\n")
-    return 0
+    return CursorInstaller.main(argv)
 
 
 if __name__ == "__main__":

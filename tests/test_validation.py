@@ -342,11 +342,11 @@ class TestTagValidation:
         m = store.remember("tagged ok", tags=["fine"])
         with pytest.raises(ValueError, match="comma"):
             store.edit(m.id, tags=["still,broken"])
-        assert store._get_by_id(m.id).tags == ["fine"]
+        assert store.get(m.id).tags == ["fine"]
 
     def test_normal_tags_unaffected(self, store: MemoryStore):
         m = store.remember("tagged fine", tags=["a-b", "c_d", "e.f"])
-        assert store._get_by_id(m.id).tags == ["a-b", "c_d", "e.f"]
+        assert store.get(m.id).tags == ["a-b", "c_d", "e.f"]
 
 
 class TestHttpPackCoercionAndFields:
@@ -388,3 +388,82 @@ class TestHttpPackCoercionAndFields:
         status, body = _req(server, "POST", "/supersede",
                             {"old_id": a.id, "new_id": a.id})
         assert status == 400
+
+
+class TestZeroMeansZero:
+    """A numeric knob a caller supplies means what it says.
+
+    These were emergent in Python (``for _ in range(depth)``, ``memories[:0]``)
+    and therefore unasserted, while the Go port read the same zero as "unset"
+    and substituted a default. ``?limit=0`` returned the whole store there,
+    ``?depth=0`` walked a hop, ``token_budget=0`` packed a full context block.
+    Pinning the Python side keeps the contract the Go port now matches from
+    drifting back.
+
+    The zero worth defending is the computed one — ``limit = min(remaining,
+    page)``, a depth budget walked down to nothing — where answering with
+    everything is the worst available answer.
+    """
+
+    def test_list_recent_limit_zero_returns_nothing(self, store) -> None:
+        for i in range(3):
+            store.remember(text=f"zero limit subject {i}")
+        assert store.list_recent(limit=0) == []
+        assert len(store.list_recent(limit=2)) == 2
+
+    def test_list_recent_rejects_a_negative_limit(self, store) -> None:
+        store.remember(text="negative limit subject")
+        with pytest.raises(ValueError, match="limit"):
+            store.list_recent(limit=-1)
+
+    def test_neighbors_depth_zero_reaches_nothing(self, store) -> None:
+        a = store.remember(text="depth zero source")
+        b = store.remember(text="depth zero target")
+        store.link(a.id, b.id, "related")
+        assert store.neighbors(a.id, depth=0) == []
+        assert store.neighbors(a.id, depth=-1) == []
+        assert len(store.neighbors(a.id, depth=1)) == 1
+
+    def test_recall_pack_zero_budget_packs_nothing(self, store) -> None:
+        store.remember(text="budget subject one")
+        store.remember(text="budget subject two")
+        packed = store.recall_pack("budget subject", token_budget=0)
+        assert packed.items == []
+        assert "budget subject" not in packed.text
+
+    def test_auto_context_pack_zero_budget_packs_nothing(self, store) -> None:
+        store.remember(text="auto budget subject")
+        packed = store.auto_context_pack("auto budget subject", token_budget=0)
+        assert packed.items == []
+
+    def test_a_real_budget_still_packs(self, store) -> None:
+        """The other half of the contract: a sane budget must still fill."""
+        store.remember(text="packable subject with real content")
+        assert store.recall_pack("packable subject", token_budget=800).items
+
+
+class TestBlankTagRejected:
+    """A tag of nothing but spaces is a write no reader can use: it renders as
+    an empty cell in `houkai tags list` and cannot be typed back in to select
+    anything. Only-whitespace is rejected; a tag that *contains* a space is
+    ordinary and stays legal."""
+
+    def test_remember_rejects_a_blank_tag(self, store) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            store.remember(text="blank tag subject", tags=["   "])
+
+    def test_rename_to_a_blank_tag_is_rejected(self, store) -> None:
+        store.remember(text="rename blank subject", tags=["keepme"])
+        with pytest.raises(ValueError, match="empty"):
+            store.rename_tag("keepme", "  ")
+
+    def test_merge_into_a_blank_tag_is_rejected(self, store) -> None:
+        store.remember(text="merge blank subject", tags=["keepme"])
+        with pytest.raises(ValueError, match="empty"):
+            store.merge_tags(["keepme"], "\t")
+
+    def test_a_tag_containing_a_space_is_still_fine(self, store) -> None:
+        mem = store.remember(text="spacey tag subject", tags=["my tag"])
+        assert store.get(mem.id).tags == ["my tag"]
+        renamed = store.rename_tag("my tag", "your tag")
+        assert renamed.changed == 1

@@ -28,7 +28,7 @@ class TestEditStore:
         store.remember("Paris is a lovely European city")
         store.edit(m.id, text="the capital of France is Paris")
 
-        got = store._get_by_id(m.id)
+        got = store.get(m.id)
         assert got.text == "the capital of France is Paris"
         hits = store.recall("what is the capital of France?", k=1)
         assert hits and hits[0][0].id == m.id
@@ -37,10 +37,10 @@ class TestEditStore:
         m = store.remember("original", tags=["keep"])
         other = store.remember("other")
         store.link(m.id, other.id, "refines")
-        before = store._get_by_id(m.id)
+        before = store.get(m.id)
 
         store.edit(m.id, text="rewritten")
-        after = store._get_by_id(m.id)
+        after = store.get(m.id)
 
         assert after.id == m.id
         assert after.created_at == before.created_at
@@ -52,7 +52,7 @@ class TestEditStore:
                            source="orig", polarity=0)
         store.edit(m.id, type="semantic", importance=0.9, polarity=1,
                    tags=["a", "b"])
-        got = store._get_by_id(m.id)
+        got = store.get(m.id)
         assert got.type == "semantic"
         assert got.importance == 0.9
         assert got.polarity == 1
@@ -62,14 +62,14 @@ class TestEditStore:
     def test_edit_source_none_clears_omitted_keeps(self, store: MemoryStore):
         m = store.remember("with source", source="cli")
         store.edit(m.id, importance=0.7)     # source omitted
-        assert store._get_by_id(m.id).source == "cli"
+        assert store.get(m.id).source == "cli"
         store.edit(m.id, source=None)        # explicit clear
-        assert store._get_by_id(m.id).source is None
+        assert store.get(m.id).source is None
 
     def test_edit_importance_clamped(self, store: MemoryStore):
         m = store.remember("x" * 30)
         store.edit(m.id, importance=7.5)
-        assert store._get_by_id(m.id).importance == 1.0
+        assert store.get(m.id).importance == 1.0
 
     def test_edit_missing_id_raises(self, store: MemoryStore):
         with pytest.raises(KeyError):
@@ -105,7 +105,7 @@ class TestEditStore:
         entry = list(store.journal.read(op="edit"))[-1]
 
         assert store.undo(entry) is True
-        got = store._get_by_id(m.id)
+        got = store.get(m.id)
         assert got.text == "version one"
         assert got.importance == 0.4
         assert got.tags == ["t1"]
@@ -166,7 +166,7 @@ class TestEditCli:
         m = store.remember("bump me please", importance=0.5)
         res = self._run(path, ["bump", m.id, "+0.2"])
         assert res.exit_code == 0, res.output
-        assert store._get_by_id(m.id).importance == pytest.approx(0.7)
+        assert store.get(m.id).importance == pytest.approx(0.7)
         assert any(e.id == m.id for e in store.journal.read(op="edit"))
 
     def test_bump_bad_delta_clean_error(self, cli_store):
@@ -182,7 +182,7 @@ class TestEditCli:
         m = store.remember("tag me please", tags=["old"])
         res = self._run(path, ["tag", m.id, "--add", "new", "--remove", "old"])
         assert res.exit_code == 0, res.output
-        assert store._get_by_id(m.id).tags == ["new"]
+        assert store.get(m.id).tags == ["new"]
         assert any(e.id == m.id for e in store.journal.read(op="edit"))
 
 
@@ -214,7 +214,7 @@ class TestEditHttp:
         assert status == 200
         assert body["text"] == "http edited"
         assert body["importance"] == 0.9
-        assert store._get_by_id(m.id).text == "http edited"
+        assert store.get(m.id).text == "http edited"
 
     def test_patch_missing_id_404(self, server):
         status, _ = self._req(server, "PATCH",

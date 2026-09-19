@@ -25,6 +25,7 @@ so the ``houkai`` / ``ai-houkai-serve`` entry points are on PATH.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import os
 import shutil
@@ -704,3 +705,115 @@ def test_http_new_routes(http_server):
     assert status == 400
     status, wiped = _http("POST", f"{base}/nuke", {"confirm": "DELETE ALL"})
     assert status == 200 and wiped["ok"] is True
+
+
+def _gz(path, *lines: str):
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    return str(path)
+
+
+def test_cli_rejects_every_shape_of_broken_archive(tmp_path):
+    """A corrupt .ahkai must exit 1 with one `Error:` line — never a traceback.
+
+    Worth an end-to-end test rather than only a unit one: the failure it
+    guards against was the *rendered* output of the installed console script.
+    A gzip failure is OSError, not the ImportError the command catches, so
+    `houkai import` on a plain .json printed a rich traceback panel where
+    every sibling corruption printed a single line.
+    """
+    store = str(tmp_path / "chroma")
+
+    plain = tmp_path / "plain.ahkai"
+    plain.write_text('{"format": "ai-houkai/export", "version": 1}\n')
+
+    whole = gzip.compress(
+        b'{"format": "ai-houkai/export", "version": 1}\n'
+        b'{"id": "a", "text": "t", "meta": {}}\n')
+    truncated = tmp_path / "truncated.ahkai"
+    truncated.write_bytes(whole[: len(whole) // 2])
+
+    cases = {
+        "not gzipped":   str(plain),
+        "truncated":     str(truncated),
+        "empty":         _gz(tmp_path / "empty.ahkai"),
+        "bad header":    _gz(tmp_path / "nonjson.ahkai", "this is not json"),
+        "foreign format": _gz(tmp_path / "foreign.ahkai",
+                              '{"format": "someone-elses/export", "version": 1}'),
+        "future version": _gz(tmp_path / "future.ahkai",
+                              '{"format": "ai-houkai/export", "version": 99}'),
+    }
+
+    for label, path in cases.items():
+        proc = houkai(store, "import", "-y", path, check=False)
+        assert proc.returncode == 1, f"{label}: rc={proc.returncode}\n{proc.stdout}"
+        combined = proc.stdout + proc.stderr
+        assert "Traceback" not in combined, f"{label} printed a traceback"
+        assert "Error:" in combined, f"{label}: no clean error line\n{combined}"
+
+    # …and the store is untouched by any of them.
+    assert houkai_json(store, "stats", "--format", "json")["total"] == 0
+
+
+def test_cli_info_refuses_a_file_import_would_refuse(tmp_path):
+    """`houkai info` answers "can I import this?", so it applies import's
+    header checks rather than printing a memory count for a foreign file."""
+    foreign = _gz(tmp_path / "foreign.ahkai",
+                  '{"format": "someone-elses/export", "version": 1}',
+                  '{"anything": 1}')
+    proc = subprocess.run(["houkai", "info", foreign], capture_output=True,
+                          text=True, timeout=_CLI_TIMEOUT)
+    assert proc.returncode == 1
+    assert "not an ai-houkai export" in proc.stdout + proc.stderr
+    assert "memories on disk" not in proc.stdout
+
+    future = _gz(tmp_path / "future.ahkai",
+                 '{"format": "ai-houkai/export", "version": 99}')
+    proc = subprocess.run(["houkai", "info", future], capture_output=True,
+                          text=True, timeout=_CLI_TIMEOUT)
+    assert "version 99" in proc.stdout + proc.stderr
+    assert "refuse" in proc.stdout + proc.stderr
+
+
+def test_cli_info_opens_no_store(tmp_path):
+    """The installed `houkai info` must not build a store for a command that
+    only reads a gzip header.
+
+    The root callback used to construct a MemoryStore before dispatching any
+    subcommand: `houkai info` spent twelve seconds loading
+    sentence-transformers and left a chroma.sqlite3 behind. Only an
+    out-of-process run proves it — the cost is the real model load, and the
+    evidence is a directory that must not appear.
+    """
+    store = tmp_path / "never-created"
+    archive = _gz(tmp_path / "real.ahkai",
+                  '{"format": "ai-houkai/export", "version": 1}')
+
+    started = time.time()
+    proc = houkai(str(store), "info", archive)
+    elapsed = time.time() - started
+
+    assert proc.returncode == 0, proc.stderr
+    assert not store.exists(), (
+        f"`houkai info` created a store at {store} — it reads a gzip header")
+    # Generous: this is about not loading a model at all, not about shaving
+    # milliseconds. A full sentence-transformers load is ~10s on this path.
+    assert elapsed < 8, f"`houkai info` took {elapsed:.1f}s — is it still building a store?"
+
+
+def test_cli_list_limit_zero_returns_nothing(tmp_path):
+    """A supplied zero means zero, through the installed CLI.
+
+    The Go port read the same zero as "unset" and returned the whole store;
+    this pins the answer a paging caller gets from the deployed command.
+    """
+    store = str(tmp_path / "chroma")
+    for i in range(3):
+        remember(store, f"limit zero subject {i}")
+
+    assert houkai_json(store, "list", "--limit", "0", "--format", "json") == []
+    assert len(houkai_json(store, "list", "--limit", "2", "--format", "json")) == 2
+
+    proc = houkai(store, "list", "--limit", "-1", check=False)
+    assert proc.returncode != 0, "a negative limit must not return the store"

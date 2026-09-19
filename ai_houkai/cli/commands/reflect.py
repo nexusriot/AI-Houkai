@@ -33,7 +33,6 @@ def reflect(
 ) -> None:
     """Cluster episodic memories and synthesise semantic summaries. Dry-run by default."""
 
-
     store = ctx.obj["store"]
     spec = summarizer if summarizer is not None else load_maintenance().summarizer
     try:

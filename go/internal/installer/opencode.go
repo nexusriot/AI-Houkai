@@ -48,60 +48,34 @@ func DefaultOpenCodeInstaller() OpenCodeInstaller {
 	}
 }
 
-func (i OpenCodeInstaller) mcpCommand() string {
-	if i.BinaryPath != "" {
-		return i.BinaryPath
-	}
-	return ResolveMCPCommand()
-}
-
 func (i OpenCodeInstaller) buildMCPBlock() map[string]any {
-	environment := map[string]any{
-		"AI_HOUKAI_PATH":       i.MemoryPath,
-		"AI_HOUKAI_COLLECTION": i.Collection,
-	}
-	for k, v := range i.ExtraEnv {
-		environment[k] = v
-	}
 	return map[string]any{
 		"type":        "local",
-		"command":     []string{i.mcpCommand()},
+		"command":     []string{mcpCommand(i.BinaryPath)},
 		"enabled":     true,
-		"environment": environment,
+		"environment": serverEnv(i.MemoryPath, i.Collection, i.ExtraEnv),
 	}
 }
 
 // Install patches opencode.json with the MCP server block and returns the
 // written path.
 func (i OpenCodeInstaller) Install() (string, error) {
-	path := expandHome(i.SettingsPath)
-	config := loadJSONFile(path)
-	if _, ok := config["$schema"]; !ok {
-		config["$schema"] = OpenCodeConfigSchemaURL
-	}
-	servers, _ := config["mcp"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
-	}
-	servers[i.ServerName] = i.buildMCPBlock()
-	config["mcp"] = servers
-	return path, writeJSONFile(path, config)
+	return mergeServerBlock(i.SettingsPath, "mcp", i.ServerName,
+		i.buildMCPBlock(),
+		map[string]any{"$schema": OpenCodeConfigSchemaURL})
 }
 
 // Verify returns true if the server entry exists in opencode.json.
 func (i OpenCodeInstaller) Verify() bool {
-	config := loadJSONFile(expandHome(i.SettingsPath))
-	servers, _ := config["mcp"].(map[string]any)
-	_, ok := servers[i.ServerName]
-	return ok
+	return hasServer(i.SettingsPath, "mcp", i.ServerName)
 }
 
 // PrintConfig prints the MCP block for manual pasting.
 func (i OpenCodeInstaller) PrintConfig() {
-	block := map[string]any{
-		"$schema": OpenCodeConfigSchemaURL,
-		"mcp":     map[string]any{i.ServerName: i.buildMCPBlock()},
-	}
-	fmt.Printf("\nPaste this into %s:\n\n%s\n", i.SettingsPath, printJSONBlock(block))
-	fmt.Printf("\nThen restart OpenCode — %q tools become available to the agent.\n\n", i.ServerName)
+	printPasteBlock(i.SettingsPath,
+		map[string]any{
+			"$schema": OpenCodeConfigSchemaURL,
+			"mcp":     map[string]any{i.ServerName: i.buildMCPBlock()},
+		},
+		fmt.Sprintf("Then restart OpenCode — %q tools become available to the agent.", i.ServerName))
 }

@@ -88,7 +88,7 @@ houkai install                          # patches ~/.claude/settings.json
 houkai install --project                # → ./.claude/settings.json
 ```
 
-After restarting Claude Code, all 22 `mcp__ai-houkai__*` tools become
+After restarting Claude Code, all 41 `mcp__ai-houkai__*` tools become
 available. Cursor and OpenCode are supported too — see
 [Other MCP clients](#other-mcp-clients).
 
@@ -135,7 +135,7 @@ Notes:
 - Restart Claude Code (or run `/mcp` and re-add the server) for it to pick
   up the change. To verify the binary works in isolation, run
   `echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ai-houkai-mcp`
-  — you should see the 22 tool definitions on stdout.
+  — you should see the 41 tool definitions on stdout.
 
 To print the exact block the installer would write without touching any
 file, run `houkai install --print`.
@@ -664,7 +664,7 @@ internal/
   maintenance/      Schedule-gated prune + reflect + purge ticks (flock-guarded state)
   ingest/           Deterministic chunking for bulk ingestion
   tui/              Bubble Tea memory browser (navigator + view-models)
-  mcpserver/        22 MCP tool definitions
+  mcpserver/        41 MCP tool definitions
   cli/              cobra commands, config resolver, output formatting
   installer/        config patchers for Claude Code, Cursor, OpenCode
   version/          ldflags-injected build info

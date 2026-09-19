@@ -75,7 +75,11 @@ func EstimateTokens(text string) int {
 
 // PackOpts holds optional RecallPack parameters.
 type PackOpts struct {
-	TokenBudget       int // default 800
+	// TokenBudget caps the rendered memory lines. It is taken literally — an
+	// explicit 0 packs nothing, which is what a caller computing a remaining
+	// budget means — so every caller sets it; DefaultTokenBudget is the value
+	// the CLI, HTTP and MCP surfaces apply when the client omits it.
+	TokenBudget       int
 	Type              MemoryType
 	Tag               string
 	MinImportance     float32
@@ -132,9 +136,6 @@ const defaultPackHeader = "## Relevant memory"
 // counted against it. The default ~4-chars/token estimate makes the budget a
 // soft ceiling unless an exact TokenCounter is supplied.
 func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpts) (PackResult, error) {
-	if opts.TokenBudget == 0 {
-		opts.TokenBudget = 800
-	}
 	if opts.Mode == "" {
 		opts.Mode = ModeHybrid
 	}
@@ -184,6 +185,12 @@ func (s *MemoryStore) RecallPack(ctx context.Context, query string, opts PackOpt
 	return packRanked(ranked, opts.TokenBudget, countFn, header,
 		opts.Compress, opts.CompressThreshold, opts.CompressMinGroup), nil
 }
+
+// DefaultTokenBudget is the budget the CLI, HTTP and MCP surfaces use when the
+// caller does not name one. It lives here rather than inside RecallPack so an
+// explicit TokenBudget of 0 stays a request to pack nothing — the same rule
+// AutoContextOpts.MaxPhrases already follows.
+const DefaultTokenBudget = 800
 
 // packRanked greedily packs already-ranked (memory, score) results to a token
 // budget, optionally compressing budget-dropped candidates into summary lines.

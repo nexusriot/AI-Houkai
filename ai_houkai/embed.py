@@ -237,7 +237,6 @@ class OpenAICompatibleEmbedder:
     def name(self) -> str:
         return f"ai_houkai.openai_compatible:{self.model}"
 
-
     def __call__(self, input: Sequence[str]) -> list[list[float]]:  # noqa: A002
         texts = list(input)
         if not texts:
@@ -286,7 +285,6 @@ class OllamaEmbedder:
 
     def name(self) -> str:
         return f"ai_houkai.ollama:{self.model}"
-
 
     def __call__(self, input: Sequence[str]) -> list[list[float]]:  # noqa: A002
         texts = list(input)

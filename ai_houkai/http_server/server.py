@@ -373,7 +373,10 @@ def _remember_many(store: MemoryStore, m, q, b):
     if not isinstance(raw, list):
         raise HttpError(400, "body must include an 'items' array")
     if not raw:
-        return 201, {"stored": 0, "memories": []}
+        # 200, not 201: an empty batch creates nothing, which is the same rule
+        # the created-id count applies below. This early return predated that
+        # rule and kept claiming Created for zero creations.
+        return 200, {"stored": 0, "memories": []}
     items: list[RememberItem] = []
     for i, it in enumerate(raw):
         if not isinstance(it, dict):

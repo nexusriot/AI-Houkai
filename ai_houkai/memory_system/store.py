@@ -71,6 +71,13 @@ CONFLICT_POLICIES: tuple[str, ...] = ("ignore", "warn", "supersede", "raise")
 IMPORT_POLICIES:   tuple[str, ...] = ("skip", "overwrite", "rename", "error")
 DIRECTIONS:        tuple[str, ...] = ("out", "in", "both")
 
+# The portable archive: what `export` stamps into the header, and what
+# `import_` (and `houkai info`) check it against. One definition, because
+# three hand-written copies of a format marker is how a reader and a writer
+# start disagreeing about what they are exchanging.
+EXPORT_FORMAT  = "ai-houkai/export"
+EXPORT_VERSION = 1
+
 
 def _validate_choice(value: object, allowed: tuple[str, ...], param: str) -> None:
     """Raise ValueError naming the parameter and the allowed vocabulary."""
@@ -126,14 +133,27 @@ def _is_valid_at(mem: "Memory", ts: float) -> bool:
 
 
 def _validate_tags(tags: list[str]) -> None:
-    """Tags are stored comma-joined in Chroma metadata, so a comma inside a
-    tag would silently split it into two on the next read."""
+    """Reject tags the write path cannot round-trip or a reader cannot use.
+
+    Two rules, and they have to be the same two the curation path enforces
+    (``curation._validate_tag``) or a caller can *create* a tag that
+    ``rename_tag`` then refuses to touch:
+
+    * **No commas.** Tags are stored comma-joined in Chroma metadata, so a
+      comma inside one would silently split it into two on the next read.
+    * **Nothing blank.** ``""`` is swallowed by that same join and never
+      appears again, and a tag of spaces reaches ``houkai tags list`` as an
+      empty row that cannot be typed back in to select anything. A tag that
+      merely *contains* a space is ordinary and stays legal.
+    """
     for t in tags:
         if "," in t:
             raise ValueError(
                 f"tags must not contain commas — got {t!r} "
                 f"(tags are stored as a comma-joined string)"
             )
+        if not t.strip():
+            raise ValueError(f"tag must not be empty — got {t!r}")
 
 
 # Backwards-compatible alias: the local sentence-transformers loader moved to
@@ -2571,7 +2591,6 @@ class MemoryStore(CurationMixin):
 
         return Graph(nodes=nodes, edges=edges)
 
-
     def export(
         self,
         path: str | Path,
@@ -2648,8 +2667,8 @@ class MemoryStore(CurationMixin):
             kept.append(k)
 
         header = {
-            "format":      "ai-houkai/export",
-            "version":     1,
+            "format":      EXPORT_FORMAT,
+            "version":     EXPORT_VERSION,
             "exported_at": t0,
             "source": {
                 "collection":      self.collection_name,
@@ -2782,19 +2801,29 @@ class MemoryStore(CurationMixin):
         collisions: list[tuple[str, str]] = []
 
         with gzip.open(in_path, "rt", encoding="utf-8") as f:
-            header_line = f.readline()
+            # An .ahkai file is caller-supplied data, so every way it can be
+            # wrong has to read as one kind of error. Decompression failures
+            # are OSError (BadGzipFile) / EOFError (truncated mid-stream) and
+            # used to escape as themselves: pointing `houkai import` at a
+            # plain .json printed a raw traceback where every other corruption
+            # printed one clean line, and the HTTP route answered 500.
+            try:
+                header_line = f.readline()
+            except (OSError, EOFError) as e:
+                raise ImportError(
+                    f"{in_path}: not a gzipped ai-houkai export ({e})") from e
             if not header_line:
                 raise ImportError(f"{in_path}: empty file")
             try:
                 header = json.loads(header_line)
             except json.JSONDecodeError as e:
                 raise ImportError(f"{in_path}: not an ai-houkai export ({e})")
-            if header.get("format") != "ai-houkai/export":
+            if header.get("format") != EXPORT_FORMAT:
                 raise ImportError(f"{in_path}: missing/bad format header")
-            if int(header.get("version", 0)) > 1:
+            if int(header.get("version", 0)) > EXPORT_VERSION:
                 raise ImportError(
                     f"{in_path}: written by ai-houkai with version "
-                    f"{header['version']} > reader version 1"
+                    f"{header['version']} > reader version {EXPORT_VERSION}"
                 )
             src = header.get("source") or {}
             src_model = src.get("embedding_model")
@@ -2818,14 +2847,21 @@ class MemoryStore(CurationMixin):
             # detect ALL collisions before the first write — an aborted
             # import must leave the store untouched.
             rows: list[dict[str, Any]] = []
-            for lineno, line in enumerate(f, 2):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    summary.errors.append((f"line:{lineno}", f"bad json: {e}"))
+            try:
+                for lineno, line in enumerate(f, 2):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        summary.errors.append(
+                            (f"line:{lineno}", f"bad json: {e}"))
+            except (OSError, EOFError) as e:
+                # A stream that stops mid-member: the header read fine, so the
+                # file IS an export — it is just truncated. Same error class as
+                # every other unusable archive.
+                raise ImportError(f"{in_path}: truncated archive ({e})") from e
 
         if on_conflict == "error":
             seen_ids: set[str] = set()
@@ -3152,7 +3188,9 @@ class MemoryStore(CurationMixin):
 
     # Deprecated private alias for get(), kept one release for out-of-tree
     # callers (the CLI, the HTTP server and ai-houkai-service all used it
-    # before it was promoted).
+    # before it was promoted). Nothing in this repo calls it any more — the
+    # suite was migrated to get() — so removing it is now a one-line change
+    # whenever downstream has caught up.
     _get_by_id = get
 
     def _get_all_memories(self) -> list[Memory]:

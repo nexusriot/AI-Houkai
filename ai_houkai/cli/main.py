@@ -56,6 +56,36 @@ app = typer.Typer(
 )
 
 
+class _CliContext(dict):
+    """The Typer context object, with ``store`` built on first use.
+
+    Every subcommand reads ``ctx.obj["store"]``, and the root callback used to
+    construct one before dispatch — for all of them, including the ones that
+    never touch a store. ``houkai info archive.ahkai`` reads a gzip header and
+    is documented as not touching the store, yet it took twelve seconds to
+    load sentence-transformers and left a fresh chroma.sqlite3 behind; worse,
+    it failed outright when the *default* store was unopenable, on a command
+    that had nothing to do with it.
+
+    A dict rather than a wrapper object so all 50-odd ``ctx.obj["store"]``
+    call sites keep working untouched, and so an explicitly assigned store (in
+    tests, or a caller embedding the app) still wins.
+    """
+
+    def __init__(self, config) -> None:
+        super().__init__(config=config)
+
+    def __missing__(self, key: str):
+        if key != "store":
+            raise KeyError(key)
+        cfg = self["config"]
+        store = MemoryStore(
+            path=cfg.store_path, collection=cfg.collection, actor="cli",
+        )
+        self["store"] = store
+        return store
+
+
 def _version_callback(value: bool) -> None:
     if not value:
         return
@@ -92,11 +122,7 @@ def _callback(
     if collection:
         cfg.collection = collection
 
-    ctx.ensure_object(dict)
-    ctx.obj["config"] = cfg
-    ctx.obj["store"] = MemoryStore(
-        path=cfg.store_path, collection=cfg.collection, actor="cli",
-    )
+    ctx.obj = _CliContext(cfg)
 
 
 def _register() -> None:

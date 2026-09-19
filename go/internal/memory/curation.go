@@ -4,7 +4,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,7 +34,13 @@ const TrashFilename = "trash.jsonl.gz"
 var trashMu sync.Mutex
 
 // ErrSelfMerge is returned when Merge is asked to fold a memory into itself.
-var ErrSelfMerge = errors.New("cannot merge a memory with itself")
+//
+// A *ValidationError, not a plain error: this is caller input, and the HTTP
+// and MCP layers key their 400-vs-500 decision on IsValidationError. As a
+// plain errors.New it answered a self-merge with "500 Internal Server Error",
+// telling the client to retry something that can never succeed. errors.Is
+// still matches it, so callers comparing against ErrSelfMerge are unaffected.
+var ErrSelfMerge error = &ValidationError{Msg: "cannot merge a memory with itself"}
 
 // Version is one past text state of a memory, recovered from the journal.
 type Version struct {
@@ -239,7 +244,9 @@ func (s *MemoryStore) Versions(memoryID string) ([]Version, error) {
 func (s *MemoryStore) ListTags(ctx context.Context, includeSuperseded bool) ([]TagCount, error) {
 	counts := map[string]int{}
 	{
-		mems, err := s.ListRecent(ctx, 0, includeSuperseded, true)
+		mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+			IncludeSuperseded: includeSuperseded, IncludeExpired: true,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +273,9 @@ func (s *MemoryStore) ListTags(ctx context.Context, includeSuperseded bool) ([]T
 // changes. Includes superseded and expired memories: tag curation that skipped
 // them would leave the old spelling alive in rows a later Restore brings back.
 func (s *MemoryStore) rewriteTags(ctx context.Context, fn func([]string) []string) (int, error) {
-	mems, err := s.ListRecent(ctx, 0, true, true)
+	mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -295,22 +304,7 @@ func (s *MemoryStore) RenameTag(ctx context.Context, old, updated string) (int, 
 	if err := validateTagName(updated); err != nil {
 		return 0, err
 	}
-	return s.rewriteTags(ctx, func(tags []string) []string {
-		if !contains(tags, old) {
-			return nil
-		}
-		var out []string
-		for _, t := range tags {
-			t2 := t
-			if t == old {
-				t2 = updated
-			}
-			if !contains(out, t2) {
-				out = append(out, t2)
-			}
-		}
-		return out
-	})
+	return s.substituteTags(ctx, map[string]bool{old: true}, updated)
 }
 
 // MergeTags folds several tags into one across the collection.
@@ -322,10 +316,20 @@ func (s *MemoryStore) MergeTags(ctx context.Context, sources []string, into stri
 	for _, t := range sources {
 		src[t] = true
 	}
+	return s.substituteTags(ctx, src, into)
+}
+
+// substituteTags rewrites every tag in sources to into, collection-wide.
+//
+// Renaming one tag and merging several are the same operation with a
+// one-element source set, and the part that has to be right in both —
+// collapsing a collision (a memory already carrying the destination) without
+// disturbing the order of its other tags — lives here once.
+func (s *MemoryStore) substituteTags(ctx context.Context, sources map[string]bool, into string) (int, error) {
 	return s.rewriteTags(ctx, func(tags []string) []string {
 		hit := false
 		for _, t := range tags {
-			if src[t] {
+			if sources[t] {
 				hit = true
 				break
 			}
@@ -336,7 +340,7 @@ func (s *MemoryStore) MergeTags(ctx context.Context, sources []string, into stri
 		var out []string
 		for _, t := range tags {
 			t2 := t
-			if src[t] {
+			if sources[t] {
 				t2 = into
 			}
 			if !contains(out, t2) {
@@ -415,7 +419,9 @@ func (s *MemoryStore) FindPath(ctx context.Context, fromID, toID string, maxDept
 // undirectedAdjacency builds both-directions adjacency from one pass over the
 // link graph — one scan, not one per hop.
 func (s *MemoryStore) undirectedAdjacency(ctx context.Context) (map[string][]PathHop, error) {
-	mems, err := s.ListRecent(ctx, 0, true, true)
+	mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -705,11 +711,17 @@ func (s *MemoryStore) writeTrash(entries []TrashEntry) error {
 
 // validateTagName rejects a tag that would corrupt the comma-joined encoding.
 func validateTagName(tag string) error {
-	if tag == "" {
-		return fmt.Errorf("tag must not be empty")
+	// validationErrorf, not fmt.Errorf: a bad tag is caller input, and the
+	// transports map anything else to 500. `rename --to "a,b"` used to come
+	// back as an internal server error.
+	// Blank, not just empty: a tag of spaces renders as nothing and cannot be
+	// typed back in to select anything. A tag that merely contains a space is
+	// fine.
+	if strings.TrimSpace(tag) == "" {
+		return validationErrorf("tag must not be empty")
 	}
 	if strings.Contains(tag, ",") {
-		return fmt.Errorf("tags must not contain commas — got %q", tag)
+		return validationErrorf("tags must not contain commas — got %q", tag)
 	}
 	return nil
 }

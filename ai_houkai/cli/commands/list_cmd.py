@@ -34,6 +34,7 @@ def list_memories(
     fmt: str = typer.Option("auto", "--format", "-f", help="auto|rich|tsv|json"),
 ) -> None:
     """List most recently created memories."""
+    out.non_negative(n, "--limit")
     store = ctx.obj["store"]
     # Fetch everything: type/tag/since filter below, so a fixed fetch cap
     # would silently drop older matches.

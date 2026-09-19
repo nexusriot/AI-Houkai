@@ -140,7 +140,7 @@ class TestRememberConflict:
         m1 = store.remember("Use ruff for linting", type="procedural", tags=["lint"])
         m2 = store.remember("Also use ruff for linting", type="procedural", tags=["lint"],
                             on_conflict="supersede")
-        old = store._get_by_id(m1.id)
+        old = store.get(m1.id)
         if old and old.superseded_by:
             assert old.superseded_by == m2.id
 
@@ -150,7 +150,7 @@ class TestSupersede:
         old = store.remember("Old fact about X")
         new = store.remember("Updated fact about X")
         store.supersede(old_id=old.id, new_id=new.id)
-        reloaded = store._get_by_id(old.id)
+        reloaded = store.get(old.id)
         assert reloaded.superseded_by == new.id
         assert reloaded.superseded_at > 0.0
 
@@ -158,7 +158,7 @@ class TestSupersede:
         old = store.remember("Old")
         new = store.remember("New")
         store.supersede(old_id=old.id, new_id=new.id)
-        new_reloaded = store._get_by_id(new.id)
+        new_reloaded = store.get(new.id)
         assert any(l.to == old.id and l.rel == "supersedes" for l in new_reloaded.links)
 
     def test_supersede_hidden_from_recall(self, store: MemoryStore):
@@ -194,7 +194,7 @@ class TestSupersede:
         new = store.remember("new")
         store.supersede(old_id=old.id, new_id=new.id)
         store.supersede(old_id=old.id, new_id=new.id)  # second call is no-op
-        reloaded = store._get_by_id(new.id)
+        reloaded = store.get(new.id)
         assert sum(1 for l in reloaded.links if l.rel == "supersedes") == 1
 
     def test_restore_clears_superseded(self, store: MemoryStore):
@@ -203,7 +203,7 @@ class TestSupersede:
         store.supersede(old_id=old.id, new_id=new.id)
         restored = store.restore(old.id)
         assert restored is True
-        reloaded = store._get_by_id(old.id)
+        reloaded = store.get(old.id)
         assert reloaded.superseded_by == ""
 
     def test_restore_removes_supersedes_link(self, store: MemoryStore):
@@ -211,7 +211,7 @@ class TestSupersede:
         new = store.remember("new")
         store.supersede(old_id=old.id, new_id=new.id)
         store.restore(old.id)
-        new_reloaded = store._get_by_id(new.id)
+        new_reloaded = store.get(new.id)
         assert not any(l.rel == "supersedes" for l in new_reloaded.links)
 
     def test_restore_active_memory_returns_false(self, store: MemoryStore):

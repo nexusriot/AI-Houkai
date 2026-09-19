@@ -71,7 +71,6 @@ class DecayEngine:
         self.protect_types = protect_types
         self.frequency_weight = frequency_weight
 
-
     def score(self, memory: "Memory", now: float | None = None) -> float:
         """Return the current decay score for a single memory.
 

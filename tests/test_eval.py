@@ -90,7 +90,7 @@ class TestEvaluateHarness:
         evaluate(store, cases)
         # touch=False inside evaluate → access_count must stay 0
         for mid in ids.values():
-            mem = store._get_by_id(mid)
+            mem = store.get(mid)
             assert mem.access_count == 0
 
     def test_evaluate_forwards_recall_kwargs(self, store: MemoryStore):

@@ -95,7 +95,7 @@ def test_undo_remember_deletes_memory(store: MemoryStore) -> None:
     mem = store.remember(text="undo me")
     entry = next(e for e in store.journal.read() if e.op == "remember" and e.id == mem.id)
     assert store.undo(entry) is True
-    assert store._get_by_id(mem.id) is None
+    assert store.get(mem.id) is None
     # An "undo" record should have been written
     assert any(e.op == "undo" for e in store.journal.read())
 
@@ -106,7 +106,7 @@ def test_undo_forget_restores_memory(store: MemoryStore) -> None:
     store.forget(mid)
     forget_entry = next(e for e in store.journal.read() if e.op == "forget")
     assert store.undo(forget_entry) is True
-    restored = store._get_by_id(mid)
+    restored = store.get(mid)
     assert restored is not None
     assert restored.text == "bring me back"
 
@@ -117,7 +117,7 @@ def test_undo_supersede(store: MemoryStore) -> None:
     store.supersede(old_id=a.id, new_id=b.id)
     entry = next(e for e in store.journal.read() if e.op == "supersede")
     assert store.undo(entry) is True
-    assert (store._get_by_id(a.id)).superseded_by == ""
+    assert (store.get(a.id)).superseded_by == ""
 
 
 def test_undo_restore_after_forget_returns_false(store: MemoryStore) -> None:
@@ -138,7 +138,7 @@ def test_undo_link_removes_edge(store: MemoryStore) -> None:
     store.link(a.id, b.id, rel="related")
     entry = next(e for e in store.journal.read() if e.op == "link")
     assert store.undo(entry) is True
-    src = store._get_by_id(a.id)
+    src = store.get(a.id)
     assert all(not (l.to == b.id and l.rel == "related") for l in src.links)
 
 
@@ -191,7 +191,7 @@ def test_undo_unlink_restores_all_parallel_rels(store: MemoryStore) -> None:
     assert entry.meta["removed_rels"] == ["related", "example_of"]
     assert store.undo(entry) is True
 
-    restored = sorted(l.rel for l in store._get_by_id(a.id).links if l.to == b.id)
+    restored = sorted(l.rel for l in store.get(a.id).links if l.to == b.id)
     assert restored == ["example_of", "related"]
 
 
@@ -206,7 +206,7 @@ def test_undo_unlink_legacy_entry_without_removed_rels(store: MemoryStore) -> No
         meta={"src_id": a.id, "dst_id": b.id, "rel": "refines", "removed": 1},
     )
     assert store.undo(legacy) is True
-    assert [l.rel for l in store._get_by_id(a.id).links if l.to == b.id] == ["refines"]
+    assert [l.rel for l in store.get(a.id).links if l.to == b.id] == ["refines"]
 
 
 def test_undo_edit_restores_previous_state(store: MemoryStore) -> None:
@@ -214,7 +214,7 @@ def test_undo_edit_restores_previous_state(store: MemoryStore) -> None:
     store.edit(mem.id, text="version B")
     entry = next(e for e in store.journal.read() if e.op == "edit")
     assert store.undo(entry) is True
-    assert store._get_by_id(mem.id).text == "version A"
+    assert store.get(mem.id).text == "version A"
 
 
 def test_undo_edit_refuses_after_later_edit(store: MemoryStore) -> None:
@@ -226,7 +226,7 @@ def test_undo_edit_refuses_after_later_edit(store: MemoryStore) -> None:
     first_edit = next(e for e in store.journal.read()
                       if e.op == "edit" and (e.after or {}).get("text") == "state B")
     assert store.undo(first_edit) is False
-    assert store._get_by_id(mem.id).text == "state C"
+    assert store.get(mem.id).text == "state C"
 
 
 def test_undo_edit_refuses_after_supersede(store: MemoryStore) -> None:
@@ -238,7 +238,7 @@ def test_undo_edit_refuses_after_supersede(store: MemoryStore) -> None:
     store.supersede(old_id=old.id, new_id=new.id)
     entry = next(e for e in store.journal.read() if e.op == "edit")
     assert store.undo(entry) is False
-    assert store._get_by_id(old.id).superseded_by == new.id
+    assert store.get(old.id).superseded_by == new.id
 
 
 def test_undo_edit_tolerates_access_bumps(store: MemoryStore) -> None:
@@ -249,7 +249,7 @@ def test_undo_edit_tolerates_access_bumps(store: MemoryStore) -> None:
     store.recall("often recalled", k=1)   # bumps access_count/last_accessed
     entry = next(e for e in store.journal.read() if e.op == "edit")
     assert store.undo(entry) is True
-    assert store._get_by_id(mem.id).text == "often recalled fact"
+    assert store.get(mem.id).text == "often recalled fact"
 
 
 def _entry(i: int) -> JournalEntry:

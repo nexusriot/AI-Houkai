@@ -70,14 +70,14 @@ class TestViews:
         # keys DataTable rows by id8, and a repeated key raises DuplicateKey.
         store, (a, b, _) = seeded
         store.link(a.id, b.id, rel="related")
-        view = neighbors_view(store, store._get_by_id(a.id))
+        view = neighbors_view(store, store.get(a.id))
         assert [r[0] for r in view.rows] == [b.id[:8]]
         assert set(view.rows[0][4].split(",")) == {"refines", "related"}
         assert view.memories[b.id[:8]].id == b.id
 
     def test_detail_markup_contents(self, seeded):
         store, (a, b, _) = seeded
-        a = store._get_by_id(a.id)  # refetch: links were added after remember()
+        a = store.get(a.id)  # refetch: links were added after remember()
         text = detail_markup(a)
         assert a.id[:8] in text
         assert "make release" in text
@@ -160,10 +160,10 @@ class TestSearchDoesNotTouch:
         """TUI browsing is read-only: recall via the search box must not bump
         access_count/last_accessed (it would feed decay reinforcement)."""
         store, (a, _, _) = seeded
-        before = store._get_by_id(a.id)
+        before = store.get(a.id)
         assert before.access_count == 0
         search_view(store, "deployment release")
-        after = store._get_by_id(a.id)
+        after = store.get(a.id)
         assert after.access_count == 0
         assert after.last_accessed == before.last_accessed
 

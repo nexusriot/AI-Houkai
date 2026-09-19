@@ -117,8 +117,8 @@ class TestRememberManyJournal:
         entry = list(store.journal.read(memory_id=out[1].id))[-1]
         assert store.undo(entry) is True
         assert store.count() == 1
-        assert store._get_by_id(out[1].id) is None
-        assert store._get_by_id(out[0].id) is not None
+        assert store.get(out[1].id) is None
+        assert store.get(out[0].id) is not None
 
 
 class TestRememberManyValidation:
@@ -155,7 +155,7 @@ class TestRememberManyConflicts:
             on_conflict="ignore",
         )
         assert store.count() == 2
-        assert all(store._get_by_id(m.id).superseded_by == "" for m in out)
+        assert all(store.get(m.id).superseded_by == "" for m in out)
 
     @pytest.mark.needs_model
     def test_warn_stores_all_and_warns_once(self, store):
@@ -172,8 +172,8 @@ class TestRememberManyConflicts:
             ["Use ruff for linting", "Use ruff for linting please"],
             on_conflict="supersede",
         )
-        assert store._get_by_id(second.id).superseded_by == first.id
-        assert store._get_by_id(first.id).superseded_by == ""
+        assert store.get(second.id).superseded_by == first.id
+        assert store.get(first.id).superseded_by == ""
 
     def test_raise_policy_rejected(self, store):
         with pytest.raises(ValueError, match="raise"):

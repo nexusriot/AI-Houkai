@@ -35,55 +35,40 @@ import os
 import shutil
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ai_houkai.installers.common import (
-    load_json,
+    DEFAULT_MEMORY_PATH,
+    MEMORY_GUIDE,
+    SERVER_NAME,
+    merge_server_block,
     resolve_mcp_command,
     verify_server,
-    write_json,
 )
 
 
 DEFAULT_CONFIG_PATH  = os.path.expanduser("~/.claude.json")
 PROJECT_CONFIG_PATH  = ".mcp.json"
-# `.chroma` leaf matches the CLI default (~/.ai_houkai/.chroma) so `houkai
-# list` sees installed-client memories, and the store's journal.log lands in
-# ~/.ai_houkai/ instead of $HOME (it is written to the store path's parent).
-DEFAULT_MEMORY_PATH  = os.path.expanduser("~/.ai_houkai/.chroma")
 DEFAULT_COLLECTION   = "claude_code"
-SERVER_NAME          = "ai-houkai"
+
+# DEFAULT_MEMORY_PATH and SERVER_NAME are re-exported from common — the store
+# path and server name are shared by every client, not Claude-Code-specific.
+__all__ = [
+    "CLAUDEMD_SNIPPET",
+    "ClaudeCodeInstaller",
+    "DEFAULT_COLLECTION",
+    "DEFAULT_CONFIG_PATH",
+    "DEFAULT_MEMORY_PATH",
+    "PROJECT_CONFIG_PATH",
+    "SERVER_NAME",
+]
 
 
-CLAUDEMD_SNIPPET = textwrap.dedent("""
-    ## Memory (AI-Houkai MCP)
-
-    You have access to a persistent memory store via MCP tools:
-
-    - **remember(text, type, tags, importance)** — store a fact, decision, or preference
-    - **recall(query, k)** — semantic search across stored memories
-    - **edit(memory_id, …)** — update a memory in place (keeps id, links, history)
-    - **forget(memory_id)** — remove a specific memory
-    - **list_recent()** — see the most recently created memories
-
-    ### When to use memory
-
-    | Situation | Action |
-    |---|---|
-    | User states a preference or coding convention | `remember` with `type="feedback"` or `"procedural"` |
-    | You learn something about the codebase | `remember` with `type="semantic"` |
-    | Starting a new task | `recall` relevant context first |
-    | A stored fact is outdated or has a typo | `edit` it in place — don't forget+remember |
-    | User corrects you | `remember` the correction, `forget` the wrong fact |
-
-    ### Memory types
-    - `episodic` — time-stamped events ("Fixed auth bug in PR #441")
-    - `semantic` — distilled facts ("API versioned at /api/v1/")
-    - `procedural` — how-to rules ("Always use tmp_path in tests")
-    - `feedback` — user preferences ("Prefers concise answers")
-""").strip()
+# The CLAUDE.md wrapper around the client-agnostic guide in common.py.
+# Keeping the body shared is what stopped the three installers' copies
+# drifting apart (this one had already lost the `edit` rows).
+CLAUDEMD_SNIPPET = f"## Memory (AI-Houkai MCP)\n\n{MEMORY_GUIDE}"
 
 
 @dataclass
@@ -168,13 +153,13 @@ class ClaudeCodeInstaller:
     def _install_direct(self, scope: str, *, overwrite_unparseable: bool) -> str:
         """Merge the server block into the config file Claude Code reads."""
         path = self.config_path if scope == "user" else PROJECT_CONFIG_PATH
-        config = load_json(path, overwrite_unparseable=overwrite_unparseable)
-        config.setdefault("mcpServers", {})
-        config["mcpServers"][self.server_name] = self.build_mcp_block()
-        return write_json(path, config)
+        return merge_server_block(
+            path, "mcpServers", self.server_name, self.build_mcp_block(),
+            overwrite_unparseable=overwrite_unparseable,
+        )
 
     def print_config(self, *, stream=sys.stdout) -> None:
-        print(f"\nRegister with the Claude Code CLI (preferred):\n", file=stream)
+        print("\nRegister with the Claude Code CLI (preferred):\n", file=stream)
         print(f"    claude mcp add --scope user {self.server_name} "
               f"--env AI_HOUKAI_PATH={self.memory_path} "
               f"--env AI_HOUKAI_COLLECTION={self.collection} "
@@ -200,14 +185,14 @@ class ClaudeCodeInstaller:
                     capture_output=True, text=True, timeout=15,
                 )
                 if self.server_name in result.stdout:
-                    print(f"  ok   registered in `claude mcp list`", file=stream)
+                    print("  ok   registered in `claude mcp list`", file=stream)
                 else:
-                    print(f"  warn not yet in `claude mcp list` — run install first",
+                    print("  warn not yet in `claude mcp list` — run install first",
                           file=stream)
             except Exception:
                 pass
         else:
-            print(f"  warn `claude` CLI not on PATH", file=stream)
+            print("  warn `claude` CLI not on PATH", file=stream)
         return ok
 
     @staticmethod
@@ -246,7 +231,7 @@ def _main(argv: Optional[list] = None) -> int:
         config_path=args.config,
     )
 
-    print(f"\nAI-Houkai · Claude Code installer")
+    print("\nAI-Houkai · Claude Code installer")
     print(f"  Scope       : {scope}")
     print(f"  Memory path : {inst.memory_path}")
     print(f"  MCP command : {inst.mcp_command}\n")
@@ -268,7 +253,7 @@ def _main(argv: Optional[list] = None) -> int:
             print(f"  err  {exc}")
             return 1
         print(f"  registered via: {written}")
-        print(f"  verify:  claude mcp list\n")
+        print("  verify:  claude mcp list\n")
     elif not (args.verify or args.claudemd):
         inst.print_config()
         print("  Run with --install to register this automatically.\n")

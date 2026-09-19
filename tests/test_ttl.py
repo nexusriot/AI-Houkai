@@ -87,13 +87,13 @@ class TestEditTTL:
     def test_edit_sets_expiry(self, store: MemoryStore):
         m = store.remember("editable")
         store.edit(m.id, expires_at=time.time() - 1)  # expire it now
-        assert store._get_by_id(m.id).expires_at > 0
+        assert store.get(m.id).expires_at > 0
         assert m.id not in {x.id for x, _ in store.recall("editable", k=5)}
 
     def test_edit_clears_expiry_with_zero(self, store: MemoryStore):
         m = store.remember("clearable", ttl_seconds=50)
         store.edit(m.id, expires_at=0.0)
-        assert store._get_by_id(m.id).expires_at == 0.0
+        assert store.get(m.id).expires_at == 0.0
 
     def test_edit_negative_expiry_rejected(self, store: MemoryStore):
         m = store.remember("x")
@@ -107,14 +107,14 @@ class TestPurgeExpired:
         exp = store.remember("drop me", expires_at=time.time() - 10)
         purged = store.purge_expired()
         assert [p.id for p in purged] == [exp.id]
-        assert store._get_by_id(exp.id) is None
-        assert store._get_by_id(live.id) is not None
+        assert store.get(exp.id) is None
+        assert store.get(live.id) is not None
 
     def test_purge_dry_run_deletes_nothing(self, store: MemoryStore):
         exp = store.remember("drop me", expires_at=time.time() - 10)
         purged = store.purge_expired(dry_run=True)
         assert [p.id for p in purged] == [exp.id]
-        assert store._get_by_id(exp.id) is not None  # still there
+        assert store.get(exp.id) is not None  # still there
 
     def test_purge_honors_custom_now(self, store: MemoryStore):
         # expires in 100s; not expired "now", but expired at now+200.

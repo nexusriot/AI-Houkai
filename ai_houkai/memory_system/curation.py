@@ -263,40 +263,36 @@ class CurationMixin:
             changed += 1
         return changed
 
-    def rename_tag(self, old: str, new: str) -> TagRename:
-        """Rename a tag across the collection, de-duplicating on collision."""
-        _validate_tag(new)
+    def _substitute_tags(self, sources: set[str], into: str) -> TagRename:
+        """Rewrite every tag in *sources* to *into*, collection-wide.
 
+        Renaming one tag and merging several are the same operation with a
+        one-element source set, and the part that has to be right in both —
+        collapsing a collision (a memory already carrying the destination)
+        without disturbing the order of its other tags — lives here once.
+        """
         def fn(tags: list[str]) -> list[str] | None:
-            if old not in tags:
+            if not sources.intersection(tags):
                 return None
             out: list[str] = []
             for t in tags:
-                t2 = new if t == old else t
-                if t2 not in out:
-                    out.append(t2)
-            return out
-
-        with self.as_actor("curation"):
-            return TagRename(changed=self._rewrite_tags(fn), tag=new)
-
-    def merge_tags(self, sources: Iterable[str], into: str) -> TagRename:
-        """Fold several tags into one across the collection."""
-        _validate_tag(into)
-        src = set(sources)
-
-        def fn(tags: list[str]) -> list[str] | None:
-            if not src.intersection(tags):
-                return None
-            out: list[str] = []
-            for t in tags:
-                t2 = into if t in src else t
+                t2 = into if t in sources else t
                 if t2 not in out:
                     out.append(t2)
             return out
 
         with self.as_actor("curation"):
             return TagRename(changed=self._rewrite_tags(fn), tag=into)
+
+    def rename_tag(self, old: str, new: str) -> TagRename:
+        """Rename a tag across the collection, de-duplicating on collision."""
+        _validate_tag(new)
+        return self._substitute_tags({old}, new)
+
+    def merge_tags(self, sources: Iterable[str], into: str) -> TagRename:
+        """Fold several tags into one across the collection."""
+        _validate_tag(into)
+        return self._substitute_tags(set(sources), into)
 
     def delete_tag(self, tag: str) -> TagRename:
         """Strip a tag from every memory that carries it."""
@@ -549,7 +545,10 @@ class CurationMixin:
 
 def _validate_tag(tag: str) -> None:
     """Tags are stored comma-joined, so a comma would split one tag into two."""
-    if not tag:
+    # Blank, not just empty: a tag of spaces renders as nothing in `houkai
+    # tags list` and cannot be typed back in to select anything, so it is a
+    # write no reader can use. A tag that merely *contains* a space is fine.
+    if not tag.strip():
         raise ValueError("tag must not be empty")
     if "," in tag:
         raise ValueError(f"tags must not contain commas — got {tag!r}")

@@ -19,8 +19,11 @@ Scope notes, both learned from banners that slipped through an earlier pass:
   * The banner check reads every hand-maintained file with ``#``/``//``
     comments, not just ``.py`` and ``.go``. The packaged
     ``etc/ai-houkai/config.toml`` grew eight banner blocks precisely because
-    it sat outside the old ``.py``/``.go`` net. Markdown is deliberately
-    excluded: there ``---`` is front matter or a real horizontal rule.
+    it sat outside the old ``.py``/``.go`` net, and the ignore files and
+    ``requirements.txt`` were the next candidates for the same reason: they
+    are hand-maintained, sectioned, and were outside it too. Markdown is
+    deliberately excluded: there ``---`` is front matter or a real
+    horizontal rule.
   * A banner is recognised by how it *ends*, so the label may come first
     (``# Storage ------``) or sit between two rules (``# --- Storage ---``).
 """
@@ -56,10 +59,16 @@ _BANNER = re.compile(
 )
 
 _SKIP_DIRS = {".venv", "__pycache__", "build", "dist", ".git", "node_modules",
-              ".chroma", ".idea", ".pytest_cache", "ai_houkai.egg-info"}
+              ".chroma", ".idea", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+              "ai_houkai.egg-info"}
 
-# Hand-maintained files that carry `#`- or `//`-style comments.
+# Hand-maintained files that carry `#`- or `//`-style comments. Every
+# extension here was added because something with comments sat outside the
+# net — the packaged config.toml first, then the ignore files and the pinned
+# requirements, which are hand-maintained and sectioned exactly like the
+# config that grew eight banners.
 _COMMENTED = (".py", ".go", ".sh", ".yml", ".yaml", ".toml",
+              ".gitignore", ".dockerignore", "requirements.txt",
               "Makefile", "Dockerfile")
 
 

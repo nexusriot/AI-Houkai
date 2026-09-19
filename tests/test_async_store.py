@@ -220,7 +220,7 @@ class TestAsyncAutoContext:
                 type="procedural")
             await astore.auto_context_pack(
                 "deploy the api", token_budget=500, touch=False)
-            return await astore.run(astore.sync._get_by_id, mem.id)
+            return await astore.run(astore.sync.get, mem.id)
 
         after = asyncio.get_event_loop().run_until_complete(_inner())
         assert after.access_count == 0

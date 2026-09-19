@@ -165,7 +165,7 @@ def start_cmd(ctx: typer.Context) -> None:
     )
     typer.echo(f"Maintenance daemon started (pid {pid}).")
     typer.echo(f"Logs → {mcfg.log_path}")
-    typer.echo(f"Stop → houkai maintenance stop")
+    typer.echo("Stop → houkai maintenance stop")
 
 
 @maintenance_app.command("stop")
@@ -227,7 +227,7 @@ def status_cmd(ctx: typer.Context) -> None:
     typer.echo(f"  consolidate:    {consolidate}")
     typer.echo(f"  summarizer:     {mcfg.summarizer or 'extractive (built-in)'}")
     typer.echo(
-        f"  reinforcement:  "
+        "  reinforcement:  "
         + (f"on (frequency_weight={mcfg.frequency_weight})"
            if mcfg.frequency_weight else "off")
     )

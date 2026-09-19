@@ -129,13 +129,11 @@ type AutoContextOpts struct {
 // because RRF scores are rank-relative to each query's own pool and cannot be
 // compared across the fan-out queries.
 func (s *MemoryStore) AutoContextPack(ctx context.Context, task string, opts AutoContextOpts) (PackResult, error) {
-	if opts.TokenBudget == 0 {
-		opts.TokenBudget = 800
-	}
-	// MaxPhrases is honored as-is (including an explicit 0 = task-only, matching
-	// Python). Callers/handlers apply the default of 3 for an *absent* value; a
-	// negative one is rejected by FanoutQueries below rather than quietly
-	// meaning something, so there is nothing to clamp here.
+	// TokenBudget and MaxPhrases are both honored as-is, including an explicit
+	// 0 (pack nothing / task-only), matching Python. Callers and handlers apply
+	// DefaultTokenBudget and the 3-phrase default for an *absent* value; a
+	// negative MaxPhrases is rejected by FanoutQueries below rather than
+	// quietly meaning something, so there is nothing to clamp here.
 	if opts.Mode == "" {
 		opts.Mode = ModeHybrid
 	}

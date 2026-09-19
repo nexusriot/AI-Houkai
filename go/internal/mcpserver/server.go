@@ -513,7 +513,7 @@ func addRecallPack(s *server.MCPServer, store *memory.MemoryStore) {
 			header = &v
 		}
 		pack, err := store.RecallPack(ctx, query, memory.PackOpts{
-			TokenBudget:       req.GetInt("token_budget", 800),
+			TokenBudget:       req.GetInt("token_budget", memory.DefaultTokenBudget),
 			Type:              memory.MemoryType(req.GetString("type", "")),
 			Tag:               req.GetString("tag", ""),
 			MinImportance:     float32(req.GetFloat("min_importance", 0)),
@@ -609,7 +609,7 @@ func addAutoContext(s *server.MCPServer, store *memory.MemoryStore) {
 			header = &v
 		}
 		pack, err := store.AutoContextPack(ctx, task, memory.AutoContextOpts{
-			TokenBudget:       req.GetInt("token_budget", 800),
+			TokenBudget:       req.GetInt("token_budget", memory.DefaultTokenBudget),
 			MaxPhrases:        maxPhrases,
 			Mode:              memory.RecallMode(req.GetString("mode", string(memory.ModeHybrid))),
 			MinCosine:         optFloat32(req, "min_cosine"),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import re
 import json
 import stat
@@ -302,8 +303,8 @@ def test_edit_text_change_preserves_id_and_links(tmp_path, monkeypatch):
 
     store = MemoryStore(path=store_path, collection="cli_test")
     try:
-        a = store._get_by_id(a_id)
-        b = store._get_by_id(b_id)
+        a = store.get(a_id)
+        b = store.get(b_id)
 
         assert a is not None, "edit must not change the memory id"
         assert a.text == "Updated text about cats and kittens"
@@ -311,7 +312,7 @@ def test_edit_text_change_preserves_id_and_links(tmp_path, monkeypatch):
         assert any(l.to == b_id and l.rel == "related" for l in a.links)
         # B's incoming link still points at a memory that exists (not orphaned).
         assert any(l.to == a_id and l.rel == "refines" for l in b.links)
-        assert store._get_by_id(b.links[0].to) is not None
+        assert store.get(b.links[0].to) is not None
     finally:
         store.client.close()
 
@@ -332,7 +333,7 @@ def test_edit_preserves_markdown_headings_in_body(tmp_path, monkeypatch):
 
     store = MemoryStore(path=store_path, collection="cli_test")
     try:
-        a = store._get_by_id(a_id)
+        a = store.get(a_id)
         assert a is not None
         assert a.text == new_text          # nothing stripped
         assert "# Deploy guide" in a.text
@@ -702,3 +703,214 @@ class TestEmptyResultsStayMachineReadable:
         assert result.exit_code == 0, result.output
         assert result.stdout.strip() == ""
         assert "No memories found" in result.stderr
+
+
+class TestInfoValidatesTheHeader:
+    """`houkai info` answers "can I import this?", so it applies import's
+    header checks.
+
+    It used to parse the header as JSON and print it, checking nothing else:
+    any gzipped JSON object was reported as a valid archive with a memory
+    count, and a file from a newer writer looked healthy right up until
+    `houkai import` refused it.
+    """
+
+    @staticmethod
+    def _archive(tmp_path, name: str, header: str, *rows: str):
+        path = tmp_path / name
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write(header + "\n")
+            for r in rows:
+                f.write(r + "\n")
+        return path
+
+    def test_accepts_a_real_export(self, cli_store, tmp_path) -> None:
+        store, path = cli_store
+        store.remember(text="a real memory to export")
+        out = tmp_path / "real.ahkai"
+        store.export(out)
+        res = runner.invoke(app, ["info", str(out)])
+        assert res.exit_code == 0, res.output
+        assert "ai-houkai/export" in res.output
+        assert "memories on disk: 1" in res.output
+
+    def test_rejects_a_foreign_gzipped_json_object(self, tmp_path) -> None:
+        bad = self._archive(tmp_path, "foreign.ahkai",
+                            '{"format": "someone-elses/export", "version": 1}',
+                            '{"anything": 1}')
+        res = runner.invoke(app, ["info", str(bad)])
+        assert res.exit_code == 1
+        assert "not an ai-houkai export" in res.output
+        # The old behaviour: a count printed for a file we cannot read.
+        assert "memories on disk" not in res.output
+
+    def test_warns_about_a_version_import_will_refuse(self, tmp_path) -> None:
+        bad = self._archive(tmp_path, "future.ahkai",
+                            '{"format": "ai-houkai/export", "version": 99}')
+        res = runner.invoke(app, ["info", str(bad)])
+        assert "version 99" in res.output
+        assert "refuse" in res.output
+
+    def test_reports_a_file_that_is_not_gzipped(self, tmp_path) -> None:
+        bad = tmp_path / "plain.ahkai"
+        bad.write_text('{"format": "ai-houkai/export", "version": 1}')
+        res = runner.invoke(app, ["info", str(bad)])
+        assert res.exit_code == 1
+        assert "Error:" in res.output
+
+    def test_reports_a_truncated_archive(self, tmp_path) -> None:
+        whole = gzip.compress(
+            b'{"format": "ai-houkai/export", "version": 1}\n'
+            b'{"id": "a", "text": "t", "meta": {}}\n')
+        bad = tmp_path / "half.ahkai"
+        bad.write_bytes(whole[: len(whole) // 2])
+        res = runner.invoke(app, ["info", str(bad)])
+        assert res.exit_code == 1
+        assert "Error:" in res.output
+
+
+def test_import_of_an_unreadable_file_is_one_clean_line(cli_store, tmp_path) -> None:
+    """Not a traceback: `houkai import` on any unusable file prints `Error: …`
+    and exits 1, the same as every other rejected archive."""
+    store, path = cli_store
+    bad = tmp_path / "plain.ahkai"
+    bad.write_text("this is not a gzip stream")
+    res = _invoke(["import", "-y", str(bad)], path)
+    assert res.exit_code == 1
+    assert res.output.strip().startswith("Error:")
+    assert "Traceback" not in res.output
+
+
+class TestStoreIsOpenedLazily:
+    """The root callback must not open a store for a command that has none.
+
+    It used to build a MemoryStore before dispatching *any* subcommand.
+    `houkai info archive.ahkai` — documented as not touching the store — took
+    twelve seconds loading sentence-transformers and left a chroma.sqlite3
+    behind, and failed outright if the default store happened to be
+    unopenable, for a command that only reads a gzip header.
+    """
+
+    def test_info_opens_no_store(self, tmp_path, monkeypatch) -> None:
+        archive = tmp_path / "x.ahkai"
+        with gzip.open(archive, "wt", encoding="utf-8") as f:
+            f.write('{"format": "ai-houkai/export", "version": 1}\n')
+
+        built: list[str] = []
+        real = main_mod.MemoryStore
+
+        def spy(*args, **kwargs):
+            built.append(kwargs.get("path", "?"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(main_mod, "MemoryStore", spy)
+        never = tmp_path / "never-created"
+        res = runner.invoke(app, ["--store", str(never), "--collection",
+                                  "cli_test", "info", str(archive)])
+
+        assert res.exit_code == 0, res.output
+        assert built == [], f"info built a store at {built}"
+        assert not never.exists(), "info created the store directory"
+
+    def test_a_store_command_still_gets_one(self, tmp_path, monkeypatch) -> None:
+        """The laziness must not go so far that nothing ever opens a store."""
+        built: list[str] = []
+        real = main_mod.MemoryStore
+
+        def spy(*args, **kwargs):
+            built.append(kwargs.get("path", "?"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(main_mod, "MemoryStore", spy)
+        path = str(tmp_path / "chroma")
+        res = runner.invoke(app, ["--store", path, "--collection", "cli_test",
+                                  "list"])
+        assert res.exit_code == 0, res.output
+        assert built == [path]
+
+    def test_the_store_is_built_once_per_run(self, tmp_path, monkeypatch) -> None:
+        """__missing__ caches: repeated ctx.obj["store"] reads in one command
+        must not open the collection again."""
+        built: list[str] = []
+        real = main_mod.MemoryStore
+
+        def spy(*args, **kwargs):
+            built.append(kwargs.get("path", "?"))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(main_mod, "MemoryStore", spy)
+        path = str(tmp_path / "chroma")
+        # `conflicts` reads ctx.obj["store"] and the command it defers to
+        # reads it again.
+        res = runner.invoke(app, ["--store", path, "--collection", "cli_test",
+                                  "stats"])
+        assert res.exit_code == 0, res.output
+        assert len(built) == 1, built
+
+    def test_an_injected_store_is_not_overwritten(self, cli_store) -> None:
+        """A caller embedding the app can still hand in its own store."""
+        store, path = cli_store
+        ctx = main_mod._CliContext(main_mod.load_config())
+        ctx["store"] = store
+        assert ctx["store"] is store
+
+
+class TestCountsThatSliceLocally:
+    """A command that slices a list by a user-supplied count has to validate it.
+
+    `MemoryStore.list_recent` raises on a negative limit with a comment about
+    exactly why — `memories[:-1]` returns everything *except* the oldest. Two
+    commands then re-implemented the slice without the guard, and `journal
+    tail` picked the other idiom, where `entries[-0:]` is the WHOLE list: the
+    two worst possible answers to "give me none" and "give me minus one".
+    """
+
+    def test_list_rejects_a_negative_limit(self, cli_store) -> None:
+        store, path = cli_store
+        for i in range(3):
+            store.remember(text=f"list guard subject {i}")
+        res = _invoke(["list", "--limit", "-1"], path)
+        assert res.exit_code != 0
+        assert "must be >= 0" in res.output
+
+    def test_list_limit_zero_lists_nothing(self, cli_store) -> None:
+        store, path = cli_store
+        store.remember(text="list zero subject")
+        res = _invoke(["list", "--limit", "0", "--format", "json"], path)
+        assert res.exit_code == 0
+        assert json.loads(res.stdout or "[]") == []
+
+    def test_journal_tail_zero_shows_nothing(self, cli_store) -> None:
+        """`entries[-0:]` is the whole list — asking for none printed the
+        entire journal."""
+        store, path = cli_store
+        for i in range(3):
+            store.remember(text=f"journal zero subject {i}")
+        res = _invoke(["journal", "tail", "-n", "0"], path)
+        assert res.exit_code == 0
+        assert "(no journal entries)" in res.output
+
+    def test_journal_tail_rejects_a_negative_count(self, cli_store) -> None:
+        store, path = cli_store
+        store.remember(text="journal guard subject")
+        res = _invoke(["journal", "tail", "-n", "-1"], path)
+        assert res.exit_code != 0
+        assert "must be >= 0" in res.output
+
+    def test_journal_tail_still_bounds(self, cli_store) -> None:
+        store, path = cli_store
+        for i in range(4):
+            store.remember(text=f"journal bound subject {i}")
+        res = _invoke(["journal", "tail", "-n", "2"], path)
+        assert res.exit_code == 0
+        assert "2 entries" in res.output
+
+    def test_eval_rejects_a_negative_k(self, cli_store, tmp_path) -> None:
+        """The metrics slice retrieved[:k], so a negative k would score
+        against all-but-the-last hit and report a plausible number."""
+        store, path = cli_store
+        gold = tmp_path / "gold.jsonl"
+        gold.write_text('{"query": "anything", "relevant": []}\n')
+        res = _invoke(["eval", str(gold), "-k", "-1"], path)
+        assert res.exit_code != 0
+        assert "must be >= 0" in res.output

@@ -457,8 +457,10 @@ install or Homebrew tap distribution:
 
 ## Testing strategy
 
-~20 test files / 100+ test functions across 9 packages, all offline
-(`go test ./...` needs no network and no Ollama):
+62 test files / 629 test functions across 15 packages, all offline
+(`go test ./...` needs no network and no Ollama). The highlights below are a
+guide to where each concern is covered, not an inventory — `ls
+internal/*/*_test.go` is the inventory:
 
 - `memory/store_test.go` — Remember→Recall→Supersede→Restore round-trips
   against a real chromem-go store in a tmpdir, using `stubEmbedder` (FNV
@@ -478,8 +480,19 @@ install or Homebrew tap distribution:
   `httptest` servers, fallback-on-error/empty
 - `decay/engine_test.go` — protected types, thresholds
 - `vector/chromem_test.go` — backend round-trip + collection management
-- `installer/*_test.go` — merge-don't-overwrite for all three clients
+- `installer/*_test.go` — merge-don't-overwrite for all three clients, plus
+  `common_test.go` over the shared block-merge / registration-check helpers
+  the three now delegate to, and the one-guide check that keeps their
+  instruction snippets from drifting apart again
+- `parity/parity_test.go` — the Go surface against `parity.json`; its
+  `docs_test.go` neighbour holds the line above to what is on disk (it had
+  drifted to a third of the real figures) and holds this port's prose counts
+  of tools and routes to the same manifest, since parity.json's contract is
+  that each port asserts against it in that port's own suite
 - `tui/data_test.go` — view-models and Navigator stack (no terminal needed)
+- `cli/install_test.go` — each client through the one shared `install` body:
+  config key, block schema, `--settings` beating `--project`, idempotence,
+  and the per-client snippet flags
 - `cli/config_test.go` — resolution-order precedence, `"auto"` importance,
   summarizer env override
 - `embed/openai_test.go` — request/response shapes

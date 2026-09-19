@@ -102,6 +102,9 @@ def eval_cmd(
         houkai eval gold.jsonl --mode hybrid --fusion rrf
         houkai eval gold.jsonl --graph 0.15 --expand-rerank
     """
+    # The metrics slice retrieved[:k]; a negative k would score against
+    # all-but-the-last hit and report a plausible number for it.
+    out.non_negative(k, "-k")
     store = ctx.obj["store"]
     try:
         cases = load_goldset(goldset, store)

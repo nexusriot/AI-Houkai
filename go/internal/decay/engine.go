@@ -26,7 +26,7 @@ type Engine struct {
 
 // Storable is the subset of MemoryStore the Engine needs.
 type Storable interface {
-	ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]memory.Memory, error)
+	ListRecentPage(ctx context.Context, o memory.ListRecentOpts) ([]memory.Memory, error)
 	Forget(ctx context.Context, id string) (bool, error)
 }
 
@@ -89,7 +89,9 @@ func (e *Engine) Prune(ctx context.Context, dryRun bool) ([]memory.Memory, error
 	// every supersede leaves the old memory in the store forever and the
 	// collection grows without bound (matches Python's score_all).
 	// includeExpired=true so decay also considers TTL-expired rows.
-	mems, err := e.store.ListRecent(ctx, 0, true, true)
+	mems, err := e.store.ListRecentPage(ctx, memory.ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
 	if err != nil {
 		return nil, err
 	}

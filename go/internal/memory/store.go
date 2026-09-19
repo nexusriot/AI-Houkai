@@ -1191,7 +1191,26 @@ type ListRecentOpts struct {
 }
 
 // ListRecent returns up to limit memories sorted by created_at desc.
+//
+// limit is taken literally, as in the Python port: 0 returns nothing and a
+// negative limit is a ValidationError. Reading 0 as "unbounded" — which this
+// used to do, inheriting ListRecentPage's internal convention — meant a
+// caller paging with `limit = min(remaining, page)` was handed the WHOLE
+// store on the step where remaining reached zero, and `GET /memories?limit=0`
+// answered differently on the two ports.
+//
+// Callers that genuinely want every row call ListRecentPage directly, where a
+// zero Limit is the documented "no bound" for an unset field.
 func (s *MemoryStore) ListRecent(ctx context.Context, limit int, includeSuperseded, includeExpired bool) ([]Memory, error) {
+	if limit < 0 {
+		// The Python port's note applies here too: memories[:-1] would drop
+		// only the oldest, returning nearly everything to a caller that asked
+		// for less than nothing.
+		return nil, validationErrorf("limit must be >= 0")
+	}
+	if limit == 0 {
+		return []Memory{}, nil
+	}
 	return s.ListRecentPage(ctx, ListRecentOpts{
 		Limit: limit, IncludeSuperseded: includeSuperseded,
 		IncludeExpired: includeExpired,
@@ -1752,9 +1771,9 @@ func (s *MemoryStore) Neighbors(ctx context.Context, memID, rel, direction strin
 			return nil, err
 		}
 	}
-	if depth <= 0 {
-		depth = 1
-	}
+	// depth is literal, as in Python's `for _ in range(depth)`: zero hops
+	// yields no neighbours. Clamping it to 1 handed a caller walking a depth
+	// budget down to zero a full extra hop.
 	// Links store full ids; resolve a starting prefix when possible.
 	root := memID
 	if m, err := s.GetByID(ctx, memID); err == nil {
@@ -2217,7 +2236,9 @@ func (s *MemoryStore) AllRaw(ctx context.Context) ([]vector.Item, error) {
 func (s *MemoryStore) Stats(ctx context.Context) (map[string]any, error) {
 	// includeExpired=true: expired-but-not-yet-purged memories are still in the
 	// store, so they count toward totals.
-	mems, err := s.ListRecent(ctx, 0, true, true)
+	mems, err := s.ListRecentPage(ctx, ListRecentOpts{
+		IncludeSuperseded: true, IncludeExpired: true,
+	})
 	if err != nil {
 		return nil, err
 	}

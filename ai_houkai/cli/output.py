@@ -53,6 +53,22 @@ def is_machine_format(fmt: str) -> bool:
     return resolve_format(fmt) in ("json", "tsv")
 
 
+def non_negative(value: int, param: str) -> int:
+    """Reject a negative count before it reaches a Python slice.
+
+    Both slice idioms a list-like command reaches for do something
+    plausible-looking and wrong with a negative count instead of failing:
+    ``xs[:-1]`` drops the last item, ``xs[-(-1):]`` drops the first, and
+    ``xs[-0:]`` is the WHOLE list — so ``journal tail -n 0`` printed the entire
+    journal. ``MemoryStore.list_recent`` raises on a negative limit for exactly
+    this reason; a command that slices locally has to make the same check
+    itself, and these two had both grown their own unguarded slice.
+    """
+    if value < 0:
+        raise typer.BadParameter(f"{param} must be >= 0 — got {value}")
+    return value
+
+
 def short_id(mid: str) -> str:
     return mid[:8]
 

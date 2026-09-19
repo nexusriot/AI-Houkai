@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_houkai.memory_system import MemoryStore
+from ai_houkai.memory_system import EXPORT_FORMAT, EXPORT_VERSION, MemoryStore
 from ai_houkai.memory_system import ImportConflictError
 
 def _new_store(tmp_path: Path, name: str = "t") -> MemoryStore:
@@ -87,13 +87,13 @@ def test_import_overwrite(store: MemoryStore, tmp_path: Path) -> None:
     out = tmp_path / "ov.ahkai"
     store.export(out)
     # Tamper with the stored version
-    mem2 = store._get_by_id(mem.id)
+    mem2 = store.get(mem.id)
     mem2.text = "modified locally"
     store.collection.update(ids=[mem.id], documents=["modified locally"],
                             metadatas=[mem2.to_metadata()])
     res = store.import_(out, on_conflict="overwrite")
     assert res.overwritten == 1
-    assert store._get_by_id(mem.id).text == "original"
+    assert store.get(mem.id).text == "original"
 
 
 def test_import_rename(store: MemoryStore, tmp_path: Path) -> None:
@@ -211,7 +211,7 @@ def test_import_error_policy_is_atomic(store: MemoryStore, tmp_path: Path) -> No
         with pytest.raises(ImportConflictError):
             target.import_(out2, on_conflict="error")
         assert target.count() == 1              # the new row was NOT written
-        assert target._get_by_id(kept.id) is not None
+        assert target.get(kept.id) is not None
         imports = [e for e in target.journal.read() if e.op == "import"]
         assert len(imports) == 1                # only the seeding import
     finally:
@@ -413,3 +413,116 @@ def test_rename_repoints_superseded_by(store: MemoryStore,
     assert tgt.get(imported_old.superseded_by).text == "new belief"
     src.client.close()
     tgt.client.close()
+
+
+class TestCorruptArchive:
+    """Every way an .ahkai file can be unusable must read as one error class.
+
+    `import_` already reported an empty file, a non-JSON header, a foreign
+    `format` and a too-new `version` as ImportError. Decompression failures
+    did not go through that door: gzip raises OSError (BadGzipFile) or
+    EOFError, so pointing the CLI at a plain .json printed a raw traceback
+    where every sibling case printed one clean line — and the HTTP route,
+    which maps ValueError/ImportError to 4xx, answered 500.
+    """
+
+    @staticmethod
+    def _write(path: Path, *lines: str) -> Path:
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return path
+
+    def test_not_gzipped_at_all(self, store: MemoryStore, tmp_path: Path) -> None:
+        bad = tmp_path / "plain.ahkai"
+        bad.write_text('{"format": "ai-houkai/export", "version": 1}\n')
+        with pytest.raises(ImportError, match="not a gzipped"):
+            store.import_(bad)
+
+    def test_truncated_mid_stream(self, store: MemoryStore, tmp_path: Path) -> None:
+        """A half-copied archive: valid gzip magic, no end-of-stream marker."""
+        whole = gzip.compress(
+            b'{"format": "ai-houkai/export", "version": 1}\n'
+            b'{"id": "a", "text": "t", "meta": {}}\n')
+        bad = tmp_path / "half.ahkai"
+        bad.write_bytes(whole[: len(whole) // 2])
+        with pytest.raises(ImportError):
+            store.import_(bad)
+
+    def test_truncated_after_a_valid_header(
+        self, store: MemoryStore, tmp_path: Path
+    ) -> None:
+        """The header reads, the body does not: still one clean ImportError."""
+        header = gzip.compress(
+            b'{"format": "ai-houkai/export", "version": 1}\n')
+        body = gzip.compress(b'{"id": "a", "text": "t", "meta": {}}\n')
+        bad = tmp_path / "cut.ahkai"
+        bad.write_bytes(header + body[: len(body) // 2])
+        with pytest.raises(ImportError):
+            store.import_(bad)
+
+    def test_empty_file(self, store: MemoryStore, tmp_path: Path) -> None:
+        bad = tmp_path / "empty.ahkai"
+        with gzip.open(bad, "wt", encoding="utf-8"):
+            pass
+        with pytest.raises(ImportError, match="empty file"):
+            store.import_(bad)
+
+    def test_header_is_not_json(self, store: MemoryStore, tmp_path: Path) -> None:
+        bad = self._write(tmp_path / "nonjson.ahkai", "this is not json")
+        with pytest.raises(ImportError, match="not an ai-houkai export"):
+            store.import_(bad)
+
+    def test_foreign_format_marker(self, store: MemoryStore, tmp_path: Path) -> None:
+        bad = self._write(tmp_path / "foreign.ahkai",
+                          '{"format": "someone-elses/export", "version": 1}')
+        with pytest.raises(ImportError, match="format header"):
+            store.import_(bad)
+
+    def test_version_from_the_future(self, store: MemoryStore, tmp_path: Path) -> None:
+        bad = self._write(tmp_path / "future.ahkai",
+                          '{"format": "ai-houkai/export", "version": 99}')
+        with pytest.raises(ImportError, match="version 99"):
+            store.import_(bad)
+
+    def test_a_bad_row_is_reported_not_raised(
+        self, store: MemoryStore, tmp_path: Path
+    ) -> None:
+        """One unparseable line must not abandon the rest of the archive."""
+        good = json.dumps({"id": "keepme", "text": "survivor",
+                           "meta": {"id": "keepme", "text": "survivor",
+                                    "type": "semantic", "tags": [],
+                                    "importance": 0.5}})
+        archive = self._write(tmp_path / "mixed.ahkai",
+                              '{"format": "ai-houkai/export", "version": 1}',
+                              "{not json}", good)
+        summary = store.import_(archive)
+        assert summary.imported == 1
+        assert [where for where, _ in summary.errors] == ["line:2"]
+
+    def test_nothing_is_written_when_the_header_is_rejected(
+        self, store: MemoryStore, tmp_path: Path
+    ) -> None:
+        before = store.count()
+        bad = tmp_path / "plain.ahkai"
+        bad.write_text("not gzip")
+        with pytest.raises(ImportError):
+            store.import_(bad)
+        assert store.count() == before
+
+
+def test_export_stamps_the_shared_format_constants(
+    store: MemoryStore, tmp_path: Path
+) -> None:
+    """The writer's header and the reader's check come from one definition.
+
+    They were three separate literals — a writer and a reader can only
+    disagree about the format they exchange if the marker is written twice.
+    """
+    store.remember(text="anything at all")
+    out = tmp_path / "dump.ahkai"
+    store.export(out)
+    with gzip.open(out, "rt", encoding="utf-8") as f:
+        header = json.loads(f.readline())
+    assert header["format"] == EXPORT_FORMAT
+    assert header["version"] == EXPORT_VERSION

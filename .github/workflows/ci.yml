@@ -186,3 +186,9 @@ jobs:
       - name: Go surface vs parity.json
         working-directory: go
         run: go test ./internal/parity/ -v
+
+      # The documentation quotes those same counts — and the test inventory —
+      # in prose. tests/test_docs.py re-derives every one of them, so a
+      # surface or suite change that leaves a doc behind fails here too.
+      - name: Documented counts vs the code
+        run: pytest -q tests/test_docs.py

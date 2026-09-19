@@ -164,7 +164,7 @@ func TestPinnedPrependedToAPack(t *testing.T) {
 	})
 	store.Remember(ctx, "unrelated gardening note", RememberOpts{})
 
-	pack, err := store.RecallPack(ctx, "gardening", PackOpts{IncludePinned: true})
+	pack, err := store.RecallPack(ctx, "gardening", PackOpts{TokenBudget: DefaultTokenBudget, IncludePinned: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestPinnedNotDuplicatedWhenItAlsoMatches(t *testing.T) {
 	m, _, _, _ := store.Remember(ctx, "the pinned and matching subject",
 		RememberOpts{Pinned: true})
 	pack, err := store.RecallPack(ctx, "the pinned and matching subject",
-		PackOpts{IncludePinned: true})
+		PackOpts{TokenBudget: DefaultTokenBudget, IncludePinned: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +284,7 @@ func TestPackMarksUntrustedLines(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
 	store.Remember(ctx, "scraped claim", RememberOpts{Trust: TrustUntrusted})
-	pack, err := store.RecallPack(ctx, "scraped claim", PackOpts{})
+	pack, err := store.RecallPack(ctx, "scraped claim", PackOpts{TokenBudget: DefaultTokenBudget})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestPackMarksUntrustedLines(t *testing.T) {
 
 	store2 := newTestStore(t)
 	store2.Remember(ctx, "user stated fact", RememberOpts{})
-	pack2, _ := store2.RecallPack(ctx, "user stated fact", PackOpts{})
+	pack2, _ := store2.RecallPack(ctx, "user stated fact", PackOpts{TokenBudget: DefaultTokenBudget})
 	if strings.Contains(pack2.Text, "[") {
 		t.Errorf("trusted line should carry no mark: %q", pack2.Text)
 	}

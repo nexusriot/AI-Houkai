@@ -116,7 +116,8 @@ prompt); a one-line summary goes to stderr.`,
 			return nil
 		},
 	}
-	cmd.Flags().IntVarP(&budget, "budget", "b", 800, "Token budget for the packed block")
+	cmd.Flags().IntVarP(&budget, "budget", "b", memory.DefaultTokenBudget,
+		"Token budget for the packed block")
 	cmd.Flags().StringVarP(&memType, "type", "t", "", "Filter by memory type")
 	cmd.Flags().StringVarP(&tag, "tag", "g", "", "Filter by tag")
 	cmd.Flags().Float32Var(&minImp, "min-importance", 0, "Minimum importance")

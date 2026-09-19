@@ -98,7 +98,6 @@ class AsyncMemoryStore:
         # Single thread: ChromaDB (SQLite) is not thread-safe under writes.
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="houkai")
 
-
     async def aclose(self) -> None:
         """Flush pending work and release resources."""
         loop = asyncio.get_running_loop()
@@ -120,7 +119,6 @@ class AsyncMemoryStore:
     async def __aexit__(self, *_: Any) -> None:
         await self.aclose()
 
-
     async def run(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
         """Run any synchronous callable in the store's executor and await it.
 
@@ -133,7 +131,6 @@ class AsyncMemoryStore:
             self._executor,
             lambda: fn(*args, **kwargs),
         )
-
 
     async def remember(
         self,
@@ -439,7 +436,6 @@ class AsyncMemoryStore:
     async def readiness(self, *, cache_ttl: float = 0.0) -> dict[str, Any]:
         return await self.run(self.sync.readiness, cache_ttl=cache_ttl)
 
-
     async def link(self, src_id: str, dst_id: str, rel: str = "related") -> None:
         await self.run(self.sync.link, src_id, dst_id, rel)
 
@@ -470,7 +466,6 @@ class AsyncMemoryStore:
     ) -> Graph:
         return await self.run(self.sync.subgraph, memory_ids, depth=depth)
 
-
     async def find_conflicts(
         self,
         memory_id: str | None = None,
@@ -488,7 +483,6 @@ class AsyncMemoryStore:
 
     async def restore(self, memory_id: str) -> bool:
         return await self.run(self.sync.restore, memory_id)
-
 
     async def export(
         self,
@@ -540,7 +534,6 @@ class AsyncMemoryStore:
             regenerate_vectors=regenerate_vectors,
             dry_run=dry_run,
         )
-
 
     async def undo(self, entry: JournalEntry) -> bool:
         return await self.run(self.sync.undo, entry)

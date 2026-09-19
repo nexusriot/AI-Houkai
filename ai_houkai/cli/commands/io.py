@@ -16,7 +16,11 @@ from typing import Optional
 import typer
 
 from ai_houkai.cli import output as out
-from ai_houkai.memory_system.store import ImportConflictError
+from ai_houkai.memory_system.store import (
+    EXPORT_FORMAT,
+    EXPORT_VERSION,
+    ImportConflictError,
+)
 
 
 def rebuild_vectors_cmd(
@@ -136,7 +140,7 @@ def info_cmd(
             for line in f:
                 if line.strip():
                     count += 1
-    except OSError as e:
+    except (OSError, EOFError) as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(1)
     try:
@@ -144,8 +148,27 @@ def info_cmd(
     except json.JSONDecodeError:
         typer.echo("Error: not an ai-houkai export (bad header).", err=True)
         raise typer.Exit(1)
+    # `info` exists to answer "can I import this?", so it has to apply the
+    # same two header checks import_() does. Without them any gzipped JSON
+    # object was reported as a valid archive with "memories on disk: N", and
+    # an archive from a newer writer looked fine right up until the import
+    # refused it.
+    if header.get("format") != EXPORT_FORMAT:
+        typer.echo(
+            f"Error: not an ai-houkai export (format={header.get('format')!r}).",
+            err=True)
+        raise typer.Exit(1)
     typer.echo(json.dumps(header, indent=2))
     typer.echo(f"\nmemories on disk: {count}")
+    try:
+        version = int(header.get("version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version > EXPORT_VERSION:
+        typer.echo(
+            f"Warning: written by a newer ai-houkai (version {version} > "
+            f"{EXPORT_VERSION}) — `houkai import` will refuse this file.",
+            err=True)
 
 
 def backup(

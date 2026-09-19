@@ -12,11 +12,11 @@ import (
 type fakeStore struct {
 	mems       []memory.Memory
 	forgot     []string
-	sawInclude bool // last includeSuperseded arg ListRecent was called with
+	sawInclude bool // last IncludeSuperseded ListRecentPage was called with
 }
 
-func (f *fakeStore) ListRecent(_ context.Context, _ int, includeSuperseded, _ bool) ([]memory.Memory, error) {
-	f.sawInclude = includeSuperseded
+func (f *fakeStore) ListRecentPage(_ context.Context, o memory.ListRecentOpts) ([]memory.Memory, error) {
+	f.sawInclude = o.IncludeSuperseded
 	return f.mems, nil
 }
 
@@ -239,7 +239,7 @@ func TestPruneFallsBackToForgetWithoutTrash(t *testing.T) {
 // way a vanished row or a failed trash write does.
 type failingTrash struct{ mems []memory.Memory }
 
-func (f *failingTrash) ListRecent(_ context.Context, _ int, _, _ bool) ([]memory.Memory, error) {
+func (f *failingTrash) ListRecentPage(_ context.Context, _ memory.ListRecentOpts) ([]memory.Memory, error) {
 	return f.mems, nil
 }
 func (f *failingTrash) Forget(_ context.Context, _ string) (bool, error) { return false, nil }

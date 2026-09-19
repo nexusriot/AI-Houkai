@@ -511,7 +511,7 @@ class TestAutoContextTouch:
                              type="procedural")
         store.auto_context_pack("deploy the release", token_budget=500,
                                 touch=False)
-        after = store._get_by_id(mem.id)
+        after = store.get(mem.id)
         assert after.access_count == 0
 
     def test_touch_default_bumps_access_stats(self, store: MemoryStore):
@@ -519,7 +519,7 @@ class TestAutoContextTouch:
                              type="procedural")
         pack = store.auto_context_pack("deploy the release", token_budget=500)
         assert pack.items                      # it actually recalled something
-        after = store._get_by_id(mem.id)
+        after = store.get(mem.id)
         assert after.access_count >= 1
 
 

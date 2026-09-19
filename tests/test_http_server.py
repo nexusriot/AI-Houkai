@@ -85,8 +85,9 @@ class TestHttpServer:
         assert health["count"] == 2
 
     def test_remember_many_empty(self, server):
+        # 200, not 201: nothing was created. See TestSurfaceBoundaries.
         status, body = _req(server, "POST", "/memories/batch", {"items": []})
-        assert status == 201 and body["stored"] == 0
+        assert status == 200 and body["stored"] == 0
 
     def test_remember_many_rejects_non_object_item(self, server):
         status, _ = _req(server, "POST", "/memories/batch", {"items": ["bare string"]})
@@ -823,3 +824,82 @@ class TestArchiveRouteGate:
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
+
+
+class TestSurfaceBoundaries:
+    """Boundary answers the Go port now matches.
+
+    A cross-port probe (same requests, same stub embedder, both servers) found
+    the two surfaces disagreeing on what a supplied zero means and on which
+    failures are the client's. These pin the Python side of each contract.
+    """
+
+    def test_empty_batch_is_not_created(self, server):
+        """201 Created for zero creations is a lie — and it contradicted the
+        rule the non-empty path already applied by counting new ids."""
+        status, body = _req(server, "POST", "/memories/batch", {"items": []})
+        assert status == 200
+        assert body["stored"] == 0
+
+        status, body = _req(server, "POST", "/memories/batch",
+                            {"items": [{"text": "a real batched memory"}]})
+        assert status == 201
+        assert body["stored"] == 1
+
+    def test_list_limit_zero_returns_nothing(self, server):
+        _req(server, "POST", "/memories", {"text": "limit zero subject"})
+        status, body = _req(server, "GET", "/memories?limit=0")
+        assert status == 200
+        assert body["memories"] == []
+
+    def test_neighbors_depth_zero_reaches_nothing(self, server):
+        _, a = _req(server, "POST", "/memories", {"text": "depth zero source"})
+        _, b = _req(server, "POST", "/memories", {"text": "depth zero target"})
+        _req(server, "POST", "/links",
+             {"src_id": a["id"], "dst_id": b["id"], "rel": "related"})
+
+        for depth in (0, -1):
+            status, body = _req(
+                server, "GET", f"/memories/{a['id']}/neighbors?depth={depth}")
+            assert status == 200
+            assert body["neighbors"] == [], f"depth={depth}"
+
+        status, body = _req(server, "GET",
+                            f"/memories/{a['id']}/neighbors?depth=1")
+        assert len(body["neighbors"]) == 1
+
+    def test_zero_token_budget_packs_nothing(self, server):
+        _req(server, "POST", "/memories", {"text": "budget subject to pack"})
+        for route, payload in (
+            ("/recall_pack", {"query": "budget subject", "token_budget": 0}),
+            ("/auto_context", {"task": "budget subject", "token_budget": 0}),
+        ):
+            status, body = _req(server, "POST", route, payload)
+            assert status == 200, route
+            assert body["items"] == [], route
+            assert "budget subject" not in body["text"], route
+
+    @pytest.mark.parametrize("route,payload", [
+        ("/recall", {"query": "x", "k": 2.7}),
+        ("/recall", {"query": "x", "overfetch": 1.5}),
+        ("/recall_pack", {"query": "x", "token_budget": 10.5}),
+        ("/auto_context", {"task": "x", "max_phrases": 1.5}),
+        ("/memories", {"text": "polarity probe", "polarity": 0.5}),
+        ("/recall", {"query": "x", "k": True}),
+    ])
+    def test_integer_params_reject_non_integers(self, server, route, payload):
+        """JSON has one number type, so truncating 2.7 to 2 would hide the
+        caller's bug rather than report it."""
+        status, _ = _req(server, "POST", route, payload)
+        assert status == 400
+
+    @pytest.mark.parametrize("k", [2, 2.0, "2"])
+    def test_integer_params_accept_whole_numbers(self, server, k):
+        """A whole number arriving as a float, and a numeric string, are both
+        still integers."""
+        for i in range(3):
+            _req(server, "POST", "/memories", {"text": f"whole number {i}"})
+        status, body = _req(server, "POST", "/recall",
+                            {"query": "whole number", "k": k})
+        assert status == 200
+        assert len(body["results"]) == 2

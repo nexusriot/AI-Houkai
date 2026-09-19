@@ -50,13 +50,25 @@ func validateChoice(value string, allowed []string, param string) error {
 		param, strings.Join(allowed, ", "), value)
 }
 
-// validateTags rejects commas: tags are stored comma-joined in backend
-// metadata, so a comma inside a tag would silently split it on the next read.
+// validateTags rejects tags the write path cannot round-trip or a reader
+// cannot use. The two rules have to match validateTagName's, which the
+// curation path applies, or a caller can create a tag that RenameTag then
+// refuses to touch:
+//
+//   - No commas: tags are stored comma-joined in backend metadata, so a comma
+//     inside one would silently split it on the next read.
+//   - Nothing blank: "" is swallowed by that same join and never appears
+//     again, and a tag of spaces reaches `houkai tags list` as an empty row
+//     that cannot be typed back in to select anything. A tag that merely
+//     contains a space is ordinary and stays legal.
 func validateTags(tags []string) error {
 	for _, t := range tags {
 		if strings.Contains(t, ",") {
 			return validationErrorf(
 				"tags must not contain commas — got %q (tags are stored as a comma-joined string)", t)
+		}
+		if strings.TrimSpace(t) == "" {
+			return validationErrorf("tag must not be empty — got %q", t)
 		}
 	}
 	return nil
