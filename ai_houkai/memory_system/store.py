@@ -240,7 +240,7 @@ class ExpandSpec:
     # the ``min_cosine`` gate, dedup, MMR diversity and the top-``k`` cut, so
     # they compete for the k slots and can neither inject near-duplicates nor
     # overflow k. When False (default) they are appended *after* the top-k cut,
-    # unfiltered — the original, backward-compatible behaviour.
+    # without relevance scoring; recall eligibility filters still apply.
     rerank: bool = False
 
 
@@ -894,6 +894,9 @@ class MemoryStore(CurationMixin):
         jp = Path(journal_path) if journal_path else Path(path).parent / "journal.log"
         self.journal = Journal(
             jp, rotate_mb=journal_rotate_mb, keep_days=journal_keep_days,
+            scope=hashlib.sha256(
+                (str(Path(path).resolve()) + "\0" + collection).encode("utf-8")
+            ).hexdigest(),
         )
 
     @contextmanager
@@ -1509,6 +1512,26 @@ class MemoryStore(CurationMixin):
             include = include + ["embeddings"]
         w = weights or self._hybrid_weights or HybridWeights()
 
+        now_ts = time.time()
+        validity_ts = now_ts if as_of is None else as_of
+
+        def eligible(mem: Memory) -> bool:
+            # All paths into the result set, including graph expansion, obey
+            # the same scope, lifecycle and provenance filters.
+            return (
+                (type is None or mem.type == type)
+                and (tag is None or tag in mem.tags)
+                and (min_importance is None or mem.importance >= min_importance)
+                and (source is None or mem.source == source)
+                and (since is None or mem.created_at >= since)
+                and (until is None or mem.created_at <= until)
+                and (pool_superseded or not mem.superseded_by)
+                and (min_trust is None
+                     or trust_rank(mem.trust) <= TRUST_LEVELS.index(min_trust))
+                and _is_valid_at(mem, validity_ts)
+                and (include_expired or not mem.expires_at or mem.expires_at > now_ts)
+            )
+
         while True:
             res = self.collection.query(
                 query_texts=[query],
@@ -1552,33 +1575,9 @@ class MemoryStore(CurationMixin):
                     res, tag, pool_superseded, w.polarity_weight, min_cosine,
                     expl)
 
-            # Drop memories whose origin is trusted less than the caller
-            # demands. A post-filter for the same reason as expiry: old rows
-            # have no "trust" key, and a Chroma equality clause would silently
-            # exclude every one of them.
-            if min_trust is not None:
-                floor = TRUST_LEVELS.index(min_trust)
-                scored = [(mem, s_) for mem, s_ in scored
-                          if trust_rank(mem.trust) <= floor]
-
-            # Drop memories that were not true at the moment being asked
-            # about. Default (as_of=None) means "now", so closing a
-            # valid_until retires a fact from ordinary recall without deleting
-            # it. A post-filter for the same reason as trust and expiry: old
-            # rows carry no validity keys, and a Chroma clause would silently
-            # exclude every one of them.
-            validity_ts = time.time() if as_of is None else as_of
-            scored = [(mem, s_) for mem, s_ in scored
-                      if _is_valid_at(mem, validity_ts)]
-
-            # Drop expired memories (post-filter, not a Chroma where-clause,
-            # so old rows without the expires_at key are unaffected). Done
-            # before rerank / top-k so an expired candidate can never occupy
-            # a returned slot.
-            if not include_expired:
-                now_ts = time.time()
-                scored = [(mem, s) for mem, s in scored
-                          if not (mem.expires_at and mem.expires_at <= now_ts)]
+            # Post-filter so legacy rows without trust/validity/expiry keys
+            # retain their defaults instead of disappearing in a DB filter.
+            scored = [(mem, s) for mem, s in scored if eligible(mem)]
 
             # Fast-path shortfall: the always-on validity filter can drop rows
             # the fetch-exactly-k guard cannot anticipate. When it does — and
@@ -1608,7 +1607,8 @@ class MemoryStore(CurationMixin):
             # explain entry of — a candidate that is already scored below k.
             pool_ids = {mem.id for mem, _ in scored}
             extra = self._collect_expansion(
-                scored[:k], expand, include_superseded, expl, seen_ids=pool_ids)
+                scored[:k], expand, pool_superseded, expl, seen_ids=pool_ids,
+                eligible=eligible)
             if extra:
                 # Expanded nodes carry an absolute hop score (~spec.score) tuned
                 # to the weighted [0,1] scale; RRF scores live near 1/rrf_k, so
@@ -1638,9 +1638,10 @@ class MemoryStore(CurationMixin):
             self._touch_many([mem for mem, _ in out])
 
         # Expand via outgoing links (rerank=False): appended after the top-k
-        # cut, unfiltered — the backward-compatible default.
+        # cut without relevance scoring; eligibility filters still apply.
         if expand is not None and expand.cap > 0 and not expand.rerank:
-            out = self._expand_links(out, expand, include_superseded, expl)
+            out = self._expand_links(out, expand, pool_superseded, expl,
+                                     eligible=eligible)
 
         self._record_recall_latency(time.perf_counter() - t0)
         if explain:
@@ -2959,8 +2960,7 @@ class MemoryStore(CurationMixin):
                 return
             if on_conflict == "overwrite":
                 if not dry_run:
-                    self.collection.delete(ids=[mem.id])
-                    self._add_imported(mem, vector)
+                    self._add_imported(mem, vector, overwrite=True)
                     written_ids.append(mem.id)
                 summary.overwritten += 1
                 return
@@ -2999,7 +2999,8 @@ class MemoryStore(CurationMixin):
             self._journal("edit", mem.id, before=before, after=mem.to_dict(),
                           meta={"import_remap": True})
 
-    def _add_imported(self, mem: Memory, vector: list[float] | None) -> None:
+    def _add_imported(self, mem: Memory, vector: list[float] | None, *,
+                      overwrite: bool = False) -> None:
         kwargs: dict[str, Any] = {
             "ids":       [mem.id],
             "documents": [mem.text],
@@ -3007,7 +3008,10 @@ class MemoryStore(CurationMixin):
         }
         if vector is not None:
             kwargs["embeddings"] = [vector]
-        self.collection.add(**kwargs)
+        # Chroma embeds and validates before replacing the row. A delete/add
+        # pair loses the original if embedding or vector validation fails.
+        write = self.collection.upsert if overwrite else self.collection.add
+        write(**kwargs)
         self._journal("import", mem.id, after=mem.to_dict(),
                       meta={"vectors_preserved": vector is not None})
 
@@ -3017,6 +3021,8 @@ class MemoryStore(CurationMixin):
         Returns True on success, False if the entry is not undoable or the
         target state has already diverged in a way that makes undo unsafe.
         """
+        if entry.scope != self.journal.scope:
+            return False
         if entry.op == "remember":
             ok = self.forget(entry.id)
             if ok:
@@ -3696,6 +3702,7 @@ class MemoryStore(CurationMixin):
         explanations: dict | None = None,
         *,
         seen_ids: set[str] | None = None,
+        eligible: Callable[[Memory], bool] | None = None,
     ) -> list[tuple[Memory, float]]:
         """Breadth-first graph expansion honouring ``spec.depth`` (multi-hop) with
         a per-hop ``spec.decay`` applied to ``spec.score``. Returns only the
@@ -3734,13 +3741,15 @@ class MemoryStore(CurationMixin):
                         continue
                     if not include_superseded and nb.superseded_by:
                         continue
+                    seen.add(lnk.to)
+                    if eligible is not None and not eligible(nb):
+                        continue
                     extra.append((nb, hop_score))
                     if explanations is not None:
                         explanations[nb.id] = {
                             "source": "graph_expansion", "rel": lnk.rel,
                             "hop": hop, "score": round(hop_score, 4),
                         }
-                    seen.add(lnk.to)
                     next_frontier.append(lnk.to)
                     added += 1
                     if added >= spec.cap:
@@ -3754,10 +3763,12 @@ class MemoryStore(CurationMixin):
         spec: ExpandSpec,
         include_superseded: bool,
         explanations: dict | None = None,
+        *,
+        eligible: Callable[[Memory], bool] | None = None,
     ) -> list[tuple[Memory, float]]:
         """Append graph-expanded neighbours after the top-k cut (``rerank=False``)."""
         return out + self._collect_expansion(
-            out, spec, include_superseded, explanations)
+            out, spec, include_superseded, explanations, eligible=eligible)
 
     def _graph_spread(
         self,

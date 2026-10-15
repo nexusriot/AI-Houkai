@@ -142,6 +142,53 @@ class TestGraphFusionRRF:
 
 
 class TestExpansionGating:
+    @pytest.mark.parametrize("rerank", [False, True])
+    def test_expansion_obeys_eligibility_and_skips_filtered_branches(self, store, rerank):
+        hub = store.remember("trusted seed", tags=["keep"], source="main", importance=0.8)
+        invalid = [
+            {"trust": "untrusted"}, {"trust": "reported"},
+            {"expires_at": 1}, {"valid_until": 1},
+            {"valid_from": 10**12}, {"type": "episodic"},
+            {"tags": ["other"]}, {"source": "other"}, {"importance": 0.1},
+            {"created_at": 1}, {"created_at": 10**12},
+        ]
+        for i, fields in enumerate(invalid):
+            opts = {"tags": ["keep"], "source": "main", "importance": 0.8}
+            opts.update(fields)
+            created_at = opts.pop("created_at", None)
+            child = store.remember(f"filtered neighbor {i}", **opts)
+            if created_at is not None:
+                store.collection.update(ids=[child.id], metadatas=[{"created_at": created_at}])
+            hidden = store.remember(f"behind filtered neighbor {i}", **{
+                "tags": ["keep"], "source": "main", "importance": 0.8})
+            store.link(hub.id, child.id, "related")
+            store.link(child.id, hidden.id, "related")
+        allowed = store.remember("eligible graph neighbor", tags=["keep"],
+                                 source="main", importance=0.8)
+        store.link(hub.id, allowed.id, "related")
+        hits = store.recall(
+            hub.text, k=2, min_cosine=0.999, min_trust="trusted",
+            type="semantic", tag="keep", source="main", min_importance=0.5,
+            since=2, until=10**11,
+            touch=False, explain=True,
+            expand=ExpandSpec(rels=("related",), depth=2, cap=1, rerank=rerank))
+        assert {m.id for m, _, _ in hits} == {hub.id, allowed.id}
+        assert next(e for m, _, e in hits if m.id == allowed.id)["source"] == "graph_expansion"
+
+    @pytest.mark.parametrize("rerank", [False, True])
+    def test_expansion_honors_explicit_lifecycle_overrides(self, store, rerank):
+        hub = store.remember("time travel seed")
+        past = store.remember("historical linked fact", valid_from=10, valid_until=20,
+                              expires_at=1, trust="reported")
+        newer = store.remember("replacement fact")
+        store.supersede(past.id, newer.id)
+        store.link(hub.id, past.id, "related")
+        hits = store.recall(
+            hub.text, k=2, min_cosine=0.999, as_of=15,
+            include_expired=True, min_trust="reported", touch=False,
+            expand=ExpandSpec(rels=("related",), cap=1, rerank=rerank))
+        assert {m.id for m, _ in hits} == {hub.id, past.id}
+
     def _seed_hub(self, store: MemoryStore, n_children: int = 5):
         hub = store.remember("microservice deployment runbook",
                              type="procedural")

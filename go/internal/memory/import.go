@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"reflect"
 
 	"github.com/google/uuid"
 	"github.com/nexusriot/ai-houkai/internal/vector"
@@ -111,21 +113,61 @@ func (s *MemoryStore) Import(ctx context.Context, path string, opts ImportOpts) 
 	summary.VectorsRegenerated = modelMismatch
 	useVectors := !modelMismatch && srcDim > 0
 
-	restore := s.AsActor("import")
-	defer restore()
-
-	var collisions [][2]string
-	renames := map[string]string{}
-	var writtenIDs []string
+	// Decode before writing so the error policy can check every collision,
+	// including repeated IDs inside the archive, without a partial import.
+	var rows []map[string]any
 	for {
 		var row map[string]any
 		if err := dec.Decode(&row); err != nil {
 			if err == io.EOF {
 				break
 			}
+			if opts.OnConflict == ImportErrorPolicy {
+				return summary, fmt.Errorf("%s: bad import row: %w", path, err)
+			}
 			summary.Errors = append(summary.Errors, ImportRowError{ID: "?", Msg: err.Error()})
 			break
 		}
+		rows = append(rows, row)
+	}
+	if opts.OnConflict == ImportErrorPolicy {
+		seen := map[string]bool{}
+		var collisions [][2]string
+		for _, row := range rows {
+			id, _ := row["id"].(string)
+			if id == "" {
+				meta, _ := row["meta"].(map[string]any)
+				id, _ = meta["id"].(string)
+			}
+			if id == "" {
+				continue
+			}
+			existing, err := s.GetByID(ctx, id)
+			if err == nil {
+				preview := existing.Text
+				if len(preview) > 80 {
+					preview = preview[:80]
+				}
+				collisions = append(collisions, [2]string{id, preview})
+			} else if !errors.Is(err, ErrNotFound) {
+				return summary, err
+			} else if seen[id] {
+				collisions = append(collisions, [2]string{id, "(duplicate id within import file)"})
+			}
+			seen[id] = true
+		}
+		if len(collisions) > 0 {
+			return summary, &ImportConflictError{Collisions: collisions}
+		}
+	}
+
+	restore := s.AsActor("import")
+	defer restore()
+
+	var collisions [][2]string
+	renames := map[string]string{}
+	var writtenIDs []string
+	for _, row := range rows {
 		if err := s.importOne(ctx, row, opts, useVectors, &summary, &collisions, renames, &writtenIDs); err != nil {
 			id, _ := row["id"].(string)
 			summary.Errors = append(summary.Errors, ImportRowError{ID: id, Msg: err.Error()})
@@ -248,9 +290,7 @@ func (s *MemoryStore) importOne(
 			return nil
 		case ImportOverwrite:
 			if !opts.DryRun {
-				if err := s.backend.Delete(ctx, []string{mem.ID}); err != nil {
-					return err
-				}
+				// Backend.Add upserts; embed/validate before replacing the row.
 				if err := s.addImported(ctx, mem, vec); err != nil {
 					return err
 				}
@@ -281,7 +321,21 @@ func (s *MemoryStore) addImported(ctx context.Context, mem Memory, vec []float32
 		if err != nil {
 			return fmt.Errorf("embed: %w", err)
 		}
+		if len(vecs) != 1 {
+			return fmt.Errorf("embed: expected one vector, got %d", len(vecs))
+		}
 		vec = vecs[0]
+	}
+	if len(vec) == 0 {
+		return fmt.Errorf("empty import vector")
+	}
+	if dim := s.embedder.Dim(); dim > 0 && len(vec) != dim {
+		return fmt.Errorf("import vector dimension %d does not match embedder dimension %d", len(vec), dim)
+	}
+	for _, v := range vec {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return fmt.Errorf("import vector must contain finite numbers")
+		}
 	}
 	if mem.Links == nil {
 		mem.Links = []Link{}
@@ -305,6 +359,9 @@ func (s *MemoryStore) addImported(ctx context.Context, mem Memory, vec []float32
 
 // Undo reverses a single journal entry where possible. Returns true on success.
 func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
+	if s.journal == nil || e.Scope != s.journal.Scope {
+		return false, nil
+	}
 	switch e.Op {
 	case "remember":
 		ok, err := s.Forget(ctx, e.ID)
@@ -346,12 +403,23 @@ func (s *MemoryStore) Undo(ctx context.Context, e JournalEntry) (bool, error) {
 		return true, nil
 
 	case "edit":
-		if e.Before == nil {
+		if e.Before == nil || e.After == nil {
 			return false, nil
 		}
 		current, err := s.GetByID(ctx, e.ID)
 		if err != nil {
 			return false, nil // memory has since been forgotten
+		}
+		// Compare persisted representations: metadata rounds floating-point
+		// fields, and a journal round-trip changes JSON numeric types.
+		currentState := MemoryToMetadata(current)
+		afterState := MemoryToMetadata(MemoryFromDict(e.After))
+		for _, key := range []string{"last_accessed", "access_count"} {
+			delete(currentState, key)
+			delete(afterState, key)
+		}
+		if !reflect.DeepEqual(currentState, afterState) {
+			return false, nil
 		}
 		restored := MemoryFromDict(e.Before)
 		// Always re-embed: the edit may have changed the text, and

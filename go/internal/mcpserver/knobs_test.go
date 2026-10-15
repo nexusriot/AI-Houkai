@@ -2,11 +2,56 @@ package mcpserver
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/nexusriot/ai-houkai/internal/memory"
 )
+
+func TestGraphEligibilityThroughRecallAndPackTools(t *testing.T) {
+	for _, tool := range []string{"recall", "recall_pack"} {
+		for _, rerank := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rerank=%v", tool, rerank), func(t *testing.T) {
+				store := newJournaledStore(t)
+				s := New(store, "/store", "test")
+				seed := callTool(t, s, "remember", map[string]any{"text": "trusted MCP seed"})["id"].(string)
+				for _, fields := range []map[string]any{
+					{"text": "untrusted MCP content", "trust": "untrusted"},
+					{"text": "expired MCP content", "expires_at": float64(1)},
+					{"text": "retired MCP content", "valid_until": float64(1)},
+				} {
+					child := callTool(t, s, "remember", fields)
+					callTool(t, s, "link", map[string]any{"src_id": seed, "dst_id": child["id"], "rel": "related"})
+				}
+				allowed := callTool(t, s, "remember", map[string]any{"text": "eligible MCP neighbor"})["id"].(string)
+				callTool(t, s, "link", map[string]any{"src_id": seed, "dst_id": allowed, "rel": "related"})
+				params := map[string]any{
+					"query": "trusted MCP seed", "mode": "semantic", "min_cosine": 0.999, "min_trust": "trusted",
+					"k": float64(2), "max_items": float64(2), "token_budget": float64(1000),
+					"expand_rels": []any{"related"}, "expand_cap": float64(1), "expand_rerank": rerank,
+				}
+				var rows []map[string]any
+				if tool == "recall" {
+					rows = callToolArray(t, s, tool, params)
+				} else {
+					result := callTool(t, s, tool, params)
+					for _, item := range result["items"].([]any) {
+						rows = append(rows, item.(map[string]any))
+					}
+					text := result["text"].(string)
+					if strings.Contains(text, "untrusted MCP") || strings.Contains(text, "expired MCP") || strings.Contains(text, "retired MCP") || !strings.Contains(text, "eligible MCP neighbor") {
+						t.Fatalf("ineligible packed context: %s", text)
+					}
+				}
+				if len(rows) != 2 || rows[0]["id"] != seed || rows[1]["id"] != allowed {
+					t.Fatalf("tool lost eligibility filters: %v", rows)
+				}
+			})
+		}
+	}
+}
 
 // The graph-proximity weight and graph-walk expansion reach the MCP recall /
 // recall_pack tools (A1). Before this they were HTTP- and library-only, so an

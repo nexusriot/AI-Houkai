@@ -1167,14 +1167,14 @@ LLM API  ──►  assistant reply to user
 
 ## 11. Test Architecture
 
-### 1412 tests across 48 files
+### 1435 tests across 48 files
 
 | File | Tests | What it covers |
 |---|---|---|
 | `test_maintenance.py` | 74 | Maintenance scheduler/daemon: tick, run-forever, duration parsing, state history, PID files, dry-run reflect schedule gating, **TTL purge job** (gating, state persistence, disabled) |
 | `test_http_server.py` | 98 | HTTP/REST API: all endpoints, auth token, 404/405/400/413 handling, keep-alive body-drain, `/health` topology-leak guard, plus `/metrics`, `/purge_expired`, `history`, `state_at`, `get_at`, TTL + `include_expired` + `explain`, POST-`/recall` advanced knobs (`graph` weight + `expand` rerank gating), and `POST /memories/batch` bulk write (`remember_many`), plus the **surface boundaries** a cross-port probe turned up: a supplied 0 means zero on every count/depth/budget, a non-integer where an integer is required is 400 rather than truncated, and an empty batch is 200 (it created nothing) |
 | `test_hybrid.py` | 55 | Hybrid retrieval: BM25 pool scoring, `HybridWeights`, blended ranking, link expansion, RRF fusion, MMR diversity & near-duplicate dedup, `min_cosine` gate, `explain` breakdowns, `recency_basis`, multi-hop expansion decay, CJK tokenization |
-| `test_graph_fusion.py` | 15 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
+| `test_graph_fusion.py` | 19 | Graph-proximity fusion (`HybridWeights.graph`): PPR-lite spread math, weighted/RRF no-op at `graph=0`, hub lift, `explain` graph term; gated expansion (`ExpandSpec.rerank`): respects `k`, dedups, RRF scale-remap doesn't bury primaries, drops un-embeddable nodes, `seen_ids` shielding |
 | `test_pack.py` | 70 | `recall_pack` / `auto_context_pack`: token-budget packing, truncation, custom counter, filters, rank-order preservation, near-duplicate compression, `min_cosine`, and `fanout_queries` (no duplicate fan-out query; a negative `max_phrases` is rejected, not reinterpreted) |
 | `test_validation.py` | 56 | Shared validation layer: store enum vocabularies (incl. `lexical_index`, so the retired `"fts"` spelling errors instead of silently reading as `"pool"`), dangling-link rejection, HTTP body coercion + status codes (400/404, HEAD, non-ASCII auth), clean CLI errors, **zero-means-zero** for `limit`/`depth`/`token_budget`, and blank tags refused by the write path as well as the curation path |
 | `test_cli.py` | 59 | CLI round-trips: remember → list → show → forget → nuke, tag/bump, link/neighbors/unlink, supersede/restore, export/import, stats, prune dry-run, stdin, pack, edit re-embed, interactive conflict resolution, **`--ttl` + `purge`**, `info` applying import's header checks, the store opened **lazily** (so `info` builds none), and the counts that slice locally (`list --limit`, `journal tail -n`, `eval -k`) refusing a negative and honouring a zero |
@@ -1184,7 +1184,7 @@ LLM API  ──►  assistant reply to user
 | `test_reflection.py` | 27 | `ReflectionEngine`: clustering, reflect (dry-run, consolidate, tags, custom summarizer), skips superseded **and lapsed** sources, polarity-cluster separation |
 | `test_async_store.py` | 51 | `AsyncMemoryStore`: coroutine API parity with sync store (incl. `probe_embedding`/`readiness`), executor lifecycle, aclose, plus a mechanical signature check — walking the MRO, so the twelve curation methods inherited from `CurationMixin` are covered too — so a wrapper cannot quietly drop a parameter the sync method gained |
 | `test_summarizers.py` | 24 | `build_summarizer`: spec parsing, ollama/openai/anthropic providers (stubbed), extractive fallback, config + scheduler wiring |
-| `test_journal.py` | 28 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution |
+| `test_journal.py` | 33 | Append-only audit journal: tail/show/undo (incl. restore-after-forget), rotation, actor attribution, store/collection ownership, and archive replay/undo after reopening via canonical path aliases |
 | `test_ingest.py` | 26 | `chunk_text` + `houkai ingest` / `houkai collections` round-trips, and that splitting a long paragraph never loses a short fragment to the noise filter |
 | `test_ttl.py` | 21 | **Expiry/TTL**: `remember(ttl_seconds/expires_at)`, recall + list hide-expired / `include_expired`, `edit`, `purge_expired` (dry-run, custom now, journaled), serialisation round-trip + migration |
 | `test_vector_index.py` | 16 | **Damaged vector index**: a real store stripped of its HNSW files still counts, lists and exports every memory — `vector_index_ok` detects it, recall refuses to answer rather than reporting a false empty, and `rebuild_vectors` re-embeds from the surviving text |
@@ -1193,7 +1193,7 @@ LLM API  ──►  assistant reply to user
 | `test_remember_many.py` | 30 | **Batch write**: `remember_many` input order/field mapping, batched embed (`ceil(N/batch)` `collection.add` calls), one-journal-entry-per-id + per-id undo, validation aborts before any write, `ignore`/`warn`/`supersede` (earlier-wins, no cycle) + `raise` rejected, TTL, async wrapper |
 | `test_mcp_server.py` | 28 | MCP tools in-process: lazy `get_store()` env honoring, `edit` dicts, `maintenance_tick` config, plus `metrics`, `purge_expired`, `history`, `state_at`, `get_at`, TTL + `explain`, and `remember_many` (bulk store, bad-item + `raise` rejection) |
 | `test_importance.py` | 18 | `score_importance`: tier matching, modifiers, clamping, store/config wiring |
-| `test_export_import.py` | 31 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen, and every shape of **broken archive** (not gzipped, truncated, empty, unparseable header, foreign `format`, future `version`, one bad row) raising one error class without writing anything |
+| `test_export_import.py` | 33 | Portable `.ahkai` archives: export filters, import conflict policies, dry-run, vector regen, and every shape of **broken archive** (not gzipped, truncated, empty, unparseable header, foreign `format`, future `version`, one bad row) raising one error class without writing anything |
 | `test_tui.py` | 18 | TUI view models, Navigator stack, Textual pilot runs (list/detail, neighbors, search), parallel-link row collapse |
 | `test_stats_health.py` | 15 | `houkai stats` and `--health` report: decay histogram, at-risk/stale counts, cluster detection, decay-formula alignment with `DecayEngine` (frequency reinforcement) and protected-type exclusion |
 | `test_installers.py` | 35 | Claude Code installer: `claude mcp add` invocation, `~/.claude.json` / `.mcp.json` direct writes, config preservation, atomic `write_json`, side-effect-free import of installers and the MCP server module |
@@ -1210,10 +1210,10 @@ LLM API  ──►  assistant reply to user
 | `test_curation.py` | 68 | **Curation**: `merge` (text join, outgoing-link transfer, **incoming-link re-pointing**, self-merge + missing-id errors, journaling), `versions` from the journal incl. archives, tag list/rename/merge/delete, `find_path` (undirected, depth cap, no-path, trivial), **trash** put/list/restore/purge and the decay-prune routing |
 | `test_corpus_lexical.py` | 17 | **Full-corpus lexical recall**: reaches a candidate outside the vector pool, real-cosine (not fabricated) distance for unioned hits, no duplication of a pool member, metadata/superseded/expired filters still applied, short-token skip + probe cap, punctuation safety, the merged pool keeping its embeddings so MMR/dedup still apply, and the Chroma-native `purge_expired` range query |
 | `test_working_set.py` | 69 | **Pinned** tier (packing order, budget interaction, decay/eviction exemption), **trust** tier (default, filtering, packer annotation, ingest boundaries), **idempotent** writes (normalised-text content hash, `remember_many`) |
-| `test_mcp_retrieval_knobs.py` | 35 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour |
+| `test_mcp_retrieval_knobs.py` | 39 | Every ranking knob reaches MCP `recall`/`recall_pack`/`auto_context` and forwards correctly; omitting them is byte-for-byte the previous behaviour; actual recall/pack results respect trust, expiry and valid time during graph expansion |
 | `test_embed.py` | 31 | **Pluggable embedder**: OpenAI-compatible + Ollama backends against a stub server (auth, batching, out-of-order reindexing, count mismatch, wrapped errors), `build_embedder` spec grammar, credentials never from the spec, the store seam + env var + precedence, `FakeEmbedder` determinism/normalisation, and a full store round-trip with no model |
 | `test_eval_wiring.py` | 23 | Gold-set parsing (comments, malformed lines, id-prefix resolution, unresolvable id is an error not a zero score), `houkai eval` scores + recorded config + read-only guarantee, the `eval_recall` MCP tool |
-| `test_surface_coverage.py` | 29 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands |
+| `test_surface_coverage.py` | 37 | Store capabilities that had no remote surface: MCP + HTTP `undo` (newest / by ts / by memory), `restore`, `subgraph`, guarded `nuke`, `journal`, `export`/`import`, and the CLI `history`/`state-at`/`get-at`/`metrics` commands; collection-scoped HTTP/CLI undo, HTTP graph eligibility in packed context, and import failure atomicity |
 | `test_code_style.py` | 31 | House rules enforced mechanically: no banner comments (trailing rules **and** dash-bookended labels, across .py/.go/.sh/.yml/.toml/Makefile/Dockerfile), no import below module top, plus the detectors' own discrimination cases |
 | `test_docs.py` | 7 | Documented numbers match what they describe: every test module has a row in the table above, every count in it is current, the headline totals and the `needs_model` figure agree with pytest's own collection, and neither **Python** doc quotes a tool or route count that disagrees with `parity.json`. The Go docs are checked by the same rule in `go/internal/parity/docs_test.go` — parity.json's own contract is that each port asserts against it in that port's suite, and the hermetic Python image has no `go/` tree to read |
 | `test_public_get.py` | 9 | `MemoryStore.get()` as public API: plain read (no touch, no journal), returns superseded/expired, async wrapper, deprecated `_get_by_id` alias, MCP `get` tool |
@@ -2005,13 +2005,20 @@ One compact JSON object per line:
 
 ```json
 {"ts": 1748284800.123, "op": "supersede", "actor": "reflection",
- "id": "72be7903-…", "before": {…}, "after": {…}, "meta": {"new_id": "…"}}
+ "id": "72be7903-…", "scope": "<store-and-collection-sha256>",
+ "before": {…}, "after": {…}, "meta": {"new_id": "…"}}
 ```
 
 - **op** — `remember | forget | edit | supersede | restore | link | unlink |
   reflect | decay | import | export | undo`
 - **actor** — who performed it: `cli` / `mcp` / `http` / `reflection` /
   `decay` / `import` / `lib`
+- **scope** — SHA-256 of the canonical absolute store path, a NUL separator,
+  and collection name (UTF-8). Store-bound journal reads filter ownership
+  before timestamp lookup or limits; undo also rejects foreign entries.
+  Unscoped legacy entries remain available through `Journal(path).read(...)`
+  for explicit recovery, but are excluded from store history and undo because
+  their owner cannot be inferred. Moving the store path changes its scope.
 - **before / after** — full memory snapshots where applicable; these are
   what make `undo` possible.
 

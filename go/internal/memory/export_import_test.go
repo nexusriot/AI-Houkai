@@ -1,11 +1,171 @@
 package memory
 
 import (
+	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+type unavailableImportEmbedder struct{}
+
+func (unavailableImportEmbedder) Dim() int { return 16 }
+func (unavailableImportEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, fmt.Errorf("embedding provider unavailable")
+}
+
+func writeImportRows(t *testing.T, rows []map[string]any, dim int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "import.ahkai")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	enc := json.NewEncoder(gz)
+	if err := enc.Encode(map[string]any{"format": "ai-houkai/export", "version": 1,
+		"source": map[string]any{"embedding_dim": dim}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestFailedImportOverwritePreservesOriginal(t *testing.T) {
+	for _, failure := range []string{"provider", "vector"} {
+		t.Run(failure, func(t *testing.T) {
+			s := newJournaledStore(t)
+			ctx := context.Background()
+			m, _, _, err := s.Remember(ctx, "original", RememberOpts{Tags: []string{"keep"}, Pinned: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _ := s.GetByID(ctx, m.ID)
+			row := map[string]any{"id": m.ID, "text": "replacement", "meta": m.ToDict()}
+			dim := 0
+			if failure == "vector" {
+				dim = 16
+				row["vector"] = []float32{1, 0}
+			}
+			path := writeImportRows(t, []map[string]any{row}, dim)
+			if failure == "provider" {
+				s.embedder = unavailableImportEmbedder{}
+			}
+			entriesBefore, _ := s.Journal().Read(ReadOpts{})
+			sum, err := s.Import(ctx, path, ImportOpts{OnConflict: ImportOverwrite})
+			if err != nil || len(sum.Errors) != 1 || sum.Overwritten != 0 {
+				t.Fatalf("unexpected import result: %+v, %v", sum, err)
+			}
+			after, err := s.GetByID(ctx, m.ID)
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("failed overwrite changed original: %+v, %v", after, err)
+			}
+			entriesAfter, _ := s.Journal().Read(ReadOpts{})
+			if !reflect.DeepEqual(entriesBefore, entriesAfter) {
+				t.Fatal("failed overwrite changed journal")
+			}
+		})
+	}
+}
+
+func TestImportErrorPreflightsEveryCollision(t *testing.T) {
+	for _, kind := range []string{"existing-first", "existing-last", "duplicate", "duplicate-meta"} {
+		for _, dryRun := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/dry=%v", kind, dryRun), func(t *testing.T) {
+				s := newJournaledStore(t)
+				ctx := context.Background()
+				m, _, _, _ := s.Remember(ctx, "existing", RememberOpts{})
+				fresh := map[string]any{"id": "fresh", "text": "new fact"}
+				collision := map[string]any{"id": m.ID, "text": "collision"}
+				rows := []map[string]any{fresh, collision}
+				if kind == "existing-first" {
+					rows = []map[string]any{collision, fresh}
+				}
+				if kind == "duplicate" {
+					rows = []map[string]any{fresh, fresh}
+				}
+				if kind == "duplicate-meta" {
+					meta := map[string]any{"meta": map[string]any{"id": "fresh", "text": "new fact"}}
+					rows = []map[string]any{meta, meta}
+				}
+				path := writeImportRows(t, rows, 0)
+				before, _ := s.Journal().Read(ReadOpts{})
+				sum, err := s.Import(ctx, path, ImportOpts{OnConflict: ImportErrorPolicy, DryRun: dryRun})
+				var conflict *ImportConflictError
+				if !errors.As(err, &conflict) || len(conflict.Collisions) != 1 || sum.Imported != 0 {
+					t.Fatalf("expected preflight rejection, got %+v, %v", sum, err)
+				}
+				if count, _ := s.Count(ctx); count != 1 {
+					t.Fatalf("rejected import left %d memories", count)
+				}
+				after, _ := s.Journal().Read(ReadOpts{})
+				if !reflect.DeepEqual(before, after) {
+					t.Fatal("rejected import changed journal")
+				}
+			})
+		}
+	}
+}
+
+func TestUndoEditRejectsDivergedState(t *testing.T) {
+	for _, change := range []string{"edit", "link", "supersede", "recall", "missing-after"} {
+		t.Run(change, func(t *testing.T) {
+			s := newJournaledStore(t)
+			ctx := context.Background()
+			m, _, _, _ := s.Remember(ctx, "original", RememberOpts{Importance: Float32Ptr(0.1234567)})
+			text := "first edit"
+			if _, err := s.Edit(ctx, m.ID, EditOpts{Text: &text}); err != nil {
+				t.Fatal(err)
+			}
+			entries, _ := s.Journal().Read(ReadOpts{Op: "edit"})
+			e := entries[0]
+			switch change {
+			case "edit":
+				text = "newer edit"
+				s.Edit(ctx, m.ID, EditOpts{Text: &text})
+			case "link", "supersede":
+				other, _, _, _ := s.Remember(ctx, "other", RememberOpts{})
+				if change == "link" {
+					s.Link(ctx, m.ID, other.ID, RelRelated)
+				} else {
+					s.Supersede(ctx, m.ID, other.ID)
+				}
+			case "recall":
+				s.Recall(ctx, text, 1, RecallOpts{})
+			case "missing-after":
+				e.After = nil
+			}
+			before, _ := s.GetByID(ctx, m.ID)
+			ok, err := s.Undo(ctx, e)
+			if err != nil || ok != (change == "recall") {
+				t.Fatalf("undo = %v, %v", ok, err)
+			}
+			after, _ := s.GetByID(ctx, m.ID)
+			if change == "recall" {
+				if after.Text != "original" {
+					t.Fatal("recall prevented a safe undo")
+				}
+			} else if !reflect.DeepEqual(before, after) {
+				t.Fatal("stale undo changed memory")
+			}
+		})
+	}
+}
 
 func TestExportImportRoundTrip(t *testing.T) {
 	src := newTestStore(t)
@@ -74,38 +234,35 @@ func TestExportImportRoundTrip(t *testing.T) {
 }
 
 func TestImportOverwrite(t *testing.T) {
-	s := newTestStore(t)
-	ctx := context.Background()
-
-	// Pre-seed dst with a memory; export from another store using same id.
-	m, _, _, err := s.Remember(ctx, "original", RememberOpts{Type: Semantic})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Manually craft an .ahkai with the same id but different text.
-	path := filepath.Join(t.TempDir(), "patch.ahkai")
-	other := newTestStore(t)
-	// Inject via Import-style path: re-Remember with crafted id is awkward;
-	// instead we Export from the source and modify the on-disk header is
-	// overkill — just test overwrite by exporting our own store back into
-	// itself with the overwrite policy after mutating text isn't trivial
-	// either. Settle for: export from `other`, copy file, hand-import.
-	_, _, _, _ = other.Remember(ctx, "replacement", RememberOpts{Type: Semantic})
-	if _, err := other.Export(ctx, path, ExportOpts{IncludeVectors: true, IncludeSuperseded: true}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Sanity: re-importing same export with rename keeps both originals.
-	sum, err := s.Import(ctx, path, ImportOpts{OnConflict: ImportRename})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sum.Renamed+sum.Imported < 1 {
-		t.Errorf("expected at least one row to land; sum=%+v", sum)
-	}
-	if _, err := s.GetByID(ctx, m.ID); err != nil {
-		t.Errorf("original lost during rename import: %v", err)
+	for _, vectors := range []bool{false, true} {
+		t.Run(fmt.Sprintf("vectors=%v", vectors), func(t *testing.T) {
+			s := newJournaledStore(t)
+			ctx := context.Background()
+			original, _, _, err := s.Remember(ctx, "original", RememberOpts{Tags: []string{"archived"}, Pinned: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, _ := s.GetByID(ctx, original.ID)
+			path := filepath.Join(t.TempDir(), "overwrite.ahkai")
+			if _, err := s.Export(ctx, path, ExportOpts{IncludeVectors: vectors}); err != nil {
+				t.Fatal(err)
+			}
+			text := "modified locally"
+			if _, err := s.Edit(ctx, original.ID, EditOpts{Text: &text, Tags: []string{"local"}}); err != nil {
+				t.Fatal(err)
+			}
+			sum, err := s.Import(ctx, path, ImportOpts{OnConflict: ImportOverwrite})
+			if err != nil || sum.Overwritten != 1 || len(sum.Errors) != 0 {
+				t.Fatalf("overwrite: %+v, %v", sum, err)
+			}
+			got, err := s.GetByID(ctx, original.ID)
+			if err != nil || !reflect.DeepEqual(before, got) {
+				t.Fatalf("overwrite did not restore snapshot: %+v, %v", got, err)
+			}
+			if count, _ := s.Count(ctx); count != 1 {
+				t.Fatalf("overwrite created %d rows", count)
+			}
+		})
 	}
 }
 

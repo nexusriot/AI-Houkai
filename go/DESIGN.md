@@ -87,6 +87,13 @@ JSON line to `journal.log` next to the store. Reflection and decay are *not*
 op markers — they run through ordinary `remember` / `forget` / `link` entries
 and are distinguished only by their `actor` tag (`reflection` / `decay`).
 
+Store-bound journals also carry a `Scope`: SHA-256 of the canonical absolute
+store path, a NUL separator, and collection name, matching Python. `Read`
+filters ownership before limits or timestamp lookup; `Undo` rejects entries
+from another scope. Unscoped legacy entries are preserved but excluded from
+store operations. A raw `NewJournal` reader has no scope and can inspect them
+for explicit recovery. Changing the store path changes its history scope.
+
 - **Best-effort writes.** `Journal.Append` swallows and logs all errors —
   a journal failure must never break the underlying memory op.
 - **Size-based gzip rotation.** Hot file caps at `RotateMB` (64 by default);
@@ -457,7 +464,7 @@ install or Homebrew tap distribution:
 
 ## Testing strategy
 
-62 test files / 629 test functions across 15 packages, all offline
+62 test files / 641 test functions across 15 packages, all offline
 (`go test ./...` needs no network and no Ollama). The highlights below are a
 guide to where each concern is covered, not an inventory — `ls
 internal/*/*_test.go` is the inventory:

@@ -6,6 +6,7 @@ differentiator and undo was reachable only from a local shell.
 
 from __future__ import annotations
 
+import gzip
 import json
 import time
 import threading
@@ -161,6 +162,98 @@ class TestMcpSurface:
 
 
 class TestHttpSurface:
+    @pytest.mark.parametrize("rerank", [False, True])
+    @pytest.mark.parametrize("endpoint", ["/recall", "/recall_pack"])
+    def test_graph_filters_survive_http_and_context_packing(self, http, rerank, endpoint):
+        call, _ = http
+        status, seed = call("POST", "/memories", {"text": "trusted graph seed"})
+        assert status == 201
+        for text, fields in [
+            ("untrusted graph content", {"trust": "untrusted"}),
+            ("expired graph content", {"expires_at": 1}),
+            ("retired graph content", {"valid_until": 1}),
+        ]:
+            status, child = call("POST", "/memories", {"text": text, **fields})
+            assert status == 201
+            status, _ = call("POST", "/links", {
+                "src_id": seed["id"], "dst_id": child["id"], "rel": "related"})
+            assert status == 200
+        _, allowed = call("POST", "/memories", {"text": "eligible graph content"})
+        call("POST", "/links", {"src_id": seed["id"], "dst_id": allowed["id"], "rel": "related"})
+        status, result = call("POST", endpoint, {
+            "query": "trusted graph seed", "k": 2, "max_items": 2,
+            "mode": "semantic", "min_cosine": 0.999, "min_trust": "trusted",
+            "token_budget": 1000,
+            "expand": {"rels": ["related"], "cap": 1, "rerank": rerank},
+        })
+        assert status == 200
+        rows = result["results"] if endpoint == "/recall" else result["items"]
+        assert {r["id"] for r in rows} == {seed["id"], allowed["id"]}
+        if endpoint == "/recall_pack":
+            assert "eligible graph content" in result["text"]
+            assert all(text not in result["text"] for text in (
+                "untrusted graph content", "expired graph content", "retired graph content"))
+
+    def test_journal_routes_and_default_undo_are_collection_scoped(self, http):
+        call, store = http
+        _, own = call("POST", "/memories", {"text": "own original"})
+        call("PATCH", f"/memories/{own['id']}", {"text": "own edited"})
+        foreign = MemoryStore(path=store.path, collection="foreign",
+                              embedding_function=store._embed_fn)
+        try:
+            other = foreign.remember("foreign private fact")
+            foreign.forget(other.id)
+            status, result = call("GET", "/journal?n=10")
+            assert status == 200 and result["count"] == 2
+            assert {e["id"] for e in result["entries"]} == {own["id"]}
+            status, state = call("GET", f"/state_at?ts={time.time() + 1}")
+            assert status == 200 and [m["id"] for m in state["memories"]] == [own["id"]]
+            assert call("GET", f"/memories/{other.id}/history")[0] == 404
+            assert call("POST", "/undo", {"memory_id": other.id})[0] == 404
+            status, undone = call("POST", "/undo", {})
+            assert status == 200 and undone["ok"] is True and undone["id"] == own["id"]
+            assert call("GET", f"/memories/{own['id']}")[1]["text"] == "own original"
+            assert call("GET", f"/memories/{other.id}")[0] == 404
+            assert foreign.get(other.id) is None
+        finally:
+            foreign.client.close()
+
+    def test_import_overwrite_failure_is_reported_without_losing_memory(self, http_tokened, tmp_path):
+        call, _ = http_tokened
+        _, original = call("POST", "/memories", {"text": "preserve this row", "tags": ["keep"]})
+        path = str(tmp_path / "invalid-vector.ahkai")
+        assert call("POST", "/export", {"path": path})[0] == 200
+        with gzip.open(path, "rt") as f:
+            rows = [json.loads(line) for line in f]
+        rows[1]["text"] = "invalid replacement"
+        rows[1]["vector"] = [1.0, 0.0]
+        with gzip.open(path, "wt") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        status, result = call("POST", "/import", {"path": path, "on_conflict": "overwrite"})
+        assert status == 200 and result["overwritten"] == 0
+        assert [e["id"] for e in result["errors"]] == [original["id"]]
+        status, fetched = call("GET", f"/memories/{original['id']}")
+        assert status == 200 and fetched["text"] == "preserve this row"
+        assert fetched["tags"] == ["keep"]
+
+    def test_import_collision_rejects_nonconflicting_rows_too(self, http_tokened, tmp_path):
+        call, store = http_tokened
+        _, original = call("POST", "/memories", {"text": "existing fact"})
+        path = str(tmp_path / "collision.ahkai")
+        assert call("POST", "/export", {"path": path})[0] == 200
+        with gzip.open(path, "rt") as f:
+            rows = [json.loads(line) for line in f]
+        rows.insert(1, {"id": "new-nonconflicting-id", "text": "must not be inserted"})
+        with gzip.open(path, "wt") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        before = list(store.journal.read())
+        status, result = call("POST", "/import", {"path": path, "on_conflict": "error"})
+        assert status == 409 and "collision" in result["error"]
+        assert call("GET", "/memories")[1]["memories"][0]["id"] == original["id"]
+        assert store.count() == 1 and list(store.journal.read()) == before
+
     def test_restore(self, http):
         call, _ = http
         _, old = call("POST", "/memories", {"text": "http old policy"})
@@ -288,6 +381,22 @@ class TestCliSurface:
         assert res.exit_code == 0 and "Undone." in res.stdout
         listing = self._run(tmp_path, "list", "--format", "json")
         assert json.loads(listing.stdout or "[]") == []
+
+    def test_journal_undo_last_only_changes_the_selected_collection(self, tmp_path):
+        for collection in ("alpha", "bravo"):
+            result = self._run(tmp_path, "--collection", collection,
+                               "remember", f"private {collection} fact")
+            assert result.exit_code == 0, result.output
+        state = self._run(tmp_path, "--collection", "alpha", "state-at", "now", "--json")
+        assert state.exit_code == 0, state.output
+        assert [m["text"] for m in json.loads(state.stdout)["memories"]] == ["private alpha fact"]
+        undone = self._run(tmp_path, "--collection", "alpha", "journal", "undo-last", "-y")
+        assert undone.exit_code == 0, undone.output
+        alpha = self._run(tmp_path, "--collection", "alpha", "list", "--format", "json")
+        bravo = self._run(tmp_path, "--collection", "bravo", "list", "--format", "json")
+        assert alpha.exit_code == bravo.exit_code == 0
+        assert json.loads(alpha.stdout) == []
+        assert [m["text"] for m in json.loads(bravo.stdout)] == ["private bravo fact"]
 
 
 class TestCliRegressionFixes:

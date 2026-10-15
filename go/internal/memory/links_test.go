@@ -290,7 +290,8 @@ func TestUndoLegacyUnlinkEntryWithoutRemovedRels(t *testing.T) {
 
 	legacy := JournalEntry{
 		Op: "unlink", ID: a,
-		Meta: map[string]any{"src_id": a, "dst_id": b, "rel": RelContradicts},
+		Scope: store.Journal().Scope,
+		Meta:  map[string]any{"src_id": a, "dst_id": b, "rel": RelContradicts},
 	}
 	ok, err := store.Undo(ctx, legacy)
 	if err != nil || !ok {

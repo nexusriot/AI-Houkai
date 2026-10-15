@@ -145,7 +145,7 @@ AI-Houkai/
 │   ├── 07_maintenance_daemon.py  # maintenance scheduler / detached daemon
 │   ├── claude_agent.py           # Claude Sonnet REPL (Anthropic SDK)
 │   └── pip_package_example.py   # post-install usage walkthrough
-├── tests/                        # 1412 tests across 48 files
+├── tests/                        # 1435 tests across 48 files
 │   ├── conftest.py               # isolated MemoryStore fixture (tmp_path)
 │   ├── test_memory.py            # MemoryStore unit tests (remember/forget/nuke/recall)
 │   ├── test_decay.py             # DecayEngine unit tests
@@ -643,6 +643,14 @@ rotated and gzipped at 64 MB, 90-day retention by default). Entries
 carry the actor (`cli` / `mcp` / `http` / `reflection` / `decay` /
 `import` / `lib`) plus `before`/`after` snapshots where applicable.
 
+Journal entries carry a `scope` derived from the canonical absolute store
+path and collection name. History, replay, journal commands and undo only
+use entries owned by that scope, including rotated archives. Old entries
+without a scope are preserved on disk but excluded from these operations:
+their collection cannot be inferred safely. For explicit recovery, an
+unscoped `Journal(path).read(include_archives=True)` reads all entries.
+Moving a store to a different path also requires explicit history recovery.
+
 ```bash
 # Tail recent entries (newest first)
 houkai journal tail
@@ -900,7 +908,7 @@ Forward-looking feature recommendations live in
 ## Run the tests
 
 ```bash
-pytest tests/ -q                       # 1412 tests across 48 files
+pytest tests/ -q                       # 1435 tests across 48 files
 pytest tests/ -q -m "not needs_model"  # the fast subset — no torch, no download
 pytest functional_tests -v             # 16 black-box e2e tests (needs an install)
 ```

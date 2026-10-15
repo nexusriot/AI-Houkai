@@ -123,6 +123,12 @@ func NewMemoryStore(backend vector.Backend, embedder embed.Embedder, cfg StoreCo
 			jp = filepath.Join(filepath.Dir(cfg.Path), "journal.log")
 		}
 		s.journal = NewJournal(jp, cfg.JournalRotateMB, cfg.JournalKeepDays)
+		storePath, _ := filepath.Abs(cfg.Path)
+		if resolved, err := filepath.EvalSymlinks(storePath); err == nil {
+			storePath = resolved
+		}
+		scope := sha256.Sum256([]byte(storePath + "\x00" + cfg.Collection))
+		s.journal.Scope = hex.EncodeToString(scope[:])
 	}
 	return s
 }
@@ -728,6 +734,18 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 	// filter decide. Without this, AsOf would answer with today's beliefs
 	// wearing a past timestamp.
 	poolSuperseded := opts.IncludeSuperseded || opts.AsOf > 0
+	eligible := func(m Memory) bool {
+		return (opts.Type == "" || m.Type == opts.Type) &&
+			(opts.Tag == "" || contains(m.Tags, opts.Tag)) &&
+			m.Importance >= opts.MinImportance &&
+			(opts.Source == "" || m.Source == opts.Source) &&
+			(opts.Since == 0 || m.CreatedAt >= opts.Since) &&
+			(opts.Until == 0 || m.CreatedAt <= opts.Until) &&
+			(poolSuperseded || m.SupersededBy == "") &&
+			(opts.MinTrust == "" || TrustRank(m.Trust) <= TrustRank(opts.MinTrust)) &&
+			isValidAt(m, validityTS) &&
+			(opts.IncludeExpired || m.ExpiresAt == 0 || m.ExpiresAt > now)
+	}
 
 	w := opts.Weights
 	if w == (HybridWeights{}) {
@@ -803,22 +821,10 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 			scored = scoreSemantic(pool, w, opts.Tag, poolSuperseded, opts.MinCosine, expl)
 		}
 
-		// Post-scoring filters, in the reference port's order: trust, then
-		// validity, then expiry. Rows written before these features existed
-		// carry zero values and pass untouched.
+		// All paths into the result set obey the same eligibility filters.
 		kept := scored[:0]
 		for _, sc := range scored {
-			if opts.MinTrust != "" && TrustRank(sc.mem.Trust) > TrustRank(opts.MinTrust) {
-				continue
-			}
-			// Drop memories that were not true at the moment being asked
-			// about. Default (AsOf unset) means "now", so closing a
-			// ValidUntil retires a fact from ordinary recall without
-			// deleting it.
-			if !isValidAt(sc.mem, validityTS) {
-				continue
-			}
-			if !opts.IncludeExpired && sc.mem.ExpiresAt > 0 && sc.mem.ExpiresAt <= now {
+			if !eligible(sc.mem) {
 				continue
 			}
 			kept = append(kept, sc)
@@ -871,7 +877,7 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		for i, sc := range scored {
 			poolIDs[i] = sc.mem.ID
 		}
-		extra, err := s.collectExpansion(ctx, seedMWS, opts.Expand, opts.IncludeSuperseded, expl, poolIDs)
+		extra, err := s.collectExpansion(ctx, seedMWS, opts.Expand, poolSuperseded, expl, poolIDs, eligible)
 		if err != nil {
 			return nil, err
 		}
@@ -962,10 +968,10 @@ func (s *MemoryStore) Recall(ctx context.Context, query string, k int, opts Reca
 		}
 	}
 
-	// Graph expansion (rerank=false): appended after the top-k cut, unfiltered
-	// — the backward-compatible default.
+	// Graph expansion (rerank=false) skips relevance scoring, but still obeys
+	// scope, lifecycle and provenance filters.
 	if opts.Expand != nil && opts.Expand.Cap > 0 && !opts.Expand.Rerank {
-		out, err = s.expandResults(ctx, out, opts.Expand, opts.IncludeSuperseded, expl)
+		out, err = s.expandResults(ctx, out, opts.Expand, poolSuperseded, expl, eligible)
 		if err != nil {
 			return nil, err
 		}
@@ -2104,8 +2110,8 @@ func (s *MemoryStore) resolvePrefix(ctx context.Context, prefix string) (Memory,
 // assigned spec.Score, mirroring Python's _expand_links.
 // expandResults appends graph-expanded neighbours after the top-k cut
 // (rerank=false) — the backward-compatible default.
-func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any) ([]MemoryWithScore, error) {
-	extra, err := s.collectExpansion(ctx, out, spec, includeSuperseded, expl, nil)
+func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any, eligible func(Memory) bool) ([]MemoryWithScore, error) {
+	extra, err := s.collectExpansion(ctx, out, spec, includeSuperseded, expl, nil, eligible)
 	if err != nil {
 		return out, err
 	}
@@ -2120,7 +2126,7 @@ func (s *MemoryStore) expandResults(ctx context.Context, out []MemoryWithScore, 
 // their existing explain entries stay intact). The BFS still fans out from out
 // — pass a superset of out to expand from the top-k while shielding the rest of
 // an already-scored pool.
-func (s *MemoryStore) collectExpansion(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any, seenIDs []string) ([]MemoryWithScore, error) {
+func (s *MemoryStore) collectExpansion(ctx context.Context, out []MemoryWithScore, spec *ExpandSpec, includeSuperseded bool, expl map[string]map[string]any, seenIDs []string, eligible func(Memory) bool) ([]MemoryWithScore, error) {
 	if spec == nil || spec.Cap <= 0 {
 		return nil, nil
 	}
@@ -2169,6 +2175,10 @@ func (s *MemoryStore) collectExpansion(ctx context.Context, out []MemoryWithScor
 					continue
 				}
 				if !includeSuperseded && nb.SupersededBy != "" {
+					continue
+				}
+				seen[lnk.To] = true
+				if eligible != nil && !eligible(nb) {
 					continue
 				}
 				mws := MemoryWithScore{Memory: nb, Score: hopScore}

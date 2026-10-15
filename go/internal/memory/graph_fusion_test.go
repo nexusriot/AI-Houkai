@@ -2,12 +2,86 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"testing"
 
 	"github.com/nexusriot/ai-houkai/internal/vector"
 )
+
+func TestExpansionObeysEligibility(t *testing.T) {
+	for _, rerank := range []bool{false, true} {
+		name := "append"
+		if rerank {
+			name = "rerank"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newJournaledStore(t)
+			ctx := context.Background()
+			opts := RememberOpts{Type: Semantic, Tags: []string{"keep"}, Source: "main", Importance: Float32Ptr(0.8)}
+			hub, _, _, _ := s.Remember(ctx, "trusted seed", opts)
+			changes := []func(*Memory){
+				func(m *Memory) { m.Trust = TrustUntrusted },
+				func(m *Memory) { m.Trust = TrustReported },
+				func(m *Memory) { m.ExpiresAt = 1 },
+				func(m *Memory) { m.ValidUntil = 1 },
+				func(m *Memory) { m.ValidFrom = 1e12 },
+				func(m *Memory) { m.Type = Episodic },
+				func(m *Memory) { m.Tags = []string{"other"} },
+				func(m *Memory) { m.Source = "other" },
+				func(m *Memory) { m.Importance = 0.1 },
+				func(m *Memory) { m.CreatedAt = 1 },
+				func(m *Memory) { m.CreatedAt = 1e12 },
+			}
+			for i, change := range changes {
+				child, _, _, _ := s.Remember(ctx, fmt.Sprintf("filtered neighbor %d", i), opts)
+				change(&child)
+				if err := s.UpdateMemory(ctx, child, false); err != nil {
+					t.Fatal(err)
+				}
+				hidden, _, _, _ := s.Remember(ctx, fmt.Sprintf("behind filtered neighbor %d", i), opts)
+				s.Link(ctx, hub.ID, child.ID, RelRelated)
+				s.Link(ctx, child.ID, hidden.ID, RelRelated)
+			}
+			allowed, _, _, _ := s.Remember(ctx, "eligible graph neighbor", opts)
+			s.Link(ctx, hub.ID, allowed.ID, RelRelated)
+			hits, err := s.Recall(ctx, hub.Text, 2, RecallOpts{
+				Type: Semantic, Tag: "keep", Source: "main", MinImportance: 0.5,
+				Since: 2, Until: 1e11, MinTrust: TrustTrusted, MinCosine: Float32Ptr(0.999),
+				NoTouch: true, Explain: true,
+				Expand: &ExpandSpec{Rels: []string{RelRelated}, Depth: 2, Cap: 1, Score: 0.7, Rerank: rerank},
+			})
+			if err != nil || len(hits) != 2 {
+				t.Fatalf("recall: %+v, %v", hits, err)
+			}
+			if hits[0].ID != hub.ID || hits[1].ID != allowed.ID || hits[1].Explain["source"] != "graph_expansion" {
+				t.Fatalf("unexpected expansion: %+v", hits)
+			}
+		})
+	}
+}
+
+func TestExpansionHonorsLifecycleOverrides(t *testing.T) {
+	for _, rerank := range []bool{false, true} {
+		s := newJournaledStore(t)
+		ctx := context.Background()
+		hub, _, _, _ := s.Remember(ctx, "time travel seed", RememberOpts{})
+		past, _, _, _ := s.Remember(ctx, "historical linked fact", RememberOpts{
+			ValidFrom: f64(10), ValidUntil: f64(20), ExpiresAt: f64(1), Trust: TrustReported,
+		})
+		newer, _, _, _ := s.Remember(ctx, "replacement fact", RememberOpts{})
+		s.Supersede(ctx, past.ID, newer.ID)
+		s.Link(ctx, hub.ID, past.ID, RelRelated)
+		hits, err := s.Recall(ctx, hub.Text, 2, RecallOpts{
+			AsOf: 15, IncludeExpired: true, MinTrust: TrustReported, MinCosine: Float32Ptr(0.999), NoTouch: true,
+			Expand: &ExpandSpec{Rels: []string{RelRelated}, Cap: 1, Score: 0.7, Rerank: rerank},
+		})
+		if err != nil || len(hits) != 2 || hits[0].ID != hub.ID || hits[1].ID != past.ID {
+			t.Fatalf("historical expansion (rerank=%v): %+v, %v", rerank, hits, err)
+		}
+	}
+}
 
 func graphApproxEq(a, b, tol float32) bool { return float32(math.Abs(float64(a-b))) <= tol }
 
@@ -338,7 +412,7 @@ func TestCollectExpansionShieldsSeenIDs(t *testing.T) {
 	seed := []MemoryWithScore{{Memory: a, Score: 1.0}}
 	spec := &ExpandSpec{Rels: []string{"refines"}, Cap: 5, Score: 0.7}
 
-	extra, err := store.collectExpansion(ctx, seed, spec, false, expl, []string{b.ID})
+	extra, err := store.collectExpansion(ctx, seed, spec, false, expl, []string{b.ID}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
