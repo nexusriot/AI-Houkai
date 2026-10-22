@@ -34,6 +34,7 @@ type JournalEntry struct {
 	Before map[string]any `json:"before,omitempty"`
 	After  map[string]any `json:"after,omitempty"`
 	Meta   map[string]any `json:"meta"`
+	Scope  string         `json:"scope,omitempty"`
 }
 
 // Summary returns a short human-readable description of the entry.
@@ -91,9 +92,12 @@ func (e JournalEntry) toLine() ([]byte, error) {
 // processes for writes ≤ PIPE_BUF). Reads tolerate truncated last lines (a
 // crash mid-write) by skipping un-parseable JSON.
 type Journal struct {
-	Path             string
-	RotateMB         int
-	KeepDays         int
+	Path     string
+	RotateMB int
+	KeepDays int
+	// Scope binds store readers/writers to one store path and collection.
+	// Empty leaves raw journal reads available for legacy-log recovery.
+	Scope            string
 	writesSinceCheck int
 }
 
@@ -115,6 +119,9 @@ func NewJournal(path string, rotateMB, keepDays int) *Journal {
 func (j *Journal) Append(e JournalEntry) {
 	if j == nil || j.Path == "" {
 		return
+	}
+	if j.Scope != "" {
+		e.Scope = j.Scope
 	}
 	if err := os.MkdirAll(filepath.Dir(j.Path), 0o755); err != nil {
 		log.Printf("ai-houkai journal mkdir: %v", err)
@@ -304,6 +311,9 @@ func (j *Journal) Read(opts ReadOpts) ([]JournalEntry, error) {
 			}
 			var e JournalEntry
 			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				continue
+			}
+			if j.Scope != "" && e.Scope != j.Scope {
 				continue
 			}
 			if opts.Since != 0 && e.TS < opts.Since {

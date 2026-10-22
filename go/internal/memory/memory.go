@@ -189,7 +189,7 @@ type ExpandSpec struct {
 	// slots and can neither inject near-duplicates nor overflow k. The
 	// min_cosine gate does not apply to them — they are graph-justified, not
 	// cosine-justified. When false (default) they are appended AFTER the top-k
-	// cut, unfiltered — the original, backward-compatible behaviour.
+	// cut without relevance scoring; recall eligibility filters still apply.
 	Rerank bool
 }
 

@@ -5,7 +5,136 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/nexusriot/ai-houkai/internal/vector"
 )
+
+func TestJournalOwnershipSurvivesReopenAndCanonicalPaths(t *testing.T) {
+	for _, alias := range []bool{false, true} {
+		name := "same-path"
+		if alias {
+			name = "canonical-alias"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "db")
+			open := func(path string) *MemoryStore {
+				be, err := vector.NewChromem(path, "reopen", 16)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { be.Close() })
+				return NewMemoryStore(be, &stubEmbedder{dim: 16}, DefaultStoreConfig(path, "reopen"))
+			}
+			first := open(path)
+			m, _, _, err := first.Remember(ctx, "persistent journal subject", RememberOpts{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := first.Journal().Read(ReadOpts{})
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("journal: %v %v", entries, err)
+			}
+			if err := first.Journal().rotate(); err != nil {
+				t.Fatal(err)
+			}
+			if err := first.backend.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if alias {
+				path += "/../db"
+			}
+			reopened := open(path)
+			if reopened.Journal().Scope != entries[0].Scope {
+				t.Fatal("scope changed after reopen")
+			}
+			state, err := reopened.StateAt(ctx, nowFloat()+1)
+			if err != nil || len(state) != 1 || state[0].ID != m.ID {
+				t.Fatalf("reopened history: %v %v", state, err)
+			}
+			if ok, err := reopened.Undo(ctx, entries[0]); !ok || err != nil {
+				t.Fatalf("reopened undo: %v %v", ok, err)
+			}
+			if _, err := reopened.GetByID(ctx, m.ID); err != ErrNotFound {
+				t.Fatalf("undo left memory: %v", err)
+			}
+		})
+	}
+}
+
+func TestJournalIsolatesStoresAndCollections(t *testing.T) {
+	for _, separatePaths := range []bool{false, true} {
+		name := "collections"
+		if separatePaths {
+			name = "stores"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			makeStore := func(path, collection string) *MemoryStore {
+				be, err := vector.NewChromem(path, collection, 16)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { be.Close() })
+				return NewMemoryStore(be, &stubEmbedder{dim: 16}, DefaultStoreConfig(path, collection))
+			}
+			a := makeStore(filepath.Join(dir, "first"), "alpha")
+			otherPath, otherCollection := a.cfg.Path, "bravo"
+			if separatePaths {
+				otherPath, otherCollection = filepath.Join(dir, "second"), "alpha"
+			}
+			b := makeStore(otherPath, otherCollection)
+			other, _, _, _ := b.Remember(ctx, "private bravo fact", RememberOpts{})
+			own, _, _, _ := a.Remember(ctx, "private alpha fact", RememberOpts{})
+			if a.Journal().Path != b.Journal().Path {
+				t.Fatal("fixture does not share a journal")
+			}
+			if entries, _ := a.Journal().Read(ReadOpts{Limit: 1}); len(entries) != 1 || entries[0].ID != own.ID {
+				t.Fatal("foreign events consumed scoped read limit")
+			}
+			assertOwn := func() {
+				t.Helper()
+				state, err := a.StateAt(ctx, nowFloat()+1)
+				if err != nil || len(state) != 1 || state[0].ID != own.ID {
+					t.Fatalf("foreign replay: %+v, %v", state, err)
+				}
+			}
+			assertOwn()
+			if history, _ := a.History(ctx, other.ID, true); len(history) != 0 {
+				t.Fatal("foreign history")
+			}
+			b.Forget(ctx, other.ID)
+			entries, _ := b.Journal().Read(ReadOpts{Op: "forget"})
+			if ok, err := a.Undo(ctx, entries[0]); ok || err != nil {
+				t.Fatalf("foreign undo: %v, %v", ok, err)
+			}
+			if entry, _ := a.Journal().FindByTS(entries[0].TS, 1e-9); entry != nil {
+				t.Fatal("timestamp lookup exposed foreign entry")
+			}
+			b.Remember(ctx, "another bravo fact", RememberOpts{})
+			b.Nuke(ctx)
+			assertOwn()
+			if err := a.Journal().rotate(); err != nil {
+				t.Fatal(err)
+			}
+			assertOwn()
+			raw := NewJournal(a.Journal().Path, 64, 90)
+			legacy := JournalEntry{TS: nowFloat(), Op: "forget", ID: own.ID, Before: own.ToDict()}
+			raw.Append(legacy)
+			if ok, err := a.Undo(ctx, legacy); ok || err != nil {
+				t.Fatalf("unscoped undo: %v, %v", ok, err)
+			}
+			assertOwn()
+			if all, _ := raw.Read(ReadOpts{IncludeArchives: true}); len(all) < 3 {
+				t.Fatal("raw recovery reader lost entries")
+			}
+			if scoped, _ := a.Journal().Read(ReadOpts{IncludeArchives: true}); len(scoped) != 1 {
+				t.Fatal("scoped reader admitted unowned events")
+			}
+		})
+	}
+}
 
 // newJournaledStore builds a store with the journal written inside the test's
 // temp dir, so History/StateAt have a clean, isolated log to replay.

@@ -10,6 +10,7 @@ import pytest
 
 from ai_houkai.memory_system import EXPORT_FORMAT, EXPORT_VERSION, MemoryStore
 from ai_houkai.memory_system import ImportConflictError
+from ai_houkai.testing import FakeEmbedder
 
 def _new_store(tmp_path: Path, name: str = "t") -> MemoryStore:
     return MemoryStore(path=str(tmp_path / name), collection=f"col_{name}")
@@ -94,6 +95,44 @@ def test_import_overwrite(store: MemoryStore, tmp_path: Path) -> None:
     res = store.import_(out, on_conflict="overwrite")
     assert res.overwritten == 1
     assert store.get(mem.id).text == "original"
+
+
+@pytest.mark.parametrize("failure", ["vector", "provider"])
+def test_failed_overwrite_preserves_original(tmp_path: Path, failure: str) -> None:
+    unavailable = False
+    fake = FakeEmbedder()
+
+    def embed(texts):
+        if unavailable:
+            raise RuntimeError("embedding provider unavailable")
+        return fake(texts)
+
+    target = MemoryStore(path=str(tmp_path / "db"), collection="overwrite",
+                         embedding_function=embed)
+    try:
+        original = target.remember("original text", tags=["keep"], pinned=True)
+        target.link(original.id, target.remember("linked target").id)
+        before = target.get(original.id).to_dict()
+        path = tmp_path / "overwrite.ahkai"
+        target.export(path, include_vectors=failure == "vector")
+        with gzip.open(path, "rt") as f:
+            rows = [json.loads(line) for line in f]
+        for row in rows[1:]:
+            row["text"] = "replacement text"
+            if failure == "vector":
+                row["vector"] = [1.0, 0.0]
+        with gzip.open(path, "wt") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        unavailable = failure == "provider"
+        journal_before = list(target.journal.read())
+        result = target.import_(path, on_conflict="overwrite")
+        assert result.errors
+        assert result.overwritten == 0
+        assert target.get(original.id).to_dict() == before
+        assert list(target.journal.read()) == journal_before
+    finally:
+        target.client.close()
 
 
 def test_import_rename(store: MemoryStore, tmp_path: Path) -> None:

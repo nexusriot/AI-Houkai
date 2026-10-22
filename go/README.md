@@ -448,6 +448,13 @@ their actor. Entries carry the actor (`cli` / `mcp` / `http` / `reflection` /
 The `http` actor is set by the serve commands; `restore` is an op, not an
 actor.
 
+Each entry carries a `scope` derived from the canonical absolute store path
+and collection. Journal commands, history, replay and undo only use matching
+entries, including archives. Legacy entries without a scope remain on disk
+but require explicit recovery through an unscoped `memory.NewJournal` reader;
+their collection cannot be inferred safely. Moving the store path likewise
+changes the scope used for history.
+
 ```bash
 # tail recent entries (newest first)
 houkai journal tail

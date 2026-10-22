@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -33,11 +33,13 @@ class JournalEntry:
     before: dict[str, Any] | None
     after:  dict[str, Any] | None
     meta:   dict[str, Any]
+    scope:  str = ""
 
     def to_line(self) -> str:
         rec = {
             "ts": self.ts, "op": self.op, "actor": self.actor, "id": self.id,
             "before": self.before, "after": self.after, "meta": self.meta,
+            "scope": self.scope,
         }
         return json.dumps(rec, separators=(",", ":")) + "\n"
 
@@ -51,6 +53,7 @@ class JournalEntry:
             before=d.get("before"),
             after=d.get("after"),
             meta=d.get("meta") or {},
+            scope=str(d.get("scope") or ""),
         )
 
     def summary(self) -> str:
@@ -90,14 +93,20 @@ class Journal:
         *,
         rotate_mb: int = 64,
         keep_days: int = 90,
+        scope: str = "",
     ) -> None:
         self.path = Path(path)
         self.rotate_mb = rotate_mb
         self.keep_days = keep_days
+        # Unscoped readers are the explicit recovery path for legacy logs.
+        # A bound reader must never guess which collection an old entry owns.
+        self.scope = scope
         self._writes_since_check = 0
 
     def append(self, entry: JournalEntry) -> None:
         """Append one entry. Failures are logged, not raised."""
+        if self.scope:
+            entry = replace(entry, scope=self.scope)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.path, "a", encoding="utf-8") as f:
@@ -224,6 +233,8 @@ class Journal:
                     try:
                         entry = JournalEntry.from_dict(json.loads(line))
                     except (json.JSONDecodeError, KeyError, ValueError):
+                        continue
+                    if self.scope and entry.scope != self.scope:
                         continue
                     if since is not None and entry.ts < since:
                         continue

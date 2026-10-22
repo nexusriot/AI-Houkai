@@ -2,11 +2,17 @@ package httpserver_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/ai-houkai/internal/httpserver"
 	"github.com/nexusriot/ai-houkai/internal/memory"
@@ -14,6 +20,186 @@ import (
 
 	"net/http/httptest"
 )
+
+func TestGraphEligibilityThroughRecallAndPackRoutes(t *testing.T) {
+	for _, endpoint := range []string{"/recall", "/recall_pack"} {
+		for _, rerank := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/rerank=%v", endpoint, rerank), func(t *testing.T) {
+				ts, _, _ := newJournaledServer(t)
+				seed := remember(t, ts.URL, "trusted graph seed")
+				for _, fields := range []map[string]any{
+					{"text": "untrusted graph content", "trust": "untrusted"},
+					{"text": "expired graph content", "expires_at": 1},
+					{"text": "retired graph content", "valid_until": 1},
+				} {
+					status, child := post(t, ts.URL+"/memories", fields)
+					if status != 201 {
+						t.Fatalf("remember: %d %v", status, child)
+					}
+					status, result := post(t, ts.URL+"/links", map[string]any{"src_id": seed, "dst_id": child["id"], "rel": "related"})
+					if status != 200 {
+						t.Fatalf("link: %d %v", status, result)
+					}
+				}
+				allowed := remember(t, ts.URL, "eligible graph content")
+				post(t, ts.URL+"/links", map[string]any{"src_id": seed, "dst_id": allowed, "rel": "related"})
+				status, result := post(t, ts.URL+endpoint, map[string]any{
+					"query": "trusted graph seed", "k": 2, "max_items": 2,
+					"mode": "semantic", "min_cosine": 0.999, "min_trust": "trusted", "token_budget": 1000,
+					"expand": map[string]any{"rels": []string{"related"}, "cap": 1, "rerank": rerank},
+				})
+				if status != 200 {
+					t.Fatalf("recall: %d %v", status, result)
+				}
+				key := "results"
+				if endpoint == "/recall_pack" {
+					key = "items"
+				}
+				rows := result[key].([]any)
+				if len(rows) != 2 || rows[0].(map[string]any)["id"] != seed || rows[1].(map[string]any)["id"] != allowed {
+					t.Fatalf("filters lost at HTTP boundary: %v", result)
+				}
+				if endpoint == "/recall_pack" {
+					text := result["text"].(string)
+					if strings.Contains(text, "untrusted graph") || strings.Contains(text, "expired graph") || strings.Contains(text, "retired graph") || !strings.Contains(text, "eligible graph content") {
+						t.Fatalf("ineligible text entered packed context: %s", text)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestJournalAndDefaultUndoRoutesStayInCollection(t *testing.T) {
+	ts, store, dir := newJournaledServer(t)
+	own := remember(t, ts.URL, "own original")
+	if status := patch(t, ts.URL+"/memories/"+own, map[string]any{"text": "own edited"}); status != 200 {
+		t.Fatal(status)
+	}
+	backend, err := vector.NewChromem(filepath.Join(dir, "s"), "foreign", 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { backend.Close() })
+	cfg := memory.DefaultStoreConfig(dir, "foreign")
+	cfg.JournalPath = store.Journal().Path
+	foreign := memory.NewMemoryStore(backend, &stubEmbedder{dim: 16}, cfg)
+	ctx := context.Background()
+	other, _, _, err := foreign.Remember(ctx, "foreign private fact", memory.RememberOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreign.Forget(ctx, other.ID); err != nil {
+		t.Fatal(err)
+	}
+	status, journal := getObj(t, ts.URL+"/journal?n=10")
+	if status != 200 || journal["count"] != float64(2) {
+		t.Fatalf("journal: %d %v", status, journal)
+	}
+	for _, raw := range journal["entries"].([]any) {
+		if raw.(map[string]any)["id"] != own {
+			t.Fatal("journal leaked foreign event")
+		}
+	}
+	status, state := getObj(t, fmt.Sprintf("%s/state_at?ts=%.6f", ts.URL, float64(time.Now().Unix())+1))
+	if status != 200 || state["count"] != float64(1) || state["memories"].([]any)[0].(map[string]any)["id"] != own {
+		t.Fatalf("state: %d %v", status, state)
+	}
+	if status, _ := getObj(t, ts.URL+"/memories/"+other.ID+"/history"); status != 404 {
+		t.Fatal("foreign history was exposed")
+	}
+	if status, _ := post(t, ts.URL+"/undo", map[string]any{"memory_id": other.ID}); status != 404 {
+		t.Fatal("foreign undo was selectable")
+	}
+	status, undone := post(t, ts.URL+"/undo", map[string]any{})
+	if status != 200 || undone["ok"] != true || undone["id"] != own {
+		t.Fatalf("undo: %d %v", status, undone)
+	}
+	if status, fetched := getObj(t, ts.URL+"/memories/"+own); status != 200 || fetched["text"] != "own original" {
+		t.Fatalf("wrong undo result: %v", fetched)
+	}
+	if status, _ := getObj(t, ts.URL+"/memories/"+other.ID); status != 404 {
+		t.Fatal("foreign row was resurrected")
+	}
+}
+
+func writeRouteImport(t *testing.T, rows []map[string]any, dim int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "route.ahkai")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	enc := json.NewEncoder(gz)
+	if err := enc.Encode(map[string]any{"format": "ai-houkai/export", "version": 1, "source": map[string]any{"embedding_dim": dim}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestOverwriteImportRoutePreservesMemoryOnFailure(t *testing.T) {
+	ts, _, _ := newTokenedServer(t)
+	status, original := postAuthed(t, ts.URL+"/memories", map[string]any{"text": "preserve this row", "tags": []string{"keep"}})
+	if status != 201 {
+		t.Fatal(original)
+	}
+	path := writeRouteImport(t, []map[string]any{{"id": original["id"], "text": "invalid replacement", "vector": []float32{1, 0}}}, 16)
+	status, result := postAuthed(t, ts.URL+"/import", map[string]any{"path": path, "on_conflict": "overwrite"})
+	if status != 200 || result["overwritten"] != float64(0) {
+		t.Fatalf("import: %d %v", status, result)
+	}
+	errors := result["errors"].([]any)
+	if len(errors) != 1 || errors[0].(map[string]any)["id"] != original["id"] {
+		t.Fatalf("missing row error: %v", result)
+	}
+	status, recalled := postAuthed(t, ts.URL+"/recall", map[string]any{"query": "preserve this row", "k": 1})
+	if status != 200 {
+		t.Fatal(recalled)
+	}
+	rows := recalled["results"].([]any)
+	if len(rows) != 1 || rows[0].(map[string]any)["id"] != original["id"] || rows[0].(map[string]any)["text"] != "preserve this row" {
+		t.Fatalf("failed import lost original: %v", recalled)
+	}
+}
+
+func TestImportConflictRouteLeavesNoPartialWrites(t *testing.T) {
+	ts, store, _ := newTokenedServer(t)
+	status, original := postAuthed(t, ts.URL+"/memories", map[string]any{"text": "existing fact"})
+	if status != 201 {
+		t.Fatal(original)
+	}
+	path := writeRouteImport(t, []map[string]any{
+		{"id": "new-nonconflicting-id", "text": "must not be inserted"},
+		{"id": original["id"], "text": "existing fact"},
+	}, 0)
+	before, err := store.Journal().Read(memory.ReadOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, result := postAuthed(t, ts.URL+"/import", map[string]any{"path": path, "on_conflict": "error"})
+	if status != 409 {
+		t.Fatalf("expected collision: %d %v", status, result)
+	}
+	if count, _ := store.Count(context.Background()); count != 1 {
+		t.Fatalf("rejected import left %d rows", count)
+	}
+	after, err := store.Journal().Read(memory.ReadOpts{})
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("rejected import changed journal: %v", err)
+	}
+}
 
 // Store capabilities that previously had no HTTP route (A3): restore,
 // subgraph, undo, nuke, journal, export, import.

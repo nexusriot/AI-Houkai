@@ -120,6 +120,32 @@ class TestKnobDefaults:
 
 
 class TestKnobsEndToEnd:
+    @pytest.mark.parametrize("rerank", [False, True])
+    @pytest.mark.parametrize("tool", ["recall", "recall_pack"])
+    def test_graph_eligibility_survives_tool_calls(self, mcp_store, rerank, tool):
+        seed = srv.remember(text="trusted MCP seed")
+        for text, fields in [
+            ("untrusted MCP content", {"trust": "untrusted"}),
+            ("expired MCP content", {"expires_at": 1}),
+            ("retired MCP content", {"valid_until": 1}),
+        ]:
+            child = srv.remember(text=text, **fields)
+            assert srv.link(src_id=seed["id"], dst_id=child["id"], rel="related")["ok"]
+        allowed = srv.remember(text="eligible MCP neighbor")
+        srv.link(src_id=seed["id"], dst_id=allowed["id"], rel="related")
+        params = dict(query="trusted MCP seed", mode="semantic", min_cosine=0.999,
+                      min_trust="trusted", expand_rels=["related"], expand_cap=1,
+                      expand_rerank=rerank)
+        if tool == "recall":
+            rows = srv.recall(k=2, touch=False, **params)
+        else:
+            result = srv.recall_pack(max_items=2, token_budget=1000, **params)
+            rows = result["items"]
+            assert "eligible MCP neighbor" in result["text"]
+            assert all(text not in result["text"] for text in (
+                "untrusted MCP content", "expired MCP content", "retired MCP content"))
+        assert {r["id"] for r in rows} == {seed["id"], allowed["id"]}
+
     def test_min_cosine_gate_returns_nothing_for_off_topic(self, mcp_store):
         srv.remember(text="the deployment pipeline runs on friday")
         assert srv.recall(query="the deployment pipeline", k=3)

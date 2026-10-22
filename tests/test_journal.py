@@ -11,6 +11,70 @@ import pytest
 
 import ai_houkai.memory_system.journal as journal_mod
 from ai_houkai.memory_system import Journal, JournalEntry, MemoryStore
+from ai_houkai.testing import FakeEmbedder
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_journal_ownership_survives_reopen_and_canonical_paths(tmp_path, alias):
+    path = tmp_path / "db"
+    first = MemoryStore(path=str(path), collection="reopen", embedding_function=FakeEmbedder())
+    mem = first.remember("persistent journal subject")
+    entry = list(first.journal.read())[0]
+    first.journal._rotate()
+    first.client.close()
+    reopened_path = path / ".." / "db" if alias else path
+    reopened = MemoryStore(path=str(reopened_path), collection="reopen", embedding_function=FakeEmbedder())
+    try:
+        assert [e.scope for e in reopened.journal.read(include_archives=True)] == [entry.scope]
+        assert [m.id for m in reopened.state_at(time.time() + 1)] == [mem.id]
+        assert reopened.undo(entry)
+        assert reopened.get(mem.id) is None
+    finally:
+        reopened.client.close()
+
+
+@pytest.mark.parametrize("separate_paths", [False, True])
+def test_journal_isolates_store_and_collection(tmp_path, separate_paths):
+    path = tmp_path / "first"
+    a = MemoryStore(path=str(path), collection="alpha", embedding_function=FakeEmbedder())
+    b = MemoryStore(path=str(tmp_path / "second" if separate_paths else path),
+                    collection="alpha" if separate_paths else "bravo",
+                    embedding_function=FakeEmbedder())
+    try:
+        other = b.remember("bravo private fact")
+        own = a.remember("alpha private fact")
+        assert a.journal.path == b.journal.path
+        assert [e.id for e in a.journal.read(limit=1)] == [own.id]
+        assert [m.id for m in a.state_at(time.time() + 1)] == [own.id]
+        assert a.history(other.id) == []
+        b.forget(other.id)
+        foreign = list(b.journal.read(op="forget"))[-1]
+        assert a.journal.find_by_ts(foreign.ts, tol=0.000001) is None
+        assert not a.undo(foreign)
+        assert a.get(other.id) is None
+        b.remember("another bravo fact")
+        b.nuke()
+        assert [m.id for m in a.state_at(time.time() + 1)] == [own.id]
+        a.journal._rotate()
+        assert [m.id for m in a.state_at(time.time() + 1)] == [own.id]
+        assert len(list(Journal(a.journal.path).read(include_archives=True))) > 1
+    finally:
+        # Both clients share a Chroma system when they use the same path.
+        b.client.close()
+        a.client.close()
+
+
+def test_unscoped_legacy_journal_requires_explicit_recovery(store):
+    mem = store.remember("legacy recovery snapshot")
+    legacy = JournalEntry(ts=time.time(), op="forget", actor="old", id=mem.id,
+                          before=mem.to_dict(), after=None, meta={})
+    raw = Journal(store.journal.path)
+    raw.append(legacy)
+    assert legacy in list(raw.read())
+    assert legacy not in list(store.journal.read())
+    assert store.journal.find_by_ts(legacy.ts, tol=0.000001) is None
+    assert not store.undo(legacy)
+    assert store.get_at(mem.id, time.time() + 1) is not None
 
 
 def test_remember_writes_one_entry(store: MemoryStore) -> None:
@@ -204,6 +268,7 @@ def test_undo_unlink_legacy_entry_without_removed_rels(store: MemoryStore) -> No
     legacy = JournalEntry(
         ts=1.0, op="unlink", actor="lib", id=a.id, before=None, after=None,
         meta={"src_id": a.id, "dst_id": b.id, "rel": "refines", "removed": 1},
+        scope=store.journal.scope,
     )
     assert store.undo(legacy) is True
     assert [l.rel for l in store.get(a.id).links if l.to == b.id] == ["refines"]
